@@ -1,0 +1,576 @@
+"""Workspace management: reset-and-retry between revision attempts, Coder
+output application (diff or full-file write), CI-check invocation, and
+rollback on failure or interruption.
+
+Branch creation is out of scope here (see docs/design.md's "Relationship
+to cicaid") - `cicaid work-on-issue <id> --type fix` has already checked
+out the branch this module operates on before orchestrator.py calls in.
+No LLM calls happen in this module.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+
+logger = logging.getLogger(__name__)
+
+# Coder output modes: a full-file write (MODE_FULL) or a `git apply`-able
+# unified diff (MODE_DIFF). Defined here rather than in agents/coder.py
+# since this module — not the Coder — decides how each mode is applied;
+# agents/coder.py imports these back for the instructions it gives the LLM.
+MODE_FULL = "FULL"
+MODE_DIFF = "DIFF"
+
+# `cicaid run-ci-checks` reads .cicaid-checks.toml in the target repo (see
+# design.md's "Relationship to cicaid"); orchestrator.py/config.py can pass
+# a different command (e.g. a plain test runner) via run_ci_checks'/
+# run_revision_attempt's ci_command argument.
+DEFAULT_CI_COMMAND = ["cicaid", "run-ci-checks", "--all"]
+
+# Matches the per-file sections NativeCoder instructs the LLM to emit (see
+# agents/coder.py's FILE_START_MARKER/MODE_MARKER/FILE_END_MARKER):
+#   === FILE: <path> ===
+#   === MODE: FULL or DIFF ===
+#   <content>
+#   === END FILE ===
+_FILE_SECTION_RE = re.compile(
+    r"=== FILE: (?P<path>.+?) ===\r?\n"
+    r"=== MODE: (?P<mode>FULL|DIFF) ===\r?\n"
+    r"(?P<body>.*?)"
+    # The terminator must be the entire line (modulo trailing spaces/tabs). A
+    # bare substring match (the old `\r?\n?=== END FILE ===`) truncated MODE:
+    # FULL sections at any `=== END FILE ===` appearing inside file content -
+    # e.g. agents/analyser.py's prompt text contains it mid-line - silently
+    # dropping the coder's real changes after the lookalike (issue #254).
+    # Requiring the marker to start after a newline and then allowing only
+    # trailing spaces/tabs before the next newline rules out every mid-line
+    # lookalike: any non-whitespace after the marker fails to match.
+    r"(?:\r?\n)=== END FILE ===[ \t]*(?:\r?\n|$)",
+    re.DOTALL,
+)
+
+# A unified diff's own syntax always starts with one of these; used to find
+# where a MODE: DIFF section's diff body starts amid surrounding prose.
+_DIFF_START_RE = re.compile(r"^(diff --git |--- )", re.MULTILINE)
+_DIFF_LINE_PREFIXES = ("diff --git", "index ", "---", "+++", "@@", " ", "+", "-", "\\")
+# Modalities may wrap the raw diff in a Markdown fenced code block (```diff /
+# ```) in addition to the mandated FILE/MODE delimiters (agents/coder.py); the
+# fence lines are not diff syntax, so strip them before handing the body to
+# git apply (issue #248).
+_FENCE_RE = re.compile(r"^[ \t]*```[ \t]*(?:diff)?[ \t]*\r?\n?$", re.MULTILINE)
+
+
+class WorkspaceError(RuntimeError):
+    """workspace.py itself could not manage the repo (a git command failed
+    unexpectedly). See design.md's "Workspace corruption" failure mode -
+    this is distinct from a Coder attempt failing normally.
+    """
+
+
+class MalformedOutputError(ValueError):
+    """Coder output rejected before it was handed to `git apply` (or before
+    a full-file write): unparsable delimiters, an undeclared/unsafe file
+    path, or a diff that doesn't apply against the current tree. Distinct
+    from a real test failure - see design.md's "Malformed diffs".
+    """
+
+
+# Prefixes WorkspaceResult.error is set to below when a Coder attempt was
+# rejected before any test ever ran, so agents/analyser.py can tell "the
+# patch was never actually tried" apart from a real CI failure without
+# re-parsing free-form error text (see design.md's "Malformed diffs").
+MALFORMED_OUTPUT_ERROR_PREFIX = "malformed coder output:"
+APPLY_FAILED_ERROR_PREFIX = "apply failed:"
+
+
+@dataclass
+class FileChange:
+    """One file's worth of a parsed Coder response."""
+    path: str
+    mode: str  # MODE_FULL | MODE_DIFF
+    body: str
+
+
+@dataclass
+class WorkspaceResult:
+    """Result of applying one revision attempt and running CI checks."""
+    success: bool
+    test_output: str = ""
+    diff_output: str = ""
+    error: str | None = None
+
+
+# Subprocess timeout bounds (#45): local git operations are fast, but a
+# fresh clone or a real test suite legitimately takes minutes — and none of
+# them may be allowed to hang the orchestrator forever.
+DEFAULT_GIT_TIMEOUT = 30.0
+CLONE_TIMEOUT = 600.0
+DEFAULT_CI_TIMEOUT = 600.0
+# `git fetch origin` talks to the network; a big repo over a slow link
+# legitimately outlasts DEFAULT_GIT_TIMEOUT, but must still be bounded.
+FETCH_TIMEOUT = 120.0
+
+
+def _run_git(
+    repo_path: str,
+    *args: str,
+    check: bool = True,
+    input_text: str | None = None,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess:
+    """Run a git command in ``repo_path`` with a bounded subprocess timeout.
+
+    ``timeout`` defaults to :data:`DEFAULT_GIT_TIMEOUT` (local git
+    operations are fast; the bound exists to turn a hung git process —
+    network filesystem, stuck lock — into a :class:`WorkspaceError`
+    instead of an indefinite orchestrator block, #45).
+    """
+    effective_timeout = DEFAULT_GIT_TIMEOUT if timeout is None else timeout
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            input=input_text,
+            timeout=effective_timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise WorkspaceError(
+            f"git {' '.join(args)} timed out after {effective_timeout}s"
+        ) from exc
+    if check and result.returncode != 0:
+        raise WorkspaceError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
+    return result
+
+
+def get_current_commit(repo_path: str) -> str:
+    """Return the current HEAD commit hash - the caller's starting point
+    before any revision attempts begin.
+    """
+    return _run_git(repo_path, "rev-parse", "HEAD").stdout.strip()
+
+
+def reset_to_commit(repo_path: str, commit: str) -> None:
+    """Discard all working-tree/index changes and reset back to `commit`.
+
+    Called before every attempt and on every failure, so a failed attempt's
+    changes never bleed into the next one (see design.md's Analyser
+    section) and a successful final attempt is the only thing left on disk.
+    """
+    _run_git(repo_path, "reset", "--hard", commit)
+    _run_git(repo_path, "clean", "-fd")
+
+
+def refresh_to_main(repo_path: str) -> None:
+    """Fetch origin and put the checkout on the latest ``main``.
+
+    The unified flow's per-pass refresh (#301): ``ensure_base_clone``
+    never fetches an existing checkout, so without this a long-running
+    Scheduler would keep reviewing and branching from stale code. Hard
+    resets (``checkout --force`` + ``reset --hard``) because the caller
+    guarantees a clean workspace first — see scheduler's
+    ``_workspace_is_dirty`` guard. The local ``main`` branch is recreated
+    at ``origin/main`` if it is stale or missing.
+
+    Raises:
+        WorkspaceError when fetch or reset fails.
+    """
+    _run_git(repo_path, "fetch", "origin", timeout=FETCH_TIMEOUT)
+    _run_git(repo_path, "checkout", "--force", "-B", "main", "origin/main")
+    _run_git(repo_path, "reset", "--hard", "origin/main")
+
+
+class _RollbackGuard:
+    """Resets the repo to `start_commit` on the way out unless disarmed.
+
+    Using a context manager (rather than a plain try/except) means the
+    reset also runs when the attempt is interrupted mid-run - e.g. a
+    KeyboardInterrupt raised out of the CI-check subprocess call - not only
+    on a normally-returned failure. See design.md's "Workspace corruption"
+    and the rollback-path test coverage this issue asks for.
+    """
+
+    def __init__(self, repo_path: str, start_commit: str):
+        self.repo_path = repo_path
+        self.start_commit = start_commit
+        self._armed = True
+
+    def disarm(self) -> None:
+        self._armed = False
+
+    def __enter__(self) -> "_RollbackGuard":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if self._armed:
+            try:
+                reset_to_commit(self.repo_path, self.start_commit)
+            except WorkspaceError:
+                logger.error("Rollback to %s failed", self.start_commit, exc_info=True)
+        return False  # never suppress the original exception, if any
+
+
+def _escapes_repo(path: str) -> bool:
+    normalised = PurePosixPath(path.replace("\\", "/"))
+    return normalised.is_absolute() or ".." in normalised.parts
+
+
+# Characters never valid in a path on Windows. Coder output and Triage's
+# FILES: lines frequently decorate real paths with markdown or glob
+# syntax; any leftover of these after stripping means the entry is not a
+# usable file path.
+_INVALID_PATH_CHARS = '<>:"|?*'
+
+
+def sanitize_file_path(path: str) -> str | None:
+    """Normalize a possibly LLM-decorated path; None when not a usable path.
+
+    The Coder echoes paths through ``=== FILE: ... ===`` markers and
+    Triage writes FILES: lines from a small local model; both routinely
+    decorate them with markdown backticks/emphasis (``** `x.py` **``),
+    leading glob prefixes (``** README.md``), or trailing asides
+    (``docs/ (if applicable)``). Taken literally, those paths fail on
+    Windows with ``[Errno 22] Invalid argument`` (``*`` and backticks
+    are not valid filename characters), so every path crossing into file
+    I/O is sanitized here: markdown/glob decoration is stripped, Windows
+    separators are normalized to ``/``, and anything that is still empty,
+    absolute, ``.``/``..``, or carrying invalid characters is rejected.
+
+    Args:
+        path: A raw path extracted from LLM output.
+
+    Returns:
+        The normalized relative path, or None when the entry is not a
+        usable file path and should be dropped.
+    """
+    if not path or not path.strip():
+        return None
+    cleaned = path.strip()
+    # Backticks are markdown decoration, never part of a path.
+    cleaned = re.sub(r"`", "", cleaned)
+    # Leading glob prefixes ("** README.md") are decoration; any `*` that
+    # survives this (i.e. sits mid-path) is a glob pattern, not a filename
+    # — rejected below via _INVALID_PATH_CHARS.
+    cleaned = cleaned.lstrip("*").strip()
+    # Trailing parenthetical asides, only when whitespace-separated:
+    # "docs/ (if applicable)" is an aside, but "src/foo(bar).py" is a real
+    # filename and must be kept.
+    cleaned = re.sub(r"\s+\([^)]*\)\s*$", "", cleaned).strip()
+    cleaned = cleaned.replace("\\", "/")
+    if not cleaned or cleaned in (".", ".."):
+        return None
+    if cleaned.startswith("/") or re.match(r"^[A-Za-z]:", cleaned):
+        return None  # absolute path — never allowed
+    if any(ch in cleaned for ch in _INVALID_PATH_CHARS) or any(
+        ord(ch) < 32 for ch in cleaned
+    ):
+        return None
+    return cleaned
+
+
+def _extract_diff(body: str) -> str | None:
+    """Pull the unified-diff hunk out of a MODE: DIFF section's body.
+
+    NativeCoder's prompt asks for "a unified diff ... with a brief
+    explanation" (agents/coder.py), so the body can have prose before
+    and/or after the actual diff. Finds where diff syntax starts, then
+    stops at the first line that no longer looks diff-shaped.
+    """
+    match = _DIFF_START_RE.search(body)
+    if not match:
+        return None
+
+    lines = body[match.start():].splitlines()
+    end = len(lines)
+    for index, line in enumerate(lines):
+        if index == 0:
+            continue
+        if line.startswith(_DIFF_LINE_PREFIXES) or line.strip() == "":
+            continue
+        end = index
+        break
+
+    diff_text = "\n".join(lines[:end]).rstrip("\n")
+    if not diff_text:
+        return None
+    # Drop a Markdown fence line wrapping the block (issue #248): the
+    # Coder's ```diff / ``` wrapper is not diff syntax, and handing it to
+    # git apply produces a "corrupt patch" error. Only fence lines at the
+    # very edges of the extracted body are removed - a fence-like line
+    # inside the diff (e.g. a " ```" context line when editing Markdown)
+    # is real diff content and must be preserved.
+    lines = diff_text.splitlines()
+    if lines and _FENCE_RE.match(lines[0]):
+        lines = lines[1:]
+    if lines and _FENCE_RE.match(lines[-1]):
+        lines = lines[:-1]
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def parse_coder_output(output: str, declared_files: list[str]) -> list[FileChange]:
+    """Split a Coder response into per-file changes, rejecting anything
+    that isn't safe to hand to git apply / a direct file write.
+
+    Raises MalformedOutputError (not a generic exception) so callers can
+    tell "the Coder's patch was never actually tried" apart from a real
+    test failure - see design.md's "Malformed diffs".
+    """
+    if not output or not output.strip():
+        raise MalformedOutputError("coder output is empty")
+
+    matches = list(_FILE_SECTION_RE.finditer(output))
+    if not matches:
+        raise MalformedOutputError(
+            "no '=== FILE: ... === / === MODE: ... === / === END FILE ===' "
+            "sections found in coder output"
+        )
+
+    # Declared files are normalized the same way the FILE marker path is,
+    # so a Coder that echoes back a decorated path (``** `x.py` **``) still
+    # matches its declared, sanitized file.
+    declared = {sanitize_file_path(f) for f in declared_files}
+    declared.discard(None)
+    changes: list[FileChange] = []
+    seen_paths: set[str] = set()
+
+    for match in matches:
+        path = match.group("path").strip()
+        mode = match.group("mode").strip()
+        body = match.group("body").strip("\n")
+
+        normalized = sanitize_file_path(path)
+        if normalized is None:
+            raise MalformedOutputError(
+                f"coder output declares an invalid file path: {path!r}"
+            )
+        path = normalized
+        if path not in declared:
+            raise MalformedOutputError(
+                f"coder output touches undeclared file {path!r} "
+                f"(declared files: {sorted(declared)})"
+            )
+        if _escapes_repo(path):
+            raise MalformedOutputError(f"file path escapes the repository: {path!r}")
+        if path in seen_paths:
+            raise MalformedOutputError(f"duplicate FILE section for {path!r}")
+        seen_paths.add(path)
+
+        if mode == MODE_DIFF:
+            diff_text = _extract_diff(body)
+            if diff_text is None:
+                raise MalformedOutputError(
+                    f"MODE: DIFF section for {path!r} contains no parseable unified diff"
+                )
+            body = diff_text
+
+        changes.append(FileChange(path=path, mode=mode, body=body))
+
+    return changes
+
+
+def apply_file_change(repo_path: str, change: FileChange) -> None:
+    """Apply one parsed file change: a direct write for MODE_FULL, or
+    `git apply` (pre-checked with --check) for MODE_DIFF.
+
+    Raises MalformedOutputError if a diff doesn't apply cleanly against the
+    current tree - checked before the real apply so a bad patch can't
+    partially land.
+    """
+    if change.mode == MODE_FULL:
+        target = Path(repo_path) / change.path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        content = change.body
+        if content and not content.endswith("\n"):
+            content += "\n"
+        target.write_text(content, encoding="utf-8")
+        return
+
+    check_result = _run_git(
+        repo_path, "apply", "--check", "--recount", "-",
+        check=False, input_text=change.body,
+    )
+    if check_result.returncode != 0:
+        raise MalformedOutputError(
+            f"diff for {change.path!r} does not apply: {check_result.stderr.strip()}"
+        )
+    _run_git(repo_path, "apply", "--recount", "-", input_text=change.body)
+
+
+def get_working_diff(repo_path: str) -> str:
+    """Stage every change (including new/deleted files) and return the
+    resulting diff against HEAD - the patch a passing attempt hands back
+    to the caller for commit-and-push.
+    """
+    _run_git(repo_path, "add", "-A")
+    return _run_git(repo_path, "diff", "--cached", "HEAD", check=False).stdout
+
+
+def _clone_url(repo: str) -> str:
+    """HTTPS URL to fresh-clone ``repo`` from (``owner/name`` format)."""
+    return f"https://github.com/{repo}.git"
+
+
+def _is_git_checkout(path: Path) -> bool:
+    """True when ``path`` is inside a git working tree."""
+    result = _run_git(str(path), "rev-parse", "--git-dir", check=False)
+    return result.returncode == 0
+
+
+def ensure_base_clone(repo_path: str, repo: str) -> str:
+    """Ensure ``repo_path`` (WORKSPACE_ROOT) is a usable git checkout of ``repo``.
+
+    The base clone every issue's worktree is created from. Reused as-is
+    when it is already a git checkout; fresh-cloned from
+    ``https://github.com/<repo>.git`` when the path is missing or empty;
+    never touched when it exists, is non-empty, and is not a git checkout
+    — that is user data, so a ``WorkspaceError`` is raised and the caller
+    should skip rather than clobber it. No fetch/pull of an existing
+    checkout: the worker's own ``commit-and-push`` is what advances it.
+
+    Args:
+        repo_path: The base-clone path (WORKSPACE_ROOT).
+        repo: Repository in "owner/name" format.
+
+    Returns:
+        The base-clone path (in the same relative/absolute form it was
+        given).
+
+    Raises:
+        WorkspaceError when the path cannot be made a usable checkout — a
+        non-empty non-git directory, a non-directory path, or a failed
+        clone. The caller should skip the pass with nothing attempted.
+    """
+    path = Path(repo_path)
+    if path.exists():
+        if not path.is_dir():
+            raise WorkspaceError(
+                f"WORKSPACE_ROOT {repo_path!r} is not a directory"
+            )
+        if _is_git_checkout(path):
+            return str(path)
+        if any(path.iterdir()):
+            raise WorkspaceError(
+                f"WORKSPACE_ROOT {repo_path!r} exists, is non-empty, and is "
+                "not a git checkout — refusing to touch it; point "
+                "WORKSPACE_ROOT at a clone or at a missing/empty directory"
+            )
+    # Missing (or an empty directory): fresh-clone it. The destination is
+    # absolute so it resolves against the process cwd, not the clone
+    # subprocess's cwd (the parent directory).
+    clone_url = _clone_url(repo)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    result = _run_git(
+        str(path.parent),
+        "clone",
+        clone_url,
+        str(path.absolute()),
+        check=False,
+        timeout=CLONE_TIMEOUT,
+    )
+    if result.returncode != 0:
+        raise WorkspaceError(
+            f"git clone {clone_url} -> {repo_path} failed: "
+            f"{result.stderr.strip()}"
+        )
+    return str(path)
+
+
+def run_ci_checks(
+    repo_path: str,
+    command: list[str] | None = None,
+    env: dict[str, str] | None = None,
+    timeout: float | None = None,
+) -> tuple[bool, str]:
+    """Run the configured CI-check command (default: `cicaid run-ci-checks
+    --all`, which reads .cicaid-checks.toml - see design.md's "Relationship
+    to cicaid") and capture pass/fail plus combined output.
+
+    ``env`` is the subprocess's full environment (None = inherit the
+    parent's, as before); the Scheduler passes its target's env explicitly
+    so parallel workers never rely on a mutated ``os.environ`` (#159).
+    ``timeout`` defaults to :data:`DEFAULT_CI_TIMEOUT` (a real test suite
+    takes minutes; the bound exists so a hung CI command surfaces as a
+    :class:`WorkspaceError` instead of blocking the orchestrator forever,
+    #45).
+
+    Returns (passed, output) rather than raising, so a missing/failing CI
+    tool is reported to the caller (and, on the next revision, the
+    Analyser) the same way a real test failure is. A command that exceeds
+    its timeout is different — it raises :class:`WorkspaceError` so the
+    stall is not mistaken for a test failure.
+    """
+    command = list(command) if command else list(DEFAULT_CI_COMMAND)
+    effective_timeout = DEFAULT_CI_TIMEOUT if timeout is None else timeout
+    try:
+        result = subprocess.run(
+            command,
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=env,
+            timeout=effective_timeout,
+        )
+    except OSError as exc:
+        return False, f"failed to run CI command {command}: {exc}"
+    except subprocess.TimeoutExpired as exc:
+        raise WorkspaceError(
+            f"CI command {' '.join(command)} timed out after "
+            f"{effective_timeout}s"
+        ) from exc
+    return result.returncode == 0, result.stdout + result.stderr
+
+
+def run_revision_attempt(
+    repo_path: str,
+    coder_output: str,
+    declared_files: list[str],
+    start_commit: str | None = None,
+    ci_command: list[str] | None = None,
+    env: dict[str, str] | None = None,
+) -> WorkspaceResult:
+    """Apply one bounded revision attempt and run CI checks, rolling back
+    to `start_commit` on any failure or interruption.
+
+    This is the unit orchestrator.py calls once per attempt in the Coder ->
+    Verifier loop (see design.md): reset to a known-good commit, apply this
+    attempt's diff/full-file output, run CI checks, and leave the repo
+    clean again unless the attempt fully passed. ``env`` is forwarded to
+    the CI-check subprocess (see :func:`run_ci_checks`).
+    """
+    if start_commit is None:
+        start_commit = get_current_commit(repo_path)
+
+    reset_to_commit(repo_path, start_commit)
+
+    with _RollbackGuard(repo_path, start_commit) as guard:
+        try:
+            changes = parse_coder_output(coder_output, declared_files)
+        except MalformedOutputError as exc:
+            return WorkspaceResult(success=False, error=f"{MALFORMED_OUTPUT_ERROR_PREFIX} {exc}")
+
+        try:
+            for change in changes:
+                apply_file_change(repo_path, change)
+        except MalformedOutputError as exc:
+            return WorkspaceResult(success=False, error=f"{APPLY_FAILED_ERROR_PREFIX} {exc}")
+
+        diff_output = get_working_diff(repo_path)
+
+        passed, test_output = run_ci_checks(repo_path, ci_command, env=env)
+        if not passed:
+            return WorkspaceResult(
+                success=False,
+                test_output=test_output,
+                diff_output=diff_output,
+                error="CI checks failed",
+            )
+
+        guard.disarm()
+        return WorkspaceResult(success=True, test_output=test_output, diff_output=diff_output)
