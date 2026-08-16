@@ -44,6 +44,9 @@ on:
       gh_token:
         description: "Token used for gh CLI calls (PR/issue read and write)"
         required: true
+      cicaid_core_token:
+        description: "Fine-grained PAT (Contents: Read-only) scoped to leonarduk/cicaid-core, used to install cicaid-devtools since the review modules (review_diff, review_comment, deepseek_review, gpt_review, etc.) only exist in the private cicaid-core package"
+        required: true
 
 # github.workflow resolves to the *calling* workflow's name (DeepSeek/GPT PR
 # Review), so this groups per-provider without cross-cancelling other
@@ -71,11 +74,17 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install cicaid-devtools
-        # Pinned to a stale release wheel (v0.1.0) that lacks review_diff /
-        # review_comment; pinned instead to the commit on main that has them,
-        # matching this org's tag-pinning convention until a new release ships.
-        run: python -m pip install "cicaid-devtools @ git+https://github.com/leonarduk/cicaid.git@30d9ae0053ef08afe32eba3f380274451eda5663"
+      # The AI-review modules this workflow imports below (review_diff,
+      # review_comment, deepseek_review, gpt_review, etc.) only exist in the
+      # private leonarduk/cicaid-core package, not the public leonarduk/cicaid
+      # "free shell" repo -- installing the public wheel/repo either 404s or
+      # is missing these modules. pip_install_cicaid_core.sh validates the
+      # token up front and exposes the credential only to the pip process
+      # through GIT_CONFIG_* variables.
+      - name: Install cicaid-devtools (PR review helpers)
+        env:
+          CICAID_CORE_TOKEN: ${{ secrets.cicaid_core_token }}
+        run: bash .github/scripts/pip_install_cicaid_core.sh pip install --retries 10 "cicaid-devtools @ git+https://github.com/leonarduk/cicaid-core.git@v0.9.1"
 
       - name: Get linked issue body
         id: issue
