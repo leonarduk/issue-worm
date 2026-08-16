@@ -34,6 +34,9 @@ planned. See the [open-core split](docs/monetization-split-plan.md) for a
 complete list of what is available in this MIT-licensed package and what
 requires the private package.
 
+For a component-by-component breakdown of the public shell and private
+pipeline, see the [open-core split](./docs/monetization-split-plan.md).
+
 ## License
 
 MIT — see [LICENSE](./LICENSE).
