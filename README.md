@@ -32,6 +32,9 @@ reproduce, and is kept in a private package, issue-worm-core. Contact
 the maintainer for access, or watch this repo — a payment link is
 planned.
 
+For a component-by-component breakdown of the public shell and private
+pipeline, see the [open-core split](./docs/monetization-split-plan.md).
+
 ## License
 
 MIT — see [LICENSE](./LICENSE).
