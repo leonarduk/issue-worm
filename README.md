@@ -30,7 +30,9 @@ The automated pipeline (multi-agent retry loop, LLM-based issue
 triage/review) is the part of issue-worm that's actually hard to
 reproduce, and is kept in a private package, issue-worm-core. Contact
 the maintainer for access, or watch this repo — a payment link is
-planned.
+planned. See the [open-core split](docs/monetization-split-plan.md) for a
+complete list of what is available in this MIT-licensed package and what
+requires the private package.
 
 ## License
 
