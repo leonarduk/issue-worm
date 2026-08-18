@@ -44,8 +44,8 @@ on:
       gh_token:
         description: "Token used for gh CLI calls (PR/issue read and write)"
         required: true
-      cicaid_core_token:
-        description: "Fine-grained PAT (Contents: Read-only) scoped to leonarduk/cicaid-core, used to install cicaid-devtools since the review modules (review_diff, review_comment, deepseek_review, gpt_review, etc.) only exist in the private cicaid-core package"
+      cicaid_pro_token:
+        description: "Fine-grained PAT (Contents: Read-only) scoped to leonarduk/cicaid-pro, used to install cicaid-devtools-pro since the review modules (review_diff, review_comment, deepseek_review, gpt_review, etc.) only exist in the private cicaid-pro package"
         required: true
 
 # github.workflow resolves to the *calling* workflow's name (DeepSeek/GPT PR
@@ -76,15 +76,23 @@ jobs:
 
       # The AI-review modules this workflow imports below (review_diff,
       # review_comment, deepseek_review, gpt_review, etc.) only exist in the
-      # private leonarduk/cicaid-core package, not the public leonarduk/cicaid
+      # private leonarduk/cicaid-pro package, not the public leonarduk/cicaid
       # "free shell" repo -- installing the public wheel/repo either 404s or
-      # is missing these modules. pip_install_cicaid_core.sh validates the
+      # is missing these modules. pip_install_cicaid_pro.sh validates the
       # token up front and exposes the credential only to the pip process
       # through GIT_CONFIG_* variables.
-      - name: Install cicaid-devtools (PR review helpers)
+      # cicaid-devtools-pro's own pyproject.toml declares a bare
+      # "cicaid-devtools" dependency (no URL - per cicaid-pro's MIGRATION.md
+      # it expects the free package already installed). This is a fresh venv
+      # unrelated to this repo's own requirements files, so it must be
+      # installed explicitly here too. Public repo, no token needed.
+      - name: Install cicaid-devtools
+        run: pip install "cicaid-devtools @ git+https://github.com/leonarduk/cicaid.git@v0.2.4"
+
+      - name: Install cicaid-devtools-pro (PR review helpers)
         env:
-          CICAID_CORE_TOKEN: ${{ secrets.cicaid_core_token }}
-        run: bash .github/scripts/pip_install_cicaid_core.sh pip install --retries 10 "cicaid-devtools @ git+https://github.com/leonarduk/cicaid-core.git@v0.9.1"
+          CICAID_PRO_TOKEN: ${{ secrets.cicaid_pro_token }}
+        run: bash .github/scripts/pip_install_cicaid_pro.sh pip install --retries 10 "cicaid-devtools-pro @ git+https://github.com/leonarduk/cicaid-pro.git@v0.11.4"
 
       - name: Get linked issue body
         id: issue
