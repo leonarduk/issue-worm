@@ -31,7 +31,7 @@
 # Required env: CICAID_PRO_TOKEN
 set -euo pipefail
 
-if [ -z "${cicaid_pro_token:-}" ]; then
+if [ -z "${CICAID_PRO_TOKEN:-}" ]; then
   echo "::error::CICAID_PRO_TOKEN is empty or unset. Add a fine-grained PAT (Contents: Read-only, scoped to leonarduk/cicaid-pro) as the CICAID_PRO_TOKEN repository secret (Settings > Secrets and variables > Actions) before this workflow can install cicaid-devtools-pro." >&2
   exit 1
 fi
