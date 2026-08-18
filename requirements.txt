@@ -1,4 +1,4 @@
-cicaid-devtools[dotenv] @ https://github.com/leonarduk/cicaid/releases/download/v0.1.0/cicaid_devtools-0.1.0-py3-none-any.whl
+cicaid-devtools[dotenv] @ git+https://github.com/leonarduk/cicaid.git@v0.2.4
 python-dotenv>=1.0  # config.load_config() loads .env; declared directly, not just via cicaid's [dotenv] extra
 
 # Direct imports in version_checker.py (the update check): requests and
