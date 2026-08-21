@@ -81,10 +81,15 @@ jobs:
       # modules. pip_install_cicaid_pro.sh validates the token up front and
       # exposes the credential only to the pip process through GIT_CONFIG_*
       # variables.
+      # cicaid-devtools-pro's own pyproject.toml declares a bare
+      # "cicaid-devtools" dependency (no URL - per cicaid-pro's MIGRATION.md
+      # it expects the free package already installed). This is a fresh venv
+      # unrelated to this repo's own requirements files, so it must be
+      # installed explicitly here too. Public repo, no token needed.
       - name: Install cicaid-devtools + cicaid-devtools-pro (PR review helpers)
         env:
           CICAID_PRO_TOKEN: ${{ secrets.cicaid_pro_token }}
-        run: bash .github/scripts/pip_install_cicaid_pro.sh pip install --retries 10 "cicaid-devtools @ git+https://github.com/leonarduk/cicaid.git@v0.2.4" "cicaid-devtools-pro @ git+https://github.com/leonarduk/cicaid-pro.git@v0.11.2"
+        run: bash .github/scripts/pip_install_cicaid_pro.sh pip install --retries 10 "cicaid-devtools @ git+https://github.com/leonarduk/cicaid.git@v0.2.4" "cicaid-devtools-pro @ git+https://github.com/leonarduk/cicaid-pro.git@v0.11.4"
 
       - name: Get linked issue body
         id: issue
