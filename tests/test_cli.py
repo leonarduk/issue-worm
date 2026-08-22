@@ -3,6 +3,7 @@ issue-worm-pro commands (triage/poll) report themselves unavailable
 rather than crashing on a missing private package.
 """
 
+import os
 import sys
 from unittest.mock import MagicMock, patch
 
@@ -78,7 +79,8 @@ def test_build_without_issue_fails_fast(capsys):
 
 
 @pytest.mark.parametrize(
-    "bad_repo", ["no-slash", "too/many/slashes", "owner/", "/name"]
+    "bad_repo",
+    ["no-slash", "too/many/slashes", "owner/", "/name", "owner/name\n"],
 )
 def test_build_rejects_malformed_repo(bad_repo, capsys):
     with patch.object(
@@ -204,7 +206,8 @@ def test_build_applies_changes_end_to_end(tmp_path, capsys):
     assert "a.py" in out
 
 
-def test_build_workspace_flag_overrides_default(tmp_path):
+def test_build_workspace_flag_overrides_default(tmp_path, monkeypatch):
+    monkeypatch.delenv("WORKSPACE_ROOT", raising=False)
     ready = ReviewResult(ready=True, files=["a.py"], done="it works")
     custom = str(tmp_path / "custom-ws")
     with patch.object(
@@ -268,6 +271,30 @@ def test_build_env_var_used_when_no_workspace_flag(tmp_path, monkeypatch):
         cli.main()
 
     mock_clone.assert_called_once_with(from_env, "o/r")
+
+
+def test_build_default_workspace_used_when_neither_flag_nor_env_set(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("WORKSPACE_ROOT", raising=False)
+    ready = ReviewResult(ready=True, files=["a.py"], done="it works")
+    with patch.object(
+        sys, "argv", ["issue-worm", "build", "5", "--repo", "o/r"]
+    ), patch("cli._fetch_issue_body", return_value="body"), patch(
+        "cli.review_issue", return_value=ready
+    ), patch(
+        "cli.ensure_base_clone", return_value=str(tmp_path)
+    ) as mock_clone, patch(
+        "cli.LocalOllamaCoder"
+    ) as mock_coder_cls, patch(
+        "cli.parse_coder_output", return_value=[]
+    ), pytest.raises(SystemExit):
+        mock_coder_cls.return_value.propose.return_value = "raw coder output"
+        cli.main()
+
+    mock_clone.assert_called_once_with(
+        os.path.join(".issue-worm-workspace", "o_r"), "o/r"
+    )
 
 
 def test_build_reports_malformed_coder_output(tmp_path, capsys):

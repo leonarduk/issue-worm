@@ -151,7 +151,7 @@ def _run_build(args, config: dict) -> int:
     if not args.repo:
         print("✗ `build` needs --repo owner/name", file=sys.stderr)
         return 2
-    if not _REPO_RE.match(args.repo):
+    if not _REPO_RE.fullmatch(args.repo):
         print(
             f"✗ Invalid --repo {args.repo!r} — expected 'owner/name' "
             "(e.g. 'octocat/Hello-World')",
