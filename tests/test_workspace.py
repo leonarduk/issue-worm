@@ -1321,6 +1321,25 @@ def test_non_interactive_env_does_not_double_up_batchmode(given, monkeypatch):
     assert env["GIT_SSH_COMMAND"] == given
 
 
+def test_only_stdin_decides_not_stdout(monkeypatch):
+    """`issue-worm build | tee run.log` still prompts (#58).
+
+    Pins a README claim that is easy to get wrong in either direction:
+    piping *output* is the common case, and it leaves stdin a terminal,
+    so the guard must not engage. Only stdin redirection does that.
+    """
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(True))
+    monkeypatch.setattr(sys, "stdout", _FakeStdin(False))
+    monkeypatch.setattr(sys, "stderr", _FakeStdin(False))
+
+    # A terminal on stdin, pipes on stdout/stderr: interactive.
+    assert _non_interactive_env(None) is None
+
+    # Redirecting stdin is what flips it.
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(False))
+    assert _non_interactive_env(None)["GIT_TERMINAL_PROMPT"] == "0"
+
+
 def test_non_interactive_env_append_survives_shell_quoting(monkeypatch):
     """Appending cannot break a quoted GIT_SSH_COMMAND.
 
