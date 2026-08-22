@@ -243,6 +243,18 @@ def test_fetch_issue_body_reports_rate_limit(capsys):
     assert "rate limit" in capsys.readouterr().err
 
 
+def test_fetch_issue_body_reports_scope_error_for_403_without_rate_limit_header(capsys):
+    with patch(
+        "cli.requests.get", return_value=_mock_get_response(403, headers={})
+    ):
+        result = cli._fetch_issue_body("o/r", 5)
+
+    assert result is None
+    err = capsys.readouterr().err
+    assert "403" in err
+    assert "GITHUB_TOKEN" in err
+
+
 def test_fetch_issue_body_reports_generic_request_error(capsys):
     with patch(
         "cli.requests.get", side_effect=requests.ConnectionError("dns failure")

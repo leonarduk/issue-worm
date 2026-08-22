@@ -113,14 +113,20 @@ def _fetch_issue_body(repo: str, issue_number: int) -> str | None:
     if response.status_code == 404:
         print(f"✗ Issue {repo}#{issue_number} not found", file=sys.stderr)
         return None
-    if response.status_code == 403 and response.headers.get(
-        "X-RateLimit-Remaining"
-    ) == "0":
-        print(
-            "✗ GitHub API rate limit exceeded — set GITHUB_TOKEN for a "
-            "higher limit, or wait and retry",
-            file=sys.stderr,
-        )
+    if response.status_code == 403:
+        if response.headers.get("X-RateLimit-Remaining") == "0":
+            print(
+                "✗ GitHub API rate limit exceeded — set GITHUB_TOKEN for a "
+                "higher limit, or wait and retry",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"✗ GitHub denied access to {repo}#{issue_number} (403) — "
+                "for a private repo, GITHUB_TOKEN may be missing or lack "
+                "the required scope",
+                file=sys.stderr,
+            )
         return None
     try:
         response.raise_for_status()
