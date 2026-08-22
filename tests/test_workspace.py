@@ -1,6 +1,7 @@
 """Tests for workspace.py: reset-and-retry, diff/full-file apply, CI checks,
 and rollback on failure or interruption."""
 
+import logging
 import subprocess
 import tempfile
 from pathlib import Path
@@ -15,6 +16,8 @@ from workspace import (
     FileChange,
     MalformedOutputError,
     WorkspaceError,
+    _redact_url,
+    _repo_identity,
     _run_git,
     apply_file_change,
     ensure_base_clone,
@@ -869,3 +872,294 @@ def test_sanitize_file_path_keeps_legitimate_parentheses():
     assert sanitize_file_path("src/foo(bar).py") == "src/foo(bar).py"
     assert sanitize_file_path("docs/api(v2)/index.md") == "docs/api(v2)/index.md"
     assert sanitize_file_path("docs/ (if applicable)") == "docs/"
+
+
+# --- #208: run_ci_checks honours a caller-supplied timeout ----------------
+
+
+def test_run_ci_checks_passes_custom_timeout(repo):
+    """An explicit timeout overrides DEFAULT_CI_TIMEOUT (#208).
+
+    The parameter wiring is the same shape as _run_git's, which is
+    already covered; this pins the public method too, so a refactor that
+    drops the argument before it reaches subprocess.run is caught.
+    """
+    with patch("workspace.subprocess.run") as m_run:
+        m_run.return_value = subprocess.CompletedProcess([], 0, stdout="ok", stderr="")
+        passed, _ = run_ci_checks(repo, ["echo", "hi"], timeout=123)
+
+    assert passed is True
+    assert m_run.call_args.kwargs["timeout"] == 123
+
+
+def test_run_ci_checks_custom_timeout_appears_in_the_error(repo):
+    """The WorkspaceError quotes the effective timeout, not the default."""
+    with patch(
+        "workspace.subprocess.run",
+        side_effect=subprocess.TimeoutExpired(["pytest"], 123),
+    ):
+        with pytest.raises(WorkspaceError, match="timed out after 123s"):
+            run_ci_checks(repo, ["pytest"], timeout=123)
+
+
+# --- #178: an existing checkout must be the scheduled repository ----------
+
+
+@pytest.mark.parametrize(
+    ("url", "identity"),
+    [
+        ("https://github.com/owner/name.git", "github.com/owner/name"),
+        ("https://github.com/owner/name", "github.com/owner/name"),
+        ("https://github.com/owner/name/", "github.com/owner/name"),
+        ("git@github.com:owner/name.git", "github.com/owner/name"),
+        ("git@github.com:owner/name", "github.com/owner/name"),
+        ("ssh://git@github.com/owner/name.git", "github.com/owner/name"),
+        (
+            "https://x-access-token:TOKEN@github.com/owner/name.git",
+            "github.com/owner/name",
+        ),
+        # Case is not significant on GitHub.
+        ("https://github.com/OWNER/Name.git", "github.com/owner/name"),
+        # GitHub's SSH-over-443 endpoint and the www alias are github.com.
+        ("ssh://git@ssh.github.com:443/owner/name.git", "github.com/owner/name"),
+        ("git@ssh.github.com:owner/name.git", "github.com/owner/name"),
+        ("https://www.github.com/owner/name", "github.com/owner/name"),
+        # A different forge is a different repository, same owner/name.
+        ("https://gitlab.com/owner/name.git", "gitlab.com/owner/name"),
+        # Unrecognised shapes are "cannot verify", not a mismatch. The
+        # file:// cases matter most: an authority-less URL must not have
+        # its first path segment mistaken for an owner.
+        ("file:///srv/repo", None),
+        ("file:///data/mirror", None),
+        ("/plain/local/path", None),
+        ("../relative", None),
+        ("C:\\path\\to\\repo", None),
+        ("", None),
+        ("   ", None),
+        ("not a url", None),
+        ("https://github.com/owner", None),
+        ("https://github.com/owner/name/extra", None),
+        # A port on a non-aliased host is stripped, the host is not.
+        ("https://github.com:8443/owner/name.git", "github.com/owner/name"),
+        ("https://git.example.com:8443/owner/name.git", "git.example.com/owner/name"),
+        # scp-style needs a real owner/name: a Windows path and a
+        # host:port pair are not repositories.
+        ("example.com:8080", None),
+        ("C:/path/to/repo", None),
+        ("C:/repo", None),
+        ("C:\\repo", None),
+        # Drive-relative Windows paths: no leading slash, so the path
+        # shape alone does not exclude them — the host must.
+        ("C:repo/sub", None),
+        ("D:a/b", None),
+        # ...but a short real hostname is still a hostname.
+        ("gitserver:owner/name", "gitserver/owner/name"),
+        # A bare host:port with a path is not an scp remote either: the
+        # port lands in the path, giving three segments, not two.
+        ("example.com:8080/owner/name", None),
+    ],
+)
+def test_repo_identity_normalises_remote_urls(url, identity):
+    """Identity, not URL spelling — SSH and HTTPS name the same repo."""
+    assert _repo_identity(url) == identity
+
+
+def test_ensure_base_clone_rejects_a_checkout_of_another_repo(repo):
+    """A misconfigured WORKSPACE_ROOT fails loudly instead of silently (#178)."""
+    with patch("workspace._run_git") as m_git:
+
+        def _fake(path, *args, **kwargs):
+            if args[:1] == ("rev-parse",):
+                return subprocess.CompletedProcess([], 0, stdout="", stderr="")
+            if args[:3] == ("remote", "get-url", "origin"):
+                return subprocess.CompletedProcess(
+                    [], 0, stdout="https://github.com/someone/other.git\n", stderr=""
+                )
+            raise AssertionError(f"unexpected git call: {args}")
+
+        m_git.side_effect = _fake
+        with pytest.raises(WorkspaceError, match="not 'github.com/owner/name'"):
+            ensure_base_clone(repo, "owner/name")
+
+
+def test_ensure_base_clone_accepts_an_ssh_remote_of_the_same_repo(repo):
+    """The pre-clone route documented for private repos must keep working.
+
+    Private repos are pre-cloned by hand (#177), very often over SSH. A
+    strict URL-string comparison would reject exactly that setup.
+    """
+    with patch("workspace._run_git") as m_git:
+
+        def _fake(path, *args, **kwargs):
+            if args[:1] == ("rev-parse",):
+                return subprocess.CompletedProcess([], 0, stdout="", stderr="")
+            if args[:3] == ("remote", "get-url", "origin"):
+                return subprocess.CompletedProcess(
+                    [], 0, stdout="git@github.com:Owner/Name.git\n", stderr=""
+                )
+            raise AssertionError(f"unexpected git call: {args}")
+
+        m_git.side_effect = _fake
+        assert ensure_base_clone(repo, "owner/name") == repo
+
+
+def test_ensure_base_clone_allows_a_checkout_with_no_origin(repo, caplog):
+    """No origin means "cannot verify", not "wrong repo"."""
+    with patch("workspace._run_git") as m_git:
+
+        def _fake(path, *args, **kwargs):
+            if args[:1] == ("rev-parse",):
+                return subprocess.CompletedProcess([], 0, stdout="", stderr="")
+            if args[:3] == ("remote", "get-url", "origin"):
+                return subprocess.CompletedProcess(
+                    [], 2, stdout="", stderr="error: No such remote 'origin'"
+                )
+            raise AssertionError(f"unexpected git call: {args}")
+
+        m_git.side_effect = _fake
+        with caplog.at_level(logging.WARNING):
+            assert ensure_base_clone(repo, "owner/name") == repo
+
+    assert "skipping the base-clone repository check" in caplog.text
+
+
+def _origin_only(url: str):
+    """A _run_git fake answering rev-parse and `remote get-url origin`."""
+
+    def _fake(path, *args, **kwargs):
+        if args[:1] == ("rev-parse",):
+            return subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        if args[:3] == ("remote", "get-url", "origin"):
+            return subprocess.CompletedProcess([], 0, stdout=url + "\n", stderr="")
+        raise AssertionError(f"unexpected git call: {args}")
+
+    return _fake
+
+
+def test_ensure_base_clone_mismatch_never_echoes_a_token(repo):
+    """A credential-bearing origin must not reach the error text (#178).
+
+    The message goes to stderr and to log files, so a token in the remote
+    URL would leak there.
+    """
+    token_url = "https://x-access-token:ghp_SECRETVALUE@github.com/someone/other.git"
+    with patch("workspace._run_git", side_effect=_origin_only(token_url)):
+        with pytest.raises(WorkspaceError) as exc:
+            ensure_base_clone(repo, "owner/name")
+
+    assert "ghp_SECRETVALUE" not in str(exc.value)
+    assert "x-access-token" not in str(exc.value)
+    assert "***@github.com" in str(exc.value)
+
+
+def test_ensure_base_clone_mismatch_can_be_downgraded_by_env(repo, monkeypatch, caplog):
+    """A deliberate fork-origin workspace has an escape hatch (#178)."""
+    monkeypatch.setenv("WORM_SKIP_REMOTE_CHECK", "1")
+    with patch(
+        "workspace._run_git",
+        side_effect=_origin_only("https://github.com/myfork/name.git"),
+    ):
+        with caplog.at_level(logging.WARNING):
+            assert ensure_base_clone(repo, "owner/name") == repo
+
+    assert "WORM_SKIP_REMOTE_CHECK=1" in caplog.text
+
+
+def test_ensure_base_clone_survives_a_git_timeout_reading_origin(repo, caplog):
+    """The check fails open even when _run_git itself raises (#178)."""
+
+    def _fake(path, *args, **kwargs):
+        if args[:1] == ("rev-parse",):
+            return subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        raise WorkspaceError("git remote get-url origin timed out after 30.0s")
+
+    with patch("workspace._run_git", side_effect=_fake):
+        with caplog.at_level(logging.WARNING):
+            assert ensure_base_clone(repo, "owner/name") == repo
+
+    assert "skipping the base-clone repository check" in caplog.text
+
+
+def test_ensure_base_clone_disables_git_credential_prompts(tmp_path):
+    """A private repo must fail fast, not sit on a prompt for 600s (#177)."""
+    with patch("workspace._run_git") as m_git:
+        m_git.return_value = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        ensure_base_clone(str(tmp_path / "clone"), "owner/repo")
+
+    assert m_git.call_args.kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        # Nothing to redact.
+        ("https://github.com/owner/name.git", "https://github.com/owner/name.git"),
+        ("", ""),
+        # user:password and token forms.
+        (
+            "https://x-access-token:ghp_SECRET@github.com/owner/name.git",
+            "https://***@github.com/owner/name.git",
+        ),
+        (
+            "https://user:pass@github.com/owner/name",
+            "https://***@github.com/owner/name",
+        ),
+        ("https://ghp_SECRET@github.com/o/n", "https://***@github.com/o/n"),
+        # An @ later in the path is not userinfo and must survive.
+        (
+            "https://github.com/owner/name@v2.git",
+            "https://github.com/owner/name@v2.git",
+        ),
+        # scp-style carries userinfo too, with no "://" to anchor on.
+        (
+            "user:pass@github.com:owner/name.git",
+            "***@github.com:owner/name.git",
+        ),
+        ("git@github.com:owner/name.git", "***@github.com:owner/name.git"),
+        # Userinfo and a port together: only the userinfo goes.
+        (
+            "https://user:pass@github.com:8443/owner/name",
+            "https://***@github.com:8443/owner/name",
+        ),
+    ],
+)
+def test_redact_url_strips_userinfo(url, expected):
+    """Credentials never reach an error message or a log line (#178)."""
+    assert _redact_url(url) == expected
+    if "SECRET" in url or "pass@" in url:
+        assert "SECRET" not in _redact_url(url)
+        assert "pass" not in _redact_url(url)
+
+
+def test_ensure_base_clone_skips_the_check_for_a_malformed_repo(repo, caplog):
+    """A repo argument that is not owner/name cannot be compared (#178).
+
+    Fail-open, like every other case the check cannot resolve: it must
+    not invent a mismatch out of an argument it could not parse.
+    """
+    with patch(
+        "workspace._run_git",
+        side_effect=_origin_only("https://github.com/someone/other.git"),
+    ):
+        with caplog.at_level(logging.WARNING):
+            assert ensure_base_clone(repo, "owner/name/extra") == repo
+
+    # No mismatch was reported — the check simply did not run.
+    assert "refusing to run against the wrong repository" not in caplog.text
+
+
+def test_ensure_base_clone_survives_a_non_timeout_git_error_reading_origin(
+    repo, caplog
+):
+    """Any WorkspaceError from the origin read fails open, not just a timeout."""
+
+    def _fake(path, *args, **kwargs):
+        if args[:1] == ("rev-parse",):
+            return subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        raise WorkspaceError("git remote get-url origin failed: not a git repository")
+
+    with patch("workspace._run_git", side_effect=_fake):
+        with caplog.at_level(logging.WARNING):
+            assert ensure_base_clone(repo, "owner/name") == repo
+
+    assert "skipping the base-clone repository check" in caplog.text

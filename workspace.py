@@ -6,11 +6,48 @@ Branch creation is out of scope here (see docs/design.md's "Relationship
 to cicaid") - `cicaid work-on-issue <id> --type fix` has already checked
 out the branch this module operates on before orchestrator.py calls in.
 No LLM calls happen in this module.
+
+Timeouts (#45, #209)
+--------------------
+
+Every subprocess this module starts is bounded, so a hung git or CI
+command surfaces as an error instead of blocking the orchestrator
+forever. Each default can be overridden per call via a ``timeout``
+argument; the four bounds differ because the operations do:
+
+===========================  =======  =========================================
+Constant                     Default  Applies to
+===========================  =======  =========================================
+:data:`DEFAULT_GIT_TIMEOUT`     30s   :func:`_run_git` - local git operations,
+                                      which are fast and purely on-disk.
+:data:`FETCH_TIMEOUT`          120s   ``git fetch origin`` in
+                                      :func:`refresh_to_main` - talks to the
+                                      network, so a big repo over a slow link
+                                      legitimately outlasts the git default.
+:data:`CLONE_TIMEOUT`          600s   the ``git clone`` in
+                                      :func:`ensure_base_clone` - a full clone
+                                      of a large repo takes minutes.
+:data:`DEFAULT_CI_TIMEOUT`     600s   :func:`run_ci_checks` - a real test suite
+                                      takes minutes.
+===========================  =======  =========================================
+
+Note the two different failure shapes. A CI command that *fails* is
+reported as ``(False, output)`` so the Analyser can read it like any test
+failure; a CI command that *times out* raises :class:`WorkspaceError`, so
+a stall is never mistaken for a red test run. Git timeouts always raise.
+
+Environment variables (#178)
+----------------------------
+
+``WORM_SKIP_REMOTE_CHECK=1`` downgrades :func:`ensure_base_clone`'s
+repository check from an error to a warning, for a workspace whose
+``origin`` is deliberately not the repo being scheduled (a fork).
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import re
 import subprocess
 from dataclasses import dataclass
@@ -24,6 +61,18 @@ logger = logging.getLogger(__name__)
 # agents/coder.py imports these back for the instructions it gives the LLM.
 MODE_FULL = "FULL"
 MODE_DIFF = "DIFF"
+
+# The only forge this package clones from; part of a checkout's
+# identity in _repo_identity (#178).
+GITHUB_HOST = "github.com"
+
+# Hosts that are github.com under another name: the SSH-over-443 endpoint
+# GitHub documents for restrictive firewalls, and the www alias.
+_HOST_ALIASES = {"ssh.github.com": GITHUB_HOST, "www.github.com": GITHUB_HOST}
+
+# Set to "1" to downgrade a base-clone repository mismatch from an
+# error to a warning (a deliberate fork-origin workspace).
+SKIP_REMOTE_CHECK_ENV = "WORM_SKIP_REMOTE_CHECK"
 
 # `cicaid run-ci-checks` reads .cicaid-checks.toml in the target repo (see
 # design.md's "Relationship to cicaid"); orchestrator.py/config.py can pass
@@ -121,6 +170,7 @@ def _run_git(
     check: bool = True,
     input_text: str | None = None,
     timeout: float | None = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     """Run a git command in ``repo_path`` with a bounded subprocess timeout.
 
@@ -128,6 +178,13 @@ def _run_git(
     operations are fast; the bound exists to turn a hung git process —
     network filesystem, stuck lock — into a :class:`WorkspaceError`
     instead of an indefinite orchestrator block, #45).
+
+    ``env`` is the subprocess's **full** environment, not additions to it
+    - the same convention as :func:`run_ci_checks` and ``subprocess.run``
+    itself. None inherits the parent's, as before. A caller wanting to
+    add one variable must spread the parent explicitly::
+
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}
     """
     effective_timeout = DEFAULT_GIT_TIMEOUT if timeout is None else timeout
     try:
@@ -139,6 +196,7 @@ def _run_git(
             encoding="utf-8",
             input=input_text,
             timeout=effective_timeout,
+            env=env,
         )
     except subprocess.TimeoutExpired as exc:
         raise WorkspaceError(
@@ -422,6 +480,163 @@ def _is_git_checkout(path: Path) -> bool:
     return result.returncode == 0
 
 
+def _redact_url(url: str) -> str:
+    """``url`` with any userinfo removed, safe to put in a message.
+
+    A remote can carry a token (``https://x-access-token:TOKEN@...``) and
+    these strings reach stderr and log files, so the credential is
+    stripped before the URL is ever shown.
+    """
+    # Two shapes carry userinfo: a URL (scheme://user:pass@host/...) and
+    # scp-style (user:pass@host:owner/name). Both are redacted; the
+    # lookbehind on the first keeps an "@" later in the path - a ref like
+    # name@v2 - untouched.
+    url = re.sub(r"(?<=://)[^/@]*@", "***@", url)
+    if "://" not in url:
+        url = re.sub(r"^[^/@]*@", "***@", url)
+    return url
+
+
+def _repo_identity(url: str) -> str | None:
+    """The ``host/owner/name`` a git remote URL points at, lowercased.
+
+    Compares *identity*, not URL spelling (#178). All of these name the
+    same repository and must compare equal, because a pre-cloned
+    checkout - the documented way to use a private repo, see
+    :func:`ensure_base_clone` - is very often an SSH one::
+
+        https://github.com/owner/name.git
+        https://github.com/owner/name
+        git@github.com:owner/name.git
+        ssh://git@github.com/owner/name.git
+        https://x-access-token:TOKEN@github.com/owner/name.git
+
+    The host is part of the identity: ``gitlab.com/owner/name`` is not
+    ``github.com/owner/name``, and this package only ever clones from
+    github.com.
+
+    Returns None for anything unrecognised - a bare local path, a
+    ``file://`` URL, a URL with no host - which callers treat as "cannot
+    verify" rather than as a mismatch. Refusing to run against a checkout
+    whose remote we merely failed to parse would be worse than the stale
+    checkout this guards against.
+    """
+    url = url.strip()
+    if not url:
+        return None
+    # scp-style SSH: [user@]host:owner/name(.git) - no "//", which is what
+    # separates it from a URL, and a path that is relative and has exactly
+    # one "/" in it. The narrow path is what keeps "C:\dir\repo" and
+    # "example.com:8080" from being read as a host and a repository at all
+    # (both used to match and then fail the segment count instead).
+    # The host needs at least two characters: a one-character "host" is a
+    # Windows drive letter, and "C:repo/sub" is a drive-relative path, not
+    # a remote. (C:/repo and C:\repo are already excluded by the path
+    # having to be relative.)
+    scp = re.match(
+        r"^(?:[^/@]+@)?(?P<host>[^/:]{2,}):(?P<path>[^/][^:]*/[^/:]+)$", url
+    )
+    if scp and "//" not in url:
+        host, path = scp.group("host"), scp.group("path")
+    else:
+        match = re.match(
+            r"^[a-zA-Z][a-zA-Z0-9+.-]*://(?P<host>[^/]*)/(?P<path>.+)$", url
+        )
+        if not match:
+            return None
+        host, path = match.group("host"), match.group("path")
+        # An authority-less URL (file:///srv/repo) has consumed the path's
+        # own leading slash as the host separator, so what looks like an
+        # owner is really a directory. Not a repository we can identify.
+        if not host:
+            return None
+    # Strip any userinfo and port from the host, then fold the aliases so
+    # an ssh.github.com remote is not mistaken for a different forge.
+    host = host.rsplit("@", 1)[-1].split(":", 1)[0].lower()
+    host = _HOST_ALIASES.get(host, host)
+    path = path.strip("/")
+    if path.endswith(".git"):
+        path = path[: -len(".git")]
+    parts = [part for part in path.split("/") if part]
+    if not host or len(parts) != 2:
+        return None
+    return f"{host}/{parts[0]}/{parts[1]}".lower()
+
+
+def _check_existing_remote(path: Path, repo: str) -> None:
+    """Warn or raise when an existing checkout is a different repository.
+
+    A misconfigured WORKSPACE_ROOT pointing at another project would
+    otherwise be silent: the pass would refresh, dispatch, and commit
+    against the wrong codebase (#178). ``refresh_to_main`` hard-resets to
+    that origin's ``main``, so the wrong origin means the wrong code, not
+    merely the wrong label.
+
+    Only an unambiguous mismatch - both sides parsed, both naming a
+    repository, and the two differing - raises. A missing ``origin``, a
+    git failure, or an unparseable URL warns and continues, so an unusual
+    but working setup is never blocked by this check. Set
+    ``WORM_SKIP_REMOTE_CHECK=1`` to downgrade even a real mismatch to a
+    warning, for a deliberate fork-origin setup.
+    """
+    try:
+        result = _run_git(str(path), "remote", "get-url", "origin", check=False)
+    except WorkspaceError as exc:
+        # _run_git raises on timeout; this check must never be the thing
+        # that stops a pass, so it fails open like every branch below.
+        logger.warning(
+            "Could not read origin's URL in %s (%s); skipping the "
+            "base-clone repository check",
+            path,
+            exc,
+        )
+        return
+    if result.returncode != 0:
+        logger.warning(
+            "Could not read origin's URL in %s (%s); skipping the "
+            "base-clone repository check",
+            path,
+            result.stderr.strip() or f"git exited {result.returncode}",
+        )
+        return
+    actual_url = result.stdout.strip()
+    actual = _repo_identity(actual_url)
+    # Derived from `repo` ("owner/name") directly rather than from
+    # _clone_url: this check never clones, and going through the clone
+    # helper would tie a read-only guard to the fresh-clone path.
+    expected_parts = [part for part in repo.strip().strip("/").split("/") if part]
+    expected = (
+        f"{GITHUB_HOST}/{expected_parts[0]}/{expected_parts[1]}".lower()
+        if len(expected_parts) == 2
+        else None
+    )
+    if actual is None or expected is None:
+        # A local mirror or a bare path is a normal setup we simply cannot
+        # identify — debug, not warning, so it does not shout every pass.
+        logger.debug(
+            "Could not interpret origin's URL %r in %s; skipping the "
+            "base-clone repository check",
+            _redact_url(actual_url),
+            path,
+        )
+        return
+    if actual == expected:
+        return
+    message = (
+        f"WORKSPACE_ROOT {str(path)!r} is a checkout of {actual!r}, not "
+        f"{expected!r} (origin is {_redact_url(actual_url)!r})"
+    )
+    if os.environ.get(SKIP_REMOTE_CHECK_ENV) == "1":
+        logger.warning("%s; continuing because %s=1", message, SKIP_REMOTE_CHECK_ENV)
+        return
+    raise WorkspaceError(
+        f"{message} - refusing to run against the wrong repository. Point "
+        "WORKSPACE_ROOT at a clone of the scheduled repo; if this is a "
+        "deliberate fork setup, either set origin to the upstream and push "
+        f"via a second remote, or set {SKIP_REMOTE_CHECK_ENV}=1 to allow it."
+    )
+
+
 def ensure_base_clone(repo_path: str, repo: str) -> str:
     """Ensure ``repo_path`` (WORKSPACE_ROOT) is a usable git checkout of ``repo``.
 
@@ -432,6 +647,35 @@ def ensure_base_clone(repo_path: str, repo: str) -> str:
     — that is user data, so a ``WorkspaceError`` is raised and the caller
     should skip rather than clobber it. No fetch/pull of an existing
     checkout: the worker's own ``commit-and-push`` is what advances it.
+
+    A reused checkout is checked against ``repo`` first (#178): if its
+    ``origin`` names a different repository, that is a misconfigured
+    WORKSPACE_ROOT and raises rather than silently dispatching against
+    the wrong codebase. The comparison is on the ``owner/name`` identity,
+    not the URL's spelling, so SSH and HTTPS remotes of the same repo are
+    equivalent; an origin that cannot be read or parsed warns and is
+    allowed through.
+
+    Private repositories (#177)
+        Fresh cloning is **HTTPS without credentials** — :func:`_clone_url`
+        builds ``https://github.com/<owner>/<name>.git`` and nothing adds
+        a token. Git may still satisfy that from the host's own
+        configuration (a credential helper, ``gh auth setup-git``, an
+        ``insteadOf`` rewrite to SSH), so private HTTPS cloning does work
+        on a machine set up that way; without one, the clone fails to
+        authenticate.
+
+        The supported route is to create the checkout yourself and point
+        WORKSPACE_ROOT at it; an existing checkout is reused as-is, by
+        any protocol::
+
+            git clone git@github.com:owner/private-repo.git /srv/worm/private-repo
+            # .env
+            WORKSPACE_ROOT=/srv/worm/private-repo
+
+        Whatever credentials that clone was made with (an SSH key, a
+        stored HTTPS token, a credential helper) are what the later
+        ``git fetch``/``push`` use, since they run in that checkout.
 
     Args:
         repo_path: The base-clone path (WORKSPACE_ROOT).
@@ -453,6 +697,7 @@ def ensure_base_clone(repo_path: str, repo: str) -> str:
                 f"WORKSPACE_ROOT {repo_path!r} is not a directory"
             )
         if _is_git_checkout(path):
+            _check_existing_remote(path, repo)
             return str(path)
         if any(path.iterdir()):
             raise WorkspaceError(
@@ -465,6 +710,10 @@ def ensure_base_clone(repo_path: str, repo: str) -> str:
     # subprocess's cwd (the parent directory).
     clone_url = _clone_url(repo)
     path.parent.mkdir(parents=True, exist_ok=True)
+    # _run_git inherits stdin, so a repo needing credentials git cannot
+    # supply non-interactively would sit on a username prompt until
+    # CLONE_TIMEOUT (ten minutes). Fail fast instead, so the private-repo
+    # case surfaces as an auth error the caller can act on (#177).
     result = _run_git(
         str(path.parent),
         "clone",
@@ -472,6 +721,7 @@ def ensure_base_clone(repo_path: str, repo: str) -> str:
         str(path.absolute()),
         check=False,
         timeout=CLONE_TIMEOUT,
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
     )
     if result.returncode != 0:
         raise WorkspaceError(
