@@ -421,3 +421,43 @@ def test_check_and_prompt_windows_defer_failure_continues():
         version_checker.check_and_prompt()  # returns, does not raise
 
     assert "Unable to start the issue-worm updater" in stderr.getvalue()
+
+
+# --- #182: an unexpected payload shape must not take down the CLI ---------
+
+
+@patch("version_checker.installed_version", return_value="1.0.0")
+def test_available_update_reports_a_non_list_assets_field(mock_installed, caplog):
+    """A dict `assets` is rejected at the source, with a warning (#182).
+
+    Iterating a dict yields its str keys, so `asset.get("name")` used to
+    raise AttributeError and take down the CLI at startup. Validating the
+    field instead routes it through the existing ValueError handler, so
+    the user is told the release could not be read rather than the check
+    failing silently.
+    """
+    payload = {
+        "tag_name": "v2.0.0",
+        # An object where the code expects a list of asset objects.
+        "assets": {"issue_worm-2.0.0-py3-none-any.whl": "https://example/x.whl"},
+    }
+    response = Mock()
+    response.raise_for_status = Mock()
+    response.json = Mock(return_value=payload)
+
+    with patch("version_checker.requests.get", return_value=response):
+        with pytest.raises(ValueError, match="non-list assets"):
+            version_checker.latest_release()
+
+        with caplog.at_level(logging.WARNING):
+            assert version_checker.available_update() is None
+
+    assert "Unable to check for an issue-worm update" in caplog.text
+
+
+@patch("version_checker.latest_release", side_effect=AttributeError("str has no get"))
+@patch("version_checker.installed_version", return_value="1.0.0")
+def test_available_update_silent_on_attribute_error(mock_installed, mock_latest):
+    """The backstop for any other payload shape that trips an attribute
+    access (#182): best-effort means None, never a crash at startup."""
+    assert version_checker.available_update() is None

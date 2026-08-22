@@ -141,6 +141,14 @@ def latest_release(*, timeout: float = 2.0) -> Release:
     Version(release_version)  # Reject malformed or unexpected release tags.
     expected_wheel_name = f"issue_worm-{release_version}-py3-none-any.whl"
     assets = payload.get("assets", [])
+    if not isinstance(assets, list):
+        # Caught by available_update's ValueError handler, which *logs*.
+        # The AttributeError backstop there would swallow this silently,
+        # and a release whose assets we cannot read is worth saying (#182).
+        raise ValueError(
+            f"GitHub's latest release has a non-list assets field "
+            f"({type(assets).__name__})"
+        )
     wheel_url = None
     for asset in assets:
         asset_name = asset.get("name")
@@ -172,7 +180,13 @@ def available_update() -> Release | None:
     except ValueError as exc:
         logger.warning("Unable to check for an issue-worm update: %s", exc)
         return None
-    except (KeyError, TypeError, requests.RequestException):
+    except (AttributeError, KeyError, TypeError, requests.RequestException):
+        # AttributeError covers a payload whose shape is right-ish but
+        # wrong in detail (#182): `assets` arriving as a dict makes
+        # `for asset in assets` yield str keys, and `asset.get(...)` then
+        # raises. The update check is best-effort by design — every other
+        # unexpected-payload failure here already returns None rather than
+        # taking down the CLI on startup, and this one must too.
         return None
 
     try:

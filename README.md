@@ -30,6 +30,43 @@ package — see [Access](#access) below.
 pip install issue-worm
 ```
 
+## Working with private repositories
+
+`issue-worm build` works in a checkout it calls the workspace, chosen by
+`--workspace`, else `WORKSPACE_ROOT`, else a default under
+`.issue-worm-workspace/`. When that path is missing or empty it is
+fresh-cloned over **HTTPS with no credentials** — `ensure_base_clone`
+builds `https://github.com/<owner>/<name>.git` and nothing attaches a
+token.
+
+Git may still satisfy that from the machine's own configuration — a
+credential helper, `gh auth setup-git`, or an `insteadOf` rewrite to SSH
+— so private HTTPS cloning does work on a host set up that way. Without
+one, the clone fails to authenticate.
+
+The setup that does not depend on any of that is to create the checkout
+yourself and point the workspace at it; an existing checkout is reused
+as-is, whatever protocol it was cloned with:
+
+```bash
+git clone git@github.com:owner/private-repo.git /srv/worm/private-repo
+```
+
+```bash
+# .env
+WORKSPACE_ROOT=/srv/worm/private-repo
+```
+
+The credentials that clone was made with — an SSH key, a stored HTTPS
+token, a credential helper — are what the later fetches and pushes use,
+since they run inside that checkout.
+
+A reused checkout is checked against the repo you asked for: if its
+`origin` names a different project the run stops rather than committing
+to the wrong codebase. SSH and HTTPS remotes of the same repo count as
+the same repo. For a deliberate fork-origin workspace, set
+`WORM_SKIP_REMOTE_CHECK=1` to downgrade that to a warning.
+
 ## Access
 
 The automated pipeline (multi-agent retry loop, LLM-based issue
