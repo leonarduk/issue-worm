@@ -50,6 +50,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -164,6 +165,47 @@ DEFAULT_CI_TIMEOUT = 600.0
 FETCH_TIMEOUT = 120.0
 
 
+def _stdin_is_a_terminal() -> bool:
+    """True when stdin is a TTY a human could type a git password into.
+
+    Defensive because this decides whether git may block: a missing or
+    closed stdin (pythonw, a daemonised runner, a closed descriptor)
+    answers False, so the safe non-interactive path is the default and
+    only a stdin we positively know is a terminal opts out of it.
+    """
+    stream = getattr(sys, "stdin", None)
+    if stream is None:
+        return False
+    try:
+        return bool(stream.isatty())
+    except (AttributeError, ValueError, OSError):
+        # ValueError: operation on a closed file. OSError: a stdin whose
+        # fileno() cannot be queried.
+        return False
+
+
+def _non_interactive_env(env: dict[str, str] | None) -> dict[str, str] | None:
+    """``env`` with git's credential prompt disabled off a terminal (#58).
+
+    ``subprocess.run(capture_output=True)`` redirects stdout and stderr
+    but *not* stdin, so a git that decides it needs a username inherits
+    the parent's terminal and blocks on a prompt nobody can see. Bounded
+    by the call's timeout, so it is not a hang - but a 120s
+    ``FETCH_TIMEOUT`` spent waiting for typing is reported as a timeout,
+    which names the wrong cause. ``GIT_TERMINAL_PROMPT=0`` makes git say
+    ``could not read Username ... terminal prompts disabled`` instead.
+
+    Applied only when stdin is not a terminal, so `issue-worm build` run
+    by hand can still prompt for credentials the way git normally would;
+    the Scheduler, CI, and any piped invocation get the fast failure. An
+    explicit ``env`` entry wins either way - `ensure_base_clone` sets the
+    variable unconditionally, and keeps that on a TTY too.
+    """
+    if _stdin_is_a_terminal():
+        return env
+    return {**os.environ, "GIT_TERMINAL_PROMPT": "0", **(env or {})}
+
+
 def _run_git(
     repo_path: str,
     *args: str,
@@ -185,6 +227,11 @@ def _run_git(
     add one variable must spread the parent explicitly::
 
         env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+
+    When stdin is not a terminal, ``GIT_TERMINAL_PROMPT=0`` is added by
+    default (#58) - see :func:`_non_interactive_env`. An explicit ``env``
+    still wins, so a caller that sets the variable itself keeps its value
+    on a TTY too.
     """
     effective_timeout = DEFAULT_GIT_TIMEOUT if timeout is None else timeout
     try:
@@ -196,7 +243,7 @@ def _run_git(
             encoding="utf-8",
             input=input_text,
             timeout=effective_timeout,
-            env=env,
+            env=_non_interactive_env(env),
         )
     except subprocess.TimeoutExpired as exc:
         raise WorkspaceError(
@@ -714,6 +761,9 @@ def ensure_base_clone(repo_path: str, repo: str) -> str:
     # supply non-interactively would sit on a username prompt until
     # CLONE_TIMEOUT (ten minutes). Fail fast instead, so the private-repo
     # case surfaces as an auth error the caller can act on (#177).
+    # Set explicitly rather than left to _non_interactive_env's default
+    # (#58): that one steps aside on a TTY so an interactive run can be
+    # prompted, but a ten-minute stall is too long to offer even there.
     result = _run_git(
         str(path.parent),
         "clone",

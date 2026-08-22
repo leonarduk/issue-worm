@@ -2,6 +2,7 @@
 and rollback on failure or interruption."""
 
 import logging
+import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -16,6 +17,7 @@ from workspace import (
     FileChange,
     MalformedOutputError,
     WorkspaceError,
+    _non_interactive_env,
     _redact_url,
     _repo_identity,
     _run_git,
@@ -1163,3 +1165,110 @@ def test_ensure_base_clone_survives_a_non_timeout_git_error_reading_origin(
             assert ensure_base_clone(repo, "owner/name") == repo
 
     assert "skipping the base-clone repository check" in caplog.text
+
+
+# --- #58: git must not block on a credential prompt off a terminal -------
+
+
+class _FakeStdin:
+    def __init__(self, tty):
+        self._tty = tty
+
+    def isatty(self):
+        if isinstance(self._tty, Exception):
+            raise self._tty
+        return self._tty
+
+
+def test_non_interactive_env_disables_prompts_off_a_terminal(monkeypatch):
+    """The default path: no TTY, so git fails fast instead of waiting."""
+    monkeypatch.setattr("workspace.sys.stdin", _FakeStdin(False))
+    env = _non_interactive_env(None)
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+    # A full environment, not just the one key - subprocess.run replaces
+    # rather than merges, so dropping the parent would break PATH.
+    assert "PATH" in env
+
+
+def test_non_interactive_env_leaves_a_terminal_alone(monkeypatch):
+    """On a TTY, `issue-worm build` by hand can still prompt (#58).
+
+    Returning None unchanged is what preserves inheriting the parent's
+    environment, exactly as before this existed.
+    """
+    monkeypatch.setattr("workspace.sys.stdin", _FakeStdin(True))
+    assert _non_interactive_env(None) is None
+    explicit = {"PATH": "/bin"}
+    assert _non_interactive_env(explicit) is explicit
+
+
+def test_non_interactive_env_lets_an_explicit_value_win(monkeypatch):
+    """A caller that sets the variable keeps its value, TTY or not.
+
+    ensure_base_clone sets it unconditionally; that must survive here.
+    """
+    for tty in (True, False):
+        monkeypatch.setattr("workspace.sys.stdin", _FakeStdin(tty))
+        env = _non_interactive_env({**os.environ, "GIT_TERMINAL_PROMPT": "1"})
+        assert env["GIT_TERMINAL_PROMPT"] == "1"
+
+
+@pytest.mark.parametrize(
+    "stdin",
+    [
+        None,
+        _FakeStdin(ValueError("I/O operation on closed file")),
+        _FakeStdin(OSError("no fileno")),
+        object(),  # no isatty attribute at all
+    ],
+)
+def test_non_interactive_env_treats_an_unusable_stdin_as_non_interactive(
+    stdin, monkeypatch
+):
+    """Only a stdin we positively know is a terminal opts out (#58).
+
+    This decides whether git may block, so every uncertain case takes the
+    safe side.
+    """
+    monkeypatch.setattr("workspace.sys.stdin", stdin)
+    assert _non_interactive_env(None)["GIT_TERMINAL_PROMPT"] == "0"
+
+
+def test_run_git_disables_prompts_off_a_terminal(repo, monkeypatch):
+    """Every git call, not just the clone, gets the guard (#58)."""
+    monkeypatch.setattr("workspace.sys.stdin", _FakeStdin(False))
+    with patch("workspace.subprocess.run") as m_run:
+        m_run.return_value = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        _run_git(repo, "status")
+    assert m_run.call_args.kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
+
+
+def test_run_git_inherits_the_environment_on_a_terminal(repo, monkeypatch):
+    """Unchanged behaviour for an interactive run: env=None, as before."""
+    monkeypatch.setattr("workspace.sys.stdin", _FakeStdin(True))
+    with patch("workspace.subprocess.run") as m_run:
+        m_run.return_value = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        _run_git(repo, "status")
+    assert m_run.call_args.kwargs["env"] is None
+
+
+def test_refresh_to_main_fetch_cannot_block_on_a_prompt(repo, monkeypatch):
+    """The bug #58 was actually filed for.
+
+    `git fetch origin` in refresh_to_main is bounded by FETCH_TIMEOUT
+    (120s), so a repo whose credentials lapsed used to burn two minutes
+    per scheduler pass waiting for typing nobody could see - and report
+    it as a timeout, naming the wrong cause.
+    """
+    monkeypatch.setattr("workspace.sys.stdin", _FakeStdin(False))
+    with patch("workspace.subprocess.run") as m_run:
+        m_run.return_value = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        refresh_to_main(repo)
+
+    fetches = [
+        call
+        for call in m_run.call_args_list
+        if call.args and call.args[0][:3] == ["git", "fetch", "origin"]
+    ]
+    assert fetches, "refresh_to_main no longer fetches"
+    assert fetches[0].kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"

@@ -61,6 +61,16 @@ The credentials that clone was made with — an SSH key, a stored HTTPS
 token, a credential helper — are what the later fetches and pushes use,
 since they run inside that checkout.
 
+**If those credentials lapse**, what you see depends on where you are
+running. Off a terminal — the Scheduler, CI, anything piped — git is run
+with `GIT_TERMINAL_PROMPT=0`, so it fails immediately with `could not
+read Username ... terminal prompts disabled`. That is deliberate: git's
+default is to prompt, and `subprocess` does not redirect stdin, so
+without it a `git fetch` would sit waiting for typing nobody can see
+until the 120s fetch timeout — once per pass, and reported as a timeout
+rather than as an auth failure. Run by hand from a terminal you still
+get git's normal prompt and can type the credentials.
+
 A reused checkout is checked against the repo you asked for: if its
 `origin` names a different project the run stops rather than committing
 to the wrong codebase. SSH and HTTPS remotes of the same repo count as
