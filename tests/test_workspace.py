@@ -939,6 +939,13 @@ def test_run_ci_checks_custom_timeout_appears_in_the_error(repo):
         ("not a url", None),
         ("https://github.com/owner", None),
         ("https://github.com/owner/name/extra", None),
+        # A port on a non-aliased host is stripped, the host is not.
+        ("https://github.com:8443/owner/name.git", "github.com/owner/name"),
+        ("https://git.example.com:8443/owner/name.git", "git.example.com/owner/name"),
+        # scp-style needs a real owner/name: a Windows path and a
+        # host:port pair are not repositories.
+        ("example.com:8080", None),
+        ("C:/path/to/repo", None),
     ],
 )
 def test_repo_identity_normalises_remote_urls(url, identity):
@@ -1101,3 +1108,20 @@ def test_redact_url_strips_userinfo(url, expected):
     if "SECRET" in url or "pass@" in url:
         assert "SECRET" not in _redact_url(url)
         assert "pass" not in _redact_url(url)
+
+
+def test_ensure_base_clone_skips_the_check_for_a_malformed_repo(repo, caplog):
+    """A repo argument that is not owner/name cannot be compared (#178).
+
+    Fail-open, like every other case the check cannot resolve: it must
+    not invent a mismatch out of an argument it could not parse.
+    """
+    with patch(
+        "workspace._run_git",
+        side_effect=_origin_only("https://github.com/someone/other.git"),
+    ):
+        with caplog.at_level(logging.WARNING):
+            assert ensure_base_clone(repo, "owner/name/extra") == repo
+
+    # No mismatch was reported — the check simply did not run.
+    assert "refusing to run against the wrong repository" not in caplog.text

@@ -172,8 +172,12 @@ def _run_git(
     network filesystem, stuck lock — into a :class:`WorkspaceError`
     instead of an indefinite orchestrator block, #45).
 
-    ``env`` is the subprocess's full environment; None inherits the
-    parent's, as before.
+    ``env`` is the subprocess's **full** environment, not additions to it
+    - the same convention as :func:`run_ci_checks` and ``subprocess.run``
+    itself. None inherits the parent's, as before. A caller wanting to
+    add one variable must spread the parent explicitly::
+
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}
     """
     effective_timeout = DEFAULT_GIT_TIMEOUT if timeout is None else timeout
     try:
@@ -507,8 +511,13 @@ def _repo_identity(url: str) -> str | None:
     if not url:
         return None
     # scp-style SSH: [user@]host:owner/name(.git) - no "//", which is what
-    # separates it from a URL, and a path that is never absolute.
-    scp = re.match(r"^(?:[^/@]+@)?(?P<host>[^/:]+):(?P<path>[^/].*)$", url)
+    # separates it from a URL, and a path that is relative and has exactly
+    # one "/" in it. The narrow path is what keeps "C:\dir\repo" and
+    # "example.com:8080" from being read as a host and a repository at all
+    # (both used to match and then fail the segment count instead).
+    scp = re.match(
+        r"^(?:[^/@]+@)?(?P<host>[^/:]+):(?P<path>[^/][^:]*/[^/:]+)$", url
+    )
     if scp and "//" not in url:
         host, path = scp.group("host"), scp.group("path")
     else:
