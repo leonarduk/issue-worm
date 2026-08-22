@@ -1321,6 +1321,38 @@ def test_non_interactive_env_does_not_double_up_batchmode(given, monkeypatch):
     assert env["GIT_SSH_COMMAND"] == given
 
 
+def test_non_interactive_env_ignores_an_incidental_batchmode_mention(monkeypatch):
+    """Only `BatchMode=` counts as already-set (#58).
+
+    A bare substring match would read this command as having BatchMode
+    already and skip the append — leaving ssh free to prompt, which is
+    the unsafe direction and the exact bug being fixed.
+    """
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(False))
+    env = _non_interactive_env(
+        {"GIT_SSH_COMMAND": "ssh -i /keys/batchmode-runner.pem"}
+    )
+
+    assert env["GIT_SSH_COMMAND"] == (
+        "ssh -i /keys/batchmode-runner.pem -o BatchMode=yes"
+    )
+
+
+def test_git_apply_cannot_prompt_because_stdin_is_a_pipe(repo, monkeypatch):
+    """Pins the docstring's claim about the input_text= callers (#58).
+
+    Passing `input=` makes subprocess set stdin to a PIPE, so `git apply`
+    never had a terminal to prompt on — the docstring says so, and this
+    stops that from silently becoming untrue.
+    """
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(True))  # even at a terminal
+    with patch("workspace.subprocess.run") as m_run:
+        m_run.return_value = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        _run_git(repo, "apply", "--recount", "-", input_text="a diff")
+
+    assert m_run.call_args.kwargs["input"] == "a diff"
+
+
 def test_only_stdin_decides_not_stdout(monkeypatch):
     """`issue-worm build | tee run.log` still prompts (#58).
 

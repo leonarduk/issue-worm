@@ -237,7 +237,14 @@ def _non_interactive_env(env: dict[str, str] | None) -> dict[str, str] | None:
     result.setdefault("GIT_ASKPASS", "")
     result.setdefault("SSH_ASKPASS_REQUIRE", "never")
     ssh_command = result.get("GIT_SSH_COMMAND") or "ssh"
-    if "batchmode" not in ssh_command.lower():
+    # Match "batchmode=", not bare "batchmode": the option can only be
+    # set as `BatchMode=<value>`, so requiring the "=" keeps an
+    # incidental mention elsewhere in the command - a path, a
+    # ProxyCommand - from reading as "already set". That mistake fails
+    # in the unsafe direction: it would skip the append and leave ssh
+    # free to prompt, which is the whole bug (#58). Case-insensitive
+    # because ssh's own option parsing is.
+    if "batchmode=" not in ssh_command.lower():
         result["GIT_SSH_COMMAND"] = f"{ssh_command} -o BatchMode=yes"
     return result
 
