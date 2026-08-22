@@ -4,6 +4,7 @@ and rollback on failure or interruption."""
 import logging
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -1182,7 +1183,7 @@ class _FakeStdin:
 
 def test_non_interactive_env_disables_prompts_off_a_terminal(monkeypatch):
     """The default path: no TTY, so git fails fast instead of waiting."""
-    monkeypatch.setattr("workspace.sys.stdin", _FakeStdin(False))
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(False))
     env = _non_interactive_env(None)
     assert env["GIT_TERMINAL_PROMPT"] == "0"
     # A full environment, not just the one key - subprocess.run replaces
@@ -1196,10 +1197,12 @@ def test_non_interactive_env_leaves_a_terminal_alone(monkeypatch):
     Returning None unchanged is what preserves inheriting the parent's
     environment, exactly as before this existed.
     """
-    monkeypatch.setattr("workspace.sys.stdin", _FakeStdin(True))
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(True))
     assert _non_interactive_env(None) is None
     explicit = {"PATH": "/bin"}
-    assert _non_interactive_env(explicit) is explicit
+    assert _non_interactive_env(explicit) == {"PATH": "/bin"}
+    # The caller's dict is not modified on the way through.
+    assert explicit == {"PATH": "/bin"}
 
 
 def test_non_interactive_env_lets_an_explicit_value_win(monkeypatch):
@@ -1208,7 +1211,7 @@ def test_non_interactive_env_lets_an_explicit_value_win(monkeypatch):
     ensure_base_clone sets it unconditionally; that must survive here.
     """
     for tty in (True, False):
-        monkeypatch.setattr("workspace.sys.stdin", _FakeStdin(tty))
+        monkeypatch.setattr(sys, "stdin", _FakeStdin(tty))
         env = _non_interactive_env({**os.environ, "GIT_TERMINAL_PROMPT": "1"})
         assert env["GIT_TERMINAL_PROMPT"] == "1"
 
@@ -1230,13 +1233,13 @@ def test_non_interactive_env_treats_an_unusable_stdin_as_non_interactive(
     This decides whether git may block, so every uncertain case takes the
     safe side.
     """
-    monkeypatch.setattr("workspace.sys.stdin", stdin)
+    monkeypatch.setattr(sys, "stdin", stdin)
     assert _non_interactive_env(None)["GIT_TERMINAL_PROMPT"] == "0"
 
 
 def test_run_git_disables_prompts_off_a_terminal(repo, monkeypatch):
     """Every git call, not just the clone, gets the guard (#58)."""
-    monkeypatch.setattr("workspace.sys.stdin", _FakeStdin(False))
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(False))
     with patch("workspace.subprocess.run") as m_run:
         m_run.return_value = subprocess.CompletedProcess([], 0, stdout="", stderr="")
         _run_git(repo, "status")
@@ -1245,7 +1248,7 @@ def test_run_git_disables_prompts_off_a_terminal(repo, monkeypatch):
 
 def test_run_git_inherits_the_environment_on_a_terminal(repo, monkeypatch):
     """Unchanged behaviour for an interactive run: env=None, as before."""
-    monkeypatch.setattr("workspace.sys.stdin", _FakeStdin(True))
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(True))
     with patch("workspace.subprocess.run") as m_run:
         m_run.return_value = subprocess.CompletedProcess([], 0, stdout="", stderr="")
         _run_git(repo, "status")
@@ -1260,7 +1263,7 @@ def test_refresh_to_main_fetch_cannot_block_on_a_prompt(repo, monkeypatch):
     per scheduler pass waiting for typing nobody could see - and report
     it as a timeout, naming the wrong cause.
     """
-    monkeypatch.setattr("workspace.sys.stdin", _FakeStdin(False))
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(False))
     with patch("workspace.subprocess.run") as m_run:
         m_run.return_value = subprocess.CompletedProcess([], 0, stdout="", stderr="")
         refresh_to_main(repo)
@@ -1272,3 +1275,77 @@ def test_refresh_to_main_fetch_cannot_block_on_a_prompt(repo, monkeypatch):
     ]
     assert fetches, "refresh_to_main no longer fetches"
     assert fetches[0].kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
+
+
+def test_non_interactive_env_disables_ssh_and_askpass_prompts(monkeypatch):
+    """GIT_TERMINAL_PROMPT alone does not cover SSH or askpass (#58).
+
+    ssh reads a passphrase or host-key confirmation from /dev/tty
+    directly and never sees GIT_TERMINAL_PROMPT — and the pre-cloned SSH
+    checkout is exactly what the README recommends for private repos.
+    GIT_ASKPASS is consulted *before* the terminal, so a desktop-launched
+    process could block on a GUI dialog with stdin nowhere near a TTY.
+    """
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(False))
+    env = _non_interactive_env(None)
+
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+    assert env["GIT_ASKPASS"] == ""
+    assert env["SSH_ASKPASS_REQUIRE"] == "never"
+    assert "BatchMode=yes" in env["GIT_SSH_COMMAND"]
+
+
+def test_non_interactive_env_appends_to_an_existing_ssh_command(monkeypatch):
+    """A user's own GIT_SSH_COMMAND survives; BatchMode is added to it."""
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(False))
+    env = _non_interactive_env({"GIT_SSH_COMMAND": "ssh -i /keys/id_ed25519"})
+
+    assert env["GIT_SSH_COMMAND"] == "ssh -i /keys/id_ed25519 -o BatchMode=yes"
+
+
+def test_non_interactive_env_does_not_double_up_batchmode(monkeypatch):
+    """A caller that already set BatchMode keeps exactly what it set."""
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(False))
+    env = _non_interactive_env({"GIT_SSH_COMMAND": "ssh -o BatchMode=no"})
+
+    assert env["GIT_SSH_COMMAND"] == "ssh -o BatchMode=no"
+
+
+def test_non_interactive_env_does_not_leak_the_ambient_environment(monkeypatch):
+    """An explicit env stays the *full* environment, as _run_git documents.
+
+    Merging os.environ underneath would defeat the #159 pattern, where a
+    worker passes a deliberately restricted environment so parallel
+    dispatch cannot depend on a mutated os.environ.
+    """
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(False))
+    monkeypatch.setenv("A_LEAKY_AMBIENT_VAR", "leaked")
+
+    env = _non_interactive_env({"PATH": "/bin"})
+
+    assert "A_LEAKY_AMBIENT_VAR" not in env
+    assert env["PATH"] == "/bin"
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+
+
+def test_ensure_base_clone_clone_is_non_interactive_even_on_a_terminal(
+    tmp_path, monkeypatch
+):
+    """The clone's explicit guard survives the TTY branch (#58, #177).
+
+    Asserted through subprocess.run rather than a patched _run_git, so it
+    covers what actually reaches git — a version that dropped explicit
+    envs would pass the argument-level check.
+    """
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(True))
+    with patch("workspace.subprocess.run") as m_run:
+        m_run.return_value = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        ensure_base_clone(str(tmp_path / "clone"), "owner/repo")
+
+    clones = [
+        call
+        for call in m_run.call_args_list
+        if call.args and "clone" in call.args[0]
+    ]
+    assert clones, "ensure_base_clone no longer clones"
+    assert clones[0].kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
