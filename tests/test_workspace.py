@@ -946,6 +946,14 @@ def test_run_ci_checks_custom_timeout_appears_in_the_error(repo):
         # host:port pair are not repositories.
         ("example.com:8080", None),
         ("C:/path/to/repo", None),
+        ("C:/repo", None),
+        ("C:\\repo", None),
+        # Drive-relative Windows paths: no leading slash, so the path
+        # shape alone does not exclude them — the host must.
+        ("C:repo/sub", None),
+        ("D:a/b", None),
+        # ...but a short real hostname is still a hostname.
+        ("gitserver:owner/name", "gitserver/owner/name"),
     ],
 )
 def test_repo_identity_normalises_remote_urls(url, identity):
@@ -1083,7 +1091,6 @@ def test_ensure_base_clone_disables_git_credential_prompts(tmp_path):
     [
         # Nothing to redact.
         ("https://github.com/owner/name.git", "https://github.com/owner/name.git"),
-        ("git@github.com:owner/name.git", "git@github.com:owner/name.git"),
         ("", ""),
         # user:password and token forms.
         (
@@ -1100,6 +1107,12 @@ def test_ensure_base_clone_disables_git_credential_prompts(tmp_path):
             "https://github.com/owner/name@v2.git",
             "https://github.com/owner/name@v2.git",
         ),
+        # scp-style carries userinfo too, with no "://" to anchor on.
+        (
+            "user:pass@github.com:owner/name.git",
+            "***@github.com:owner/name.git",
+        ),
+        ("git@github.com:owner/name.git", "***@github.com:owner/name.git"),
     ],
 )
 def test_redact_url_strips_userinfo(url, expected):

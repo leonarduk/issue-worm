@@ -480,7 +480,14 @@ def _redact_url(url: str) -> str:
     these strings reach stderr and log files, so the credential is
     stripped before the URL is ever shown.
     """
-    return re.sub(r"(?<=://)[^/@]*@", "***@", url)
+    # Two shapes carry userinfo: a URL (scheme://user:pass@host/...) and
+    # scp-style (user:pass@host:owner/name). Both are redacted; the
+    # lookbehind on the first keeps an "@" later in the path - a ref like
+    # name@v2 - untouched.
+    url = re.sub(r"(?<=://)[^/@]*@", "***@", url)
+    if "://" not in url:
+        url = re.sub(r"^[^/@]*@", "***@", url)
+    return url
 
 
 def _repo_identity(url: str) -> str | None:
@@ -515,8 +522,12 @@ def _repo_identity(url: str) -> str | None:
     # one "/" in it. The narrow path is what keeps "C:\dir\repo" and
     # "example.com:8080" from being read as a host and a repository at all
     # (both used to match and then fail the segment count instead).
+    # The host needs at least two characters: a one-character "host" is a
+    # Windows drive letter, and "C:repo/sub" is a drive-relative path, not
+    # a remote. (C:/repo and C:\repo are already excluded by the path
+    # having to be relative.)
     scp = re.match(
-        r"^(?:[^/@]+@)?(?P<host>[^/:]+):(?P<path>[^/][^:]*/[^/:]+)$", url
+        r"^(?:[^/@]+@)?(?P<host>[^/:]{2,}):(?P<path>[^/][^:]*/[^/:]+)$", url
     )
     if scp and "//" not in url:
         host, path = scp.group("host"), scp.group("path")
