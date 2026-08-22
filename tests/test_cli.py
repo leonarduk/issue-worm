@@ -4,13 +4,14 @@ rather than crashing on a missing private package.
 """
 
 import sys
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 import cli
 from review import ReviewResult
-from workspace import FileChange, MalformedOutputError
+from workspace import FileChange, MalformedOutputError, WorkspaceError
 
 
 @pytest.mark.parametrize("command", ["triage", "poll"])
@@ -77,6 +78,8 @@ def test_build_without_issue_fails_fast(capsys):
 
 
 def test_build_reports_fetch_failure(capsys):
+    # _fetch_issue_body prints its own specific reason before returning
+    # None; _run_build must not print a second, redundant message.
     with patch.object(
         sys, "argv", ["issue-worm", "build", "5", "--repo", "o/r"]
     ), patch("cli._fetch_issue_body", return_value=None), pytest.raises(
@@ -85,7 +88,7 @@ def test_build_reports_fetch_failure(capsys):
         cli.main()
 
     assert exc.value.code == 1
-    assert "Could not fetch issue" in capsys.readouterr().err
+    assert capsys.readouterr().err == ""
 
 
 def test_build_reports_not_ready_issue(capsys):
@@ -174,3 +177,77 @@ def test_build_reports_malformed_coder_output(tmp_path, capsys):
 
     assert exc.value.code == 1
     assert "bad output" in capsys.readouterr().err
+
+
+def test_build_reports_apply_failure_without_crashing(tmp_path, capsys):
+    ready = ReviewResult(ready=True, files=["a.py"], done="it works")
+    change = FileChange(path="a.py", mode="FULL", body="print(1)\n")
+    with patch.object(
+        sys, "argv", ["issue-worm", "build", "5", "--repo", "o/r"]
+    ), patch("cli._fetch_issue_body", return_value="body"), patch(
+        "cli.review_issue", return_value=ready
+    ), patch("cli.ensure_base_clone", return_value=str(tmp_path)), patch(
+        "cli.LocalOllamaCoder"
+    ) as mock_coder_cls, patch(
+        "cli.parse_coder_output", return_value=[change]
+    ), patch(
+        "cli.apply_file_change", side_effect=WorkspaceError("git apply failed")
+    ), pytest.raises(SystemExit) as exc:
+        mock_coder_cls.return_value.propose.return_value = "raw coder output"
+        cli.main()
+
+    assert exc.value.code == 1
+    assert "git apply failed" in capsys.readouterr().err
+
+
+def _mock_get_response(status_code, json_body=None, headers=None):
+    response = MagicMock()
+    response.status_code = status_code
+    response.headers = headers or {}
+    response.json.return_value = json_body or {}
+    if status_code < 400:
+        response.raise_for_status.return_value = None
+    else:
+        response.raise_for_status.side_effect = requests.HTTPError("bad status")
+    return response
+
+
+def test_fetch_issue_body_returns_body_on_success():
+    with patch(
+        "cli.requests.get",
+        return_value=_mock_get_response(200, {"body": "the issue text"}),
+    ):
+        result = cli._fetch_issue_body("o/r", 5)
+
+    assert result == "the issue text"
+
+
+def test_fetch_issue_body_reports_not_found(capsys):
+    with patch("cli.requests.get", return_value=_mock_get_response(404)):
+        result = cli._fetch_issue_body("o/r", 999)
+
+    assert result is None
+    assert "not found" in capsys.readouterr().err
+
+
+def test_fetch_issue_body_reports_rate_limit(capsys):
+    with patch(
+        "cli.requests.get",
+        return_value=_mock_get_response(
+            403, headers={"X-RateLimit-Remaining": "0"}
+        ),
+    ):
+        result = cli._fetch_issue_body("o/r", 5)
+
+    assert result is None
+    assert "rate limit" in capsys.readouterr().err
+
+
+def test_fetch_issue_body_reports_generic_request_error(capsys):
+    with patch(
+        "cli.requests.get", side_effect=requests.ConnectionError("dns failure")
+    ):
+        result = cli._fetch_issue_body("o/r", 5)
+
+    assert result is None
+    assert "GitHub request failed" in capsys.readouterr().err

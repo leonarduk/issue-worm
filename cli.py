@@ -24,6 +24,7 @@ from version_checker import PACKAGE_NAME, check_and_prompt, installed_version
 from workspace import (
     FileChange,
     MalformedOutputError,
+    WorkspaceError,
     apply_file_change,
     ensure_base_clone,
     parse_coder_output,
@@ -93,7 +94,10 @@ def _fetch_issue_body(repo: str, issue_number: int) -> str | None:
     Uses GITHUB_TOKEN when set (higher rate limit, required for private
     repos); works unauthenticated against public repos otherwise. Returns
     None on any failure rather than raising, so callers can report a clean
-    error.
+    error. Prints a specific message itself for the cases a generic
+    "could not fetch" would mislead on (404, rate limiting) — the caller
+    only adds its own generic message when this returns None without
+    having explained why.
     """
     headers = {"Accept": "application/vnd.github+json"}
     token = os.getenv("GITHUB_TOKEN")
@@ -102,9 +106,27 @@ def _fetch_issue_body(repo: str, issue_number: int) -> str | None:
     url = f"https://api.github.com/repos/{repo}/issues/{issue_number}"
     try:
         response = requests.get(url, headers=headers, timeout=GITHUB_API_TIMEOUT)
+    except requests.RequestException as exc:
+        print(f"✗ GitHub request failed: {exc}", file=sys.stderr)
+        return None
+
+    if response.status_code == 404:
+        print(f"✗ Issue {repo}#{issue_number} not found", file=sys.stderr)
+        return None
+    if response.status_code == 403 and response.headers.get(
+        "X-RateLimit-Remaining"
+    ) == "0":
+        print(
+            "✗ GitHub API rate limit exceeded — set GITHUB_TOKEN for a "
+            "higher limit, or wait and retry",
+            file=sys.stderr,
+        )
+        return None
+    try:
         response.raise_for_status()
         return response.json().get("body") or ""
-    except (requests.RequestException, ValueError):
+    except (requests.RequestException, ValueError) as exc:
+        print(f"✗ GitHub request failed: {exc}", file=sys.stderr)
         return None
 
 
@@ -130,10 +152,8 @@ def _run_build(args, config: dict) -> int:
 
     body = _fetch_issue_body(args.repo, issue_number)
     if body is None:
-        print(
-            f"✗ Could not fetch issue {args.repo}#{issue_number} from GitHub",
-            file=sys.stderr,
-        )
+        # _fetch_issue_body already printed a specific reason (not found,
+        # rate-limited, or the request error) — nothing more to add here.
         return 1
 
     review = review_issue(body)
@@ -182,7 +202,7 @@ def _run_build(args, config: dict) -> int:
         changes: list[FileChange] = parse_coder_output(output, review.files)
         for change in changes:
             apply_file_change(repo_path, change)
-    except MalformedOutputError as exc:
+    except (MalformedOutputError, WorkspaceError, OSError) as exc:
         print(f"✗ {exc}", file=sys.stderr)
         return 1
 
