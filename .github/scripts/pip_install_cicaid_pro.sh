@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Runs a command (typically a pip install) with git credentials configured so it
-# can clone the private leonarduk/cicaid-pro repo. The AI-review modules this
-# workflow imports (review_diff, review_comment, deepseek_review, gpt_review,
-# etc.) only exist in cicaid-pro, not the public leonarduk/cicaid "free shell"
-# package, so a plain pip install of the public wheel/repo 404s or is missing
-# these modules.
+# can clone the private leonarduk/cicaid-pro repo. The AI-review modules the
+# generated workflows import (review_diff, review_comment, deepseek_review,
+# gpt_review, etc.) only exist in cicaid-pro, not the public leonarduk/cicaid
+# "free shell" package, so a plain pip install of the public wheel/repo 404s
+# or is missing these modules.
 #
 # Fails fast with an actionable message if CICAID_PRO_TOKEN is unset or empty,
 # instead of letting the wrapped command fail later with a confusing git auth
