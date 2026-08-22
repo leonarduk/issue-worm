@@ -954,6 +954,9 @@ def test_run_ci_checks_custom_timeout_appears_in_the_error(repo):
         ("D:a/b", None),
         # ...but a short real hostname is still a hostname.
         ("gitserver:owner/name", "gitserver/owner/name"),
+        # A bare host:port with a path is not an scp remote either: the
+        # port lands in the path, giving three segments, not two.
+        ("example.com:8080/owner/name", None),
     ],
 )
 def test_repo_identity_normalises_remote_urls(url, identity):
@@ -1113,6 +1116,11 @@ def test_ensure_base_clone_disables_git_credential_prompts(tmp_path):
             "***@github.com:owner/name.git",
         ),
         ("git@github.com:owner/name.git", "***@github.com:owner/name.git"),
+        # Userinfo and a port together: only the userinfo goes.
+        (
+            "https://user:pass@github.com:8443/owner/name",
+            "https://***@github.com:8443/owner/name",
+        ),
     ],
 )
 def test_redact_url_strips_userinfo(url, expected):
@@ -1138,3 +1146,20 @@ def test_ensure_base_clone_skips_the_check_for_a_malformed_repo(repo, caplog):
 
     # No mismatch was reported — the check simply did not run.
     assert "refusing to run against the wrong repository" not in caplog.text
+
+
+def test_ensure_base_clone_survives_a_non_timeout_git_error_reading_origin(
+    repo, caplog
+):
+    """Any WorkspaceError from the origin read fails open, not just a timeout."""
+
+    def _fake(path, *args, **kwargs):
+        if args[:1] == ("rev-parse",):
+            return subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        raise WorkspaceError("git remote get-url origin failed: not a git repository")
+
+    with patch("workspace._run_git", side_effect=_fake):
+        with caplog.at_level(logging.WARNING):
+            assert ensure_base_clone(repo, "owner/name") == repo
+
+    assert "skipping the base-clone repository check" in caplog.text

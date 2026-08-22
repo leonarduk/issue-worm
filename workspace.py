@@ -35,6 +35,13 @@ Note the two different failure shapes. A CI command that *fails* is
 reported as ``(False, output)`` so the Analyser can read it like any test
 failure; a CI command that *times out* raises :class:`WorkspaceError`, so
 a stall is never mistaken for a red test run. Git timeouts always raise.
+
+Environment variables (#178)
+----------------------------
+
+``WORM_SKIP_REMOTE_CHECK=1`` downgrades :func:`ensure_base_clone`'s
+repository check from an error to a warning, for a workspace whose
+``origin`` is deliberately not the repo being scheduled (a fork).
 """
 
 from __future__ import annotations
