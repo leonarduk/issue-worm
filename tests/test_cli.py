@@ -77,6 +77,49 @@ def test_build_without_issue_fails_fast(capsys):
     assert "issue number" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    "bad_repo", ["no-slash", "too/many/slashes", "owner/", "/name"]
+)
+def test_build_rejects_malformed_repo(bad_repo, capsys):
+    with patch.object(
+        sys, "argv", ["issue-worm", "build", "5", "--repo", bad_repo]
+    ), pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 2
+    assert "Invalid --repo" in capsys.readouterr().err
+
+
+def test_build_accepts_well_formed_repo(capsys):
+    # Valid --repo should get past validation and fail later, at the
+    # (mocked) fetch step, not at the format check.
+    with patch.object(
+        sys, "argv", ["issue-worm", "build", "5", "--repo", "octocat/Hello-World"]
+    ), patch("cli._fetch_issue_body", return_value=None), pytest.raises(
+        SystemExit
+    ) as exc:
+        cli.main()
+
+    assert exc.value.code == 1
+    assert "Invalid --repo" not in capsys.readouterr().err
+
+
+def test_build_multiple_issues_warns_and_uses_first(capsys):
+    ready = ReviewResult(ready=True, files=["a.py"], done="it works")
+    with patch.object(
+        sys, "argv", ["issue-worm", "build", "1", "2", "3", "--repo", "o/r", "--dry-run"]
+    ), patch("cli._fetch_issue_body", return_value="body") as mock_fetch, patch(
+        "cli.review_issue", return_value=ready
+    ), pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+    mock_fetch.assert_called_once_with("o/r", 1)
+    err = capsys.readouterr().err
+    assert "ignoring" in err
+    assert "[2, 3]" in err
+
+
 def test_build_reports_fetch_failure(capsys):
     # _fetch_issue_body prints its own specific reason before returning
     # None; _run_build must not print a second, redundant message.
@@ -159,6 +202,72 @@ def test_build_applies_changes_end_to_end(tmp_path, capsys):
     mock_apply.assert_called_once_with(str(tmp_path), change)
     out = capsys.readouterr().out
     assert "a.py" in out
+
+
+def test_build_workspace_flag_overrides_default(tmp_path):
+    ready = ReviewResult(ready=True, files=["a.py"], done="it works")
+    custom = str(tmp_path / "custom-ws")
+    with patch.object(
+        sys,
+        "argv",
+        ["issue-worm", "build", "5", "--repo", "o/r", "--workspace", custom],
+    ), patch("cli._fetch_issue_body", return_value="body"), patch(
+        "cli.review_issue", return_value=ready
+    ), patch(
+        "cli.ensure_base_clone", return_value=custom
+    ) as mock_clone, patch(
+        "cli.LocalOllamaCoder"
+    ) as mock_coder_cls, patch(
+        "cli.parse_coder_output", return_value=[]
+    ), pytest.raises(SystemExit):
+        mock_coder_cls.return_value.propose.return_value = "raw coder output"
+        cli.main()
+
+    mock_clone.assert_called_once_with(custom, "o/r")
+
+
+def test_build_workspace_flag_beats_env_var(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path / "from-env"))
+    ready = ReviewResult(ready=True, files=["a.py"], done="it works")
+    from_flag = str(tmp_path / "from-flag")
+    with patch.object(
+        sys,
+        "argv",
+        ["issue-worm", "build", "5", "--repo", "o/r", "--workspace", from_flag],
+    ), patch("cli._fetch_issue_body", return_value="body"), patch(
+        "cli.review_issue", return_value=ready
+    ), patch(
+        "cli.ensure_base_clone", return_value=from_flag
+    ) as mock_clone, patch(
+        "cli.LocalOllamaCoder"
+    ) as mock_coder_cls, patch(
+        "cli.parse_coder_output", return_value=[]
+    ), pytest.raises(SystemExit):
+        mock_coder_cls.return_value.propose.return_value = "raw coder output"
+        cli.main()
+
+    mock_clone.assert_called_once_with(from_flag, "o/r")
+
+
+def test_build_env_var_used_when_no_workspace_flag(tmp_path, monkeypatch):
+    from_env = str(tmp_path / "from-env")
+    monkeypatch.setenv("WORKSPACE_ROOT", from_env)
+    ready = ReviewResult(ready=True, files=["a.py"], done="it works")
+    with patch.object(
+        sys, "argv", ["issue-worm", "build", "5", "--repo", "o/r"]
+    ), patch("cli._fetch_issue_body", return_value="body"), patch(
+        "cli.review_issue", return_value=ready
+    ), patch(
+        "cli.ensure_base_clone", return_value=from_env
+    ) as mock_clone, patch(
+        "cli.LocalOllamaCoder"
+    ) as mock_coder_cls, patch(
+        "cli.parse_coder_output", return_value=[]
+    ), pytest.raises(SystemExit):
+        mock_coder_cls.return_value.propose.return_value = "raw coder output"
+        cli.main()
+
+    mock_clone.assert_called_once_with(from_env, "o/r")
 
 
 def test_build_reports_malformed_coder_output(tmp_path, capsys):
