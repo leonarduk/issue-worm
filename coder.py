@@ -1,7 +1,7 @@
 """Local-Ollama coder for the free-tier `build` flow.
 
-`issue-worm-core`'s `NativeCoder` (`agents/coder.py`) calls
-`cicaid_bridge.fetch_review`, which lives in the private `cicaid-core`
+`issue-worm-pro`'s `NativeCoder` (`agents/coder.py`) calls
+`cicaid_bridge.fetch_review`, which lives in the private `cicaid-pro`
 package. This shell has no such bridge, so `LocalOllamaCoder` talks
 straight to a local Ollama HTTP endpoint's `/api/generate` and emits the
 same `=== FILE: ... === / === MODE: ... === / === END FILE ===` format
@@ -11,11 +11,11 @@ same `=== FILE: ... === / === MODE: ... === / === END FILE ===` format
 from __future__ import annotations
 
 import logging
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import requests
 
-from workspace import MODE_FULL
+from workspace import MODE_FULL, sanitize_file_path
 
 logger = logging.getLogger(__name__)
 
@@ -67,11 +67,28 @@ def _build_prompt(workspace_dir: str, task: str, files: list[str]) -> str:
 
 
 def _format_file_section(workspace_dir: str, path: str) -> str:
+    safe_path = _safe_relative_path(path)
+    if safe_path is None:
+        return f"--- {path} ---\n(invalid or unsafe path — not read)\n"
     try:
-        content = (Path(workspace_dir) / path).read_text(encoding="utf-8")
-    except OSError:
-        content = "(file does not exist yet)"
+        content = (Path(workspace_dir) / safe_path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        content = "(file does not exist yet, or is not readable as text)"
     return f"--- {path} ---\n{content}\n"
+
+
+def _safe_relative_path(path: str) -> str | None:
+    """Reject anything that isn't a plain path inside the workspace —
+    mirrors workspace.py's own write-side guard (`_escapes_repo`) so a
+    `FILES:` entry like `../../../.env` can't be read off disk and fed
+    into the prompt sent to the (possibly remote) Ollama endpoint.
+    """
+    normalized = sanitize_file_path(path)
+    if normalized is None:
+        return None
+    if ".." in PurePosixPath(normalized).parts:
+        return None
+    return normalized
 
 
 def _build_format_instructions(files: list[str]) -> str:

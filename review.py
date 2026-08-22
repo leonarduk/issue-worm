@@ -12,8 +12,8 @@ import re
 from dataclasses import dataclass, field
 
 _SECTION_RE = re.compile(
-    r"##\s*Implementation notes\s*\r?\n(?P<body>.*?)(?=\r?\n##\s|\Z)",
-    re.DOTALL | re.IGNORECASE,
+    r"^##(?!#)[ \t]*Implementation notes[ \t]*\r?\n(?P<body>.*?)(?=\r?\n##[ \t]|\Z)",
+    re.DOTALL | re.IGNORECASE | re.MULTILINE,
 )
 _FILES_RE = re.compile(r"^FILES:[ \t]*(?P<value>.*)$", re.IGNORECASE | re.MULTILINE)
 _DONE_RE = re.compile(r"^DONE:[ \t]*(?P<value>.*)$", re.IGNORECASE | re.MULTILINE)
@@ -44,18 +44,23 @@ def review_issue(issue_body: str) -> ReviewResult:
     non-empty `FILES:` and `DONE:` lines?
 
     File existence under `FILES:` is intentionally not checked — a target
-    file may not exist yet if the issue is asking to create it.
+    file may not exist yet if the issue is asking to create it. When an
+    issue body has more than one `## Implementation notes` heading, the
+    first well-formed section wins rather than only ever looking at the
+    first occurrence (which could be an unrelated, unfilled example).
     """
-    if issue_body and issue_body.strip():
-        section_match = _SECTION_RE.search(issue_body)
-    else:
-        section_match = None
-
-    if section_match is None:
+    if not issue_body or not issue_body.strip():
         return ReviewResult(ready=False, message=NOT_READY_MESSAGE)
 
-    section = section_match.group("body")
+    for match in _SECTION_RE.finditer(issue_body):
+        result = _parse_section(match.group("body"))
+        if result.ready:
+            return result
 
+    return ReviewResult(ready=False, message=NOT_READY_MESSAGE)
+
+
+def _parse_section(section: str) -> ReviewResult:
     files_match = _FILES_RE.search(section)
     files = _split_files(files_match.group("value")) if files_match else []
 

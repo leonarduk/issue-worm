@@ -1,10 +1,11 @@
 """Command-line interface for issue-worm (free shell).
 
 Issue in, PR out: create files an issue (guided), history reports what
-was done. The automated review/implement/verify pipeline (`triage`,
-`build`, `poll`) is part of `issue-worm-pro`, a private package — see
-the README for access. This shell works standalone for `create` and
-`history` with no private dependency installed.
+was done, and build runs one standalone, single-pass review+implement
+attempt via a local Ollama coder. The full automated review/implement/
+verify pipeline with a verifier/retry loop and a scheduler (`triage`,
+`poll`) is part of `issue-worm-pro`, a private package — see the README
+for access.
 """
 
 import argparse
@@ -120,6 +121,12 @@ def _run_build(args, config: dict) -> int:
         print("✗ `build` needs --repo owner/name", file=sys.stderr)
         return 2
     issue_number = issue_numbers[0]
+    if len(issue_numbers) > 1:
+        print(
+            f"  (build handles one issue per run; using #{issue_number}, "
+            f"ignoring {issue_numbers[1:]})",
+            file=sys.stderr,
+        )
 
     body = _fetch_issue_body(args.repo, issue_number)
     if body is None:
@@ -140,7 +147,17 @@ def _run_build(args, config: dict) -> int:
         print(f"  DONE: {review.done}")
         return 0
 
-    workspace_root = config.get("workspace_root", ".")
+    # config's "workspace_root" defaults to "." (today's cwd) — fine for a
+    # repo-in-place run of triage/poll (issue-worm-pro's territory), but
+    # `ensure_base_clone` reuses *any* existing git checkout at that path
+    # without checking it's actually a checkout of --repo. Since `build`
+    # can be invoked from inside an unrelated repo (including issue-worm
+    # itself), only trust an explicit WORKSPACE_ROOT; otherwise clone into
+    # a repo-scoped subdirectory rather than risk writing generated files
+    # into whatever repo the CLI happened to be run from.
+    workspace_root = os.getenv("WORKSPACE_ROOT") or os.path.join(
+        ".issue-worm-workspace", args.repo.replace("/", "_")
+    )
     try:
         repo_path = ensure_base_clone(workspace_root, args.repo)
     except Exception as exc:  # noqa: BLE001 - report, don't crash the CLI
@@ -189,7 +206,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--version",
         action="version",
         version=f"{PACKAGE_NAME} {version} (public shell — "
-        "triage/build/poll require issue-worm-pro)",
+        "triage/poll require issue-worm-pro)",
     )
     subparsers = parser.add_subparsers(dest="command", help="Subcommand to run")
 

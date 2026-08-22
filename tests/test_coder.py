@@ -93,3 +93,37 @@ def test_propose_returns_empty_string_on_missing_response_key(tmp_path):
         result = coder.propose(str(tmp_path), "task", ["a.py"])
 
     assert result == ""
+
+
+def test_propose_does_not_read_outside_the_workspace(tmp_path):
+    secret = tmp_path.parent / "secret.txt"
+    secret.write_text("do not leak me", encoding="utf-8")
+    coder = LocalOllamaCoder()
+
+    with patch("coder.requests.post", return_value=_mock_response({"response": "x"})) as mock_post:
+        coder.propose(str(tmp_path), "task", ["../secret.txt"])
+
+    prompt = mock_post.call_args[1]["json"]["prompt"]
+    assert "do not leak me" not in prompt
+
+
+def test_propose_does_not_read_absolute_path(tmp_path):
+    outside = tmp_path.parent / "outside.txt"
+    outside.write_text("also secret", encoding="utf-8")
+    coder = LocalOllamaCoder()
+
+    with patch("coder.requests.post", return_value=_mock_response({"response": "x"})) as mock_post:
+        coder.propose(str(tmp_path), "task", [str(outside)])
+
+    prompt = mock_post.call_args[1]["json"]["prompt"]
+    assert "also secret" not in prompt
+
+
+def test_propose_survives_non_utf8_file_content(tmp_path):
+    (tmp_path / "binary.dat").write_bytes(b"\xff\xfe\x00\x01")
+    coder = LocalOllamaCoder()
+
+    with patch("coder.requests.post", return_value=_mock_response({"response": "x"})):
+        result = coder.propose(str(tmp_path), "task", ["binary.dat"])
+
+    assert result == "x"
