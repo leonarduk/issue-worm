@@ -16,6 +16,7 @@ from workspace import (
     FileChange,
     MalformedOutputError,
     WorkspaceError,
+    _redact_url,
     _repo_identity,
     _run_git,
     apply_file_change,
@@ -1068,3 +1069,35 @@ def test_ensure_base_clone_disables_git_credential_prompts(tmp_path):
         ensure_base_clone(str(tmp_path / "clone"), "owner/repo")
 
     assert m_git.call_args.kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        # Nothing to redact.
+        ("https://github.com/owner/name.git", "https://github.com/owner/name.git"),
+        ("git@github.com:owner/name.git", "git@github.com:owner/name.git"),
+        ("", ""),
+        # user:password and token forms.
+        (
+            "https://x-access-token:ghp_SECRET@github.com/owner/name.git",
+            "https://***@github.com/owner/name.git",
+        ),
+        (
+            "https://user:pass@github.com/owner/name",
+            "https://***@github.com/owner/name",
+        ),
+        ("https://ghp_SECRET@github.com/o/n", "https://***@github.com/o/n"),
+        # An @ later in the path is not userinfo and must survive.
+        (
+            "https://github.com/owner/name@v2.git",
+            "https://github.com/owner/name@v2.git",
+        ),
+    ],
+)
+def test_redact_url_strips_userinfo(url, expected):
+    """Credentials never reach an error message or a log line (#178)."""
+    assert _redact_url(url) == expected
+    if "SECRET" in url or "pass@" in url:
+        assert "SECRET" not in _redact_url(url)
+        assert "pass" not in _redact_url(url)

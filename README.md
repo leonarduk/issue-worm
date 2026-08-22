@@ -64,8 +64,16 @@ since they run inside that checkout.
 A reused checkout is checked against the repo you asked for: if its
 `origin` names a different project the run stops rather than committing
 to the wrong codebase. SSH and HTTPS remotes of the same repo count as
-the same repo. For a deliberate fork-origin workspace, set
-`WORM_SKIP_REMOTE_CHECK=1` to downgrade that to a warning.
+the same repo, and a remote the check cannot read or parse — a bare
+local path, a `file://` mirror — is allowed through rather than blocked.
+
+| Variable | Effect |
+|---|---|
+| `WORM_SKIP_REMOTE_CHECK=1` | Downgrade a repository mismatch from an error to a warning. For a deliberate fork-origin workspace, where `origin` is your fork rather than the repo you pass to `--repo`. |
+
+Note that with a fork origin the workspace is refreshed from the *fork's*
+`main`, so it is only as current as your last sync — that staleness is
+what the check exists to surface.
 
 ## Access
 
