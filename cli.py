@@ -12,6 +12,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 
 import requests
@@ -32,6 +33,8 @@ from workspace import (
 
 CREATE_ISSUE_TIMEOUT = 600
 GITHUB_API_TIMEOUT = 30
+# GitHub owner/repo names: alphanumerics, hyphens, underscores, and dots.
+_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
 
@@ -148,6 +151,13 @@ def _run_build(args, config: dict) -> int:
     if not args.repo:
         print("✗ `build` needs --repo owner/name", file=sys.stderr)
         return 2
+    if not _REPO_RE.fullmatch(args.repo):
+        print(
+            f"✗ Invalid --repo {args.repo!r} — expected 'owner/name' "
+            "(e.g. 'octocat/Hello-World')",
+            file=sys.stderr,
+        )
+        return 2
     issue_number = issue_numbers[0]
     if len(issue_numbers) > 1:
         print(
@@ -178,11 +188,14 @@ def _run_build(args, config: dict) -> int:
     # `ensure_base_clone` reuses *any* existing git checkout at that path
     # without checking it's actually a checkout of --repo. Since `build`
     # can be invoked from inside an unrelated repo (including issue-worm
-    # itself), only trust an explicit WORKSPACE_ROOT; otherwise clone into
-    # a repo-scoped subdirectory rather than risk writing generated files
-    # into whatever repo the CLI happened to be run from.
-    workspace_root = os.getenv("WORKSPACE_ROOT") or os.path.join(
-        ".issue-worm-workspace", args.repo.replace("/", "_")
+    # itself), only trust an explicit --workspace/WORKSPACE_ROOT; otherwise
+    # clone into a repo-scoped subdirectory rather than risk writing
+    # generated files into whatever repo the CLI happened to be run from.
+    # Precedence: --workspace flag > WORKSPACE_ROOT env var > default.
+    workspace_root = (
+        args.workspace
+        or os.getenv("WORKSPACE_ROOT")
+        or os.path.join(".issue-worm-workspace", args.repo.replace("/", "_"))
     )
     try:
         repo_path = ensure_base_clone(workspace_root, args.repo)
@@ -282,6 +295,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Only run the review check; don't call the Coder or touch files",
+    )
+    build_parser.add_argument(
+        "--workspace",
+        help="Directory to clone --repo into (overrides WORKSPACE_ROOT; "
+        "default: .issue-worm-workspace/<repo>)",
     )
 
     poll_parser = subparsers.add_parser(
