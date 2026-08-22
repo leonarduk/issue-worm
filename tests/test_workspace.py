@@ -3,6 +3,7 @@ and rollback on failure or interruption."""
 
 import logging
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -1303,12 +1304,42 @@ def test_non_interactive_env_appends_to_an_existing_ssh_command(monkeypatch):
     assert env["GIT_SSH_COMMAND"] == "ssh -i /keys/id_ed25519 -o BatchMode=yes"
 
 
-def test_non_interactive_env_does_not_double_up_batchmode(monkeypatch):
-    """A caller that already set BatchMode keeps exactly what it set."""
-    monkeypatch.setattr(sys, "stdin", _FakeStdin(False))
-    env = _non_interactive_env({"GIT_SSH_COMMAND": "ssh -o BatchMode=no"})
+@pytest.mark.parametrize(
+    "given", ["ssh -o BatchMode=no", "ssh -o BATCHMODE=yes", "ssh -o batchmode=no"]
+)
+def test_non_interactive_env_does_not_double_up_batchmode(given, monkeypatch):
+    """A caller that already set BatchMode keeps exactly what it set.
 
-    assert env["GIT_SSH_COMMAND"] == "ssh -o BatchMode=no"
+    The detection is case-insensitive because ssh's own option parsing
+    is: `-o BATCHMODE=yes` is as valid as `-o BatchMode=yes`, and
+    appending a second, contradicting `-o` would silently win over the
+    caller's choice (ssh takes the *first* value for an option).
+    """
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(False))
+    env = _non_interactive_env({"GIT_SSH_COMMAND": given})
+
+    assert env["GIT_SSH_COMMAND"] == given
+
+
+def test_non_interactive_env_append_survives_shell_quoting(monkeypatch):
+    """Appending cannot break a quoted GIT_SSH_COMMAND.
+
+    git shell-expands the value, so a key path containing spaces has to
+    survive the append. It does — appending at the end never lands
+    inside an existing quoted token — but nothing pinned that.
+    """
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(False))
+    env = _non_interactive_env({"GIT_SSH_COMMAND": 'ssh -i "/path with spaces/key"'})
+
+    assert env["GIT_SSH_COMMAND"] == 'ssh -i "/path with spaces/key" -o BatchMode=yes'
+    # And the shell still sees the path as one argument.
+    assert shlex.split(env["GIT_SSH_COMMAND"]) == [
+        "ssh",
+        "-i",
+        "/path with spaces/key",
+        "-o",
+        "BatchMode=yes",
+    ]
 
 
 def test_non_interactive_env_does_not_leak_the_ambient_environment(monkeypatch):
