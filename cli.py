@@ -44,12 +44,13 @@ LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
 # issue-worm-pro.
 _CORE_COMMANDS = ("triage", "poll")
 
-# issue-worm-pro is not yet published as an installable package with a
-# stable import contract this shell can call into (it is still the private
-# leonarduk/issue-worm-pro repo). Until that contract exists, these
-# commands are placeholders: they parse their flags (so --help stays
-# accurate) but always report themselves unavailable rather than claiming
-# to dispatch into an integration that does not exist yet.
+# issue-worm-pro, once installed, ships its implementation as a top-level
+# `pro_cli` module (not `cli` - #352: both packages used to declare a
+# top-level `cli` module and the same `issue-worm` console script, so
+# installing/reinstalling either one silently overwrote the other's files
+# on disk with no warning from pip). `_dispatch_to_pro` probes for it and
+# delegates when present; when it's genuinely not installed, this message
+# explains why.
 _CORE_MISSING_MESSAGE = (
     "✗ `issue-worm {command}` is part of issue-worm-pro (the automated "
     "review/implement/verify pipeline), a private package not yet "
@@ -80,12 +81,53 @@ def _reconfigure_utf8() -> None:
             pass
 
 
+def _try_import_pro_cli():
+    """The installed issue-worm-pro `pro_cli` module, or None if absent.
+
+    A plain ``import pro_cli`` wrapped for two reasons: to let `main`
+    decide *before* building its own parser whether a core command should
+    be dispatched (real flags, real execution) or handled by this shell's
+    placeholder subparser (accurate-enough flags for `--help`, "not
+    installed" on a real invocation) - see the dispatch note in `main` -
+    and to tell "pro_cli itself isn't installed" apart from "pro_cli is
+    installed but one of *its* imports is missing." Only the former is a
+    `ModuleNotFoundError` naming ``pro_cli``; re-raising anything else
+    keeps a genuine installation problem from being reported as "not
+    installed" and pointed at the wrong fix.
+    """
+    try:
+        import pro_cli
+    except ModuleNotFoundError as exc:
+        if exc.name != "pro_cli":
+            raise
+        return None
+    return pro_cli
+
+
+def _dispatch_to_pro(pro_cli) -> None:
+    """Delegate the current invocation to `pro_cli`, already confirmed importable.
+
+    Re-parses the original ``sys.argv`` from scratch via ``pro_cli.main()``
+    (which has its own full argparse setup, including flags this shell's
+    own placeholder subparsers don't know about) so a genuinely-installed
+    issue-worm-pro handles the command end to end (#352).
+
+    ``pro_cli.main()`` always calls ``sys.exit`` itself (with a real exit
+    code) rather than returning; ``sys.exit(pro_cli.main())`` forwards
+    whatever it returns instead, so a future ``pro_cli.main()`` that
+    returns an int instead of exiting doesn't get silently reported as
+    success.
+    """
+    sys.exit(pro_cli.main())
+
+
 def _core_command_unavailable(command: str) -> int:
     """Report that ``command`` needs issue-worm-pro, not installed here.
 
-    See the _CORE_COMMANDS comment above: there is no integration to call
-    into yet, so this prints the same message every time rather than
-    probing for a package that doesn't exist.
+    Reached only once this shell's own parser has already resolved
+    ``command`` - i.e. `main`'s earlier ``_try_import_pro_cli`` probe came
+    back empty, so this shell's placeholder subparser is what actually
+    handled ``--help`` and the rest of this command's flags.
     """
     print(_CORE_MISSING_MESSAGE.format(command=command), file=sys.stderr)
     return 2
@@ -318,6 +360,37 @@ def _build_parser() -> argparse.ArgumentParser:
 def main():
     """Main CLI entry point."""
     _reconfigure_utf8()
+
+    # triage/poll are issue-worm-pro-only. When it's genuinely installed,
+    # dispatched here - before this shell's own argparse parser is even
+    # built - rather than after parse_args() picks _CORE_COMMANDS out of
+    # args.command: that would mean any flag this shell's placeholder
+    # subparser for the command doesn't know - most visibly --help - is
+    # handled by the *wrong* parser and reports the wrong flag set instead
+    # of ever reaching the dispatch (the exact way #352 says this bug
+    # survived review). When it's not installed, falls through to this
+    # shell's own parser as before, so --help still shows the placeholder
+    # subparser's flags and a real invocation reports "not installed" via
+    # the args.command branch below.
+    #
+    # ``sys.argv[1]`` exactly, not a scan for the first non-flag token:
+    # `--version` is the only flag this parser accepts before the
+    # subcommand, it takes no value, and argparse's own version/help
+    # actions (plus abbreviations like `--vers`, and top-level `-h`) must
+    # keep winning over dispatch regardless of what follows them - a scan
+    # would send `--vers triage` or `--help triage` to pro_cli instead of
+    # printing this shell's own version/help as they always have.
+    #
+    # check_and_prompt() (this shell's self-update check) is skipped on
+    # the dispatch path below, but not lost: pro_cli.main() imports and
+    # calls the same check_and_prompt against the same PACKAGE_NAME
+    # ("issue-worm"), so the update check still runs exactly once either
+    # way.
+    if sys.argv[1:2] and sys.argv[1] in _CORE_COMMANDS:
+        pro_cli = _try_import_pro_cli()
+        if pro_cli is not None:
+            _dispatch_to_pro(pro_cli)
+
     check_and_prompt()
 
     parser = _build_parser()
@@ -359,6 +432,9 @@ def main():
         sys.exit(result.returncode)
 
     elif args.command in _CORE_COMMANDS:
+        # Only reached when issue-worm-pro isn't installed - main's earlier
+        # _try_import_pro_cli probe already dispatched and exited if it
+        # were (see the note there).
         sys.exit(_core_command_unavailable(args.command))
 
     elif args.command == "build":
