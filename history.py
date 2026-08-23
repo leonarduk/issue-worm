@@ -6,11 +6,14 @@ SQLite-vs-JSONL rationale; SQLite is deferred to M3's dashboard.
 """
 
 import json
+import logging
 import threading
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_HISTORY_PATH = ".issue-worm/history.jsonl"
 
@@ -102,13 +105,16 @@ def _load_records(history_path: str) -> list[dict]:
         return []
     records = []
     with path.open("r", encoding="utf-8") as f:
-        for line in f:
+        for line_number, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
                 continue
             try:
                 records.append(json.loads(line))
             except json.JSONDecodeError:
+                logger.warning(
+                    "Skipping malformed history line %d in %s", line_number, history_path
+                )
                 continue
     return records
 

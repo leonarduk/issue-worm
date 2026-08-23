@@ -20,6 +20,7 @@ from workspace import (
     MalformedOutputError,
     WorkspaceError,
     _non_interactive_env,
+    _RollbackGuard,
     _redact_url,
     _repo_identity,
     _run_git,
@@ -401,6 +402,17 @@ def test_parse_rejects_diff_section_with_no_diff_content():
         parse_coder_output(output, ["a.py"])
 
 
+def test_parse_rejects_output_missing_a_declared_file():
+    """A response truncated mid-second-file (e.g. hitting a provider's
+    output cap) leaves one declared file with no FILE section at all -
+    this must be rejected rather than silently returning a partial patch
+    (issue-worm-pro#256)."""
+    output = _full_file_output("a.py", "x = 1")
+
+    with pytest.raises(MalformedOutputError, match=r"missing declared file.*b\.py"):
+        parse_coder_output(output, ["a.py", "b.py"])
+
+
 # --- apply_file_change -------------------------------------------------------
 
 
@@ -478,6 +490,16 @@ def test_get_working_diff_includes_new_and_modified_files(repo):
     assert "new.py" in diff
 
 
+def test_get_working_diff_with_declared_files_ignores_undeclared_changes(repo):
+    (Path(repo) / "a.py").write_text("value = 2\n")
+    (Path(repo) / "stray.py").write_text("leftover = 1\n")
+
+    diff = get_working_diff(repo, declared_files=["a.py"])
+
+    assert "a.py" in diff
+    assert "stray.py" not in diff
+
+
 # --- run_revision_attempt: success -------------------------------------------
 
 
@@ -489,6 +511,21 @@ def test_run_revision_attempt_success_leaves_changes_in_place(repo):
         result = run_revision_attempt(repo, output, ["a.py"], start_commit=start)
 
     assert result.success is True
+
+
+def test_run_revision_attempt_stages_only_sanitized_declared_paths(repo):
+    """Triage's FILES: entries are often decorated (`` `a.py` ``, `** a.py`)
+    and parse_coder_output sanitizes them before matching - but a decorated
+    entry is not a valid git pathspec, so staging must use the sanitized
+    paths parse_coder_output actually applied, not the raw declared_files."""
+    start = get_current_commit(repo)
+    output = _full_file_output("a.py", "value = 2")
+
+    with patch("workspace.run_ci_checks", return_value=(True, "tests passed")):
+        result = run_revision_attempt(repo, output, ["`a.py`"], start_commit=start)
+
+    assert result.success is True
+    assert "a.py" in result.diff_output
     assert result.test_output == "tests passed"
     assert "a.py" in result.diff_output
     assert (Path(repo) / "a.py").read_text() == "value = 2\n"
@@ -596,6 +633,27 @@ def test_failed_attempt_does_not_bleed_into_next_attempt(repo):
 
     assert second.success is True
     assert (Path(repo) / "a.py").read_text() == "value = 3\n"
+
+
+# --- _RollbackGuard: rollback failure -----------------------------------------
+
+
+def test_rollback_guard_raises_when_rollback_fails_and_no_exception_in_flight(repo):
+    start = get_current_commit(repo)
+
+    with patch("workspace.reset_to_commit", side_effect=WorkspaceError("reset failed")):
+        with pytest.raises(WorkspaceError, match="reset failed"):
+            with _RollbackGuard(repo, start):
+                pass  # armed, no original exception - rollback failure is the news
+
+
+def test_rollback_guard_does_not_mask_original_exception_when_rollback_also_fails(repo):
+    start = get_current_commit(repo)
+
+    with patch("workspace.reset_to_commit", side_effect=WorkspaceError("reset failed")):
+        with pytest.raises(RuntimeError, match="original failure"):
+            with _RollbackGuard(repo, start):
+                raise RuntimeError("original failure")
 
 
 # --- run_revision_attempt: rollback on interruption --------------------------

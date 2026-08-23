@@ -361,6 +361,11 @@ class _RollbackGuard:
                 reset_to_commit(self.repo_path, self.start_commit)
             except WorkspaceError:
                 logger.error("Rollback to %s failed", self.start_commit, exc_info=True)
+                if exc_type is None:
+                    # No exception already in flight - the rollback failure
+                    # itself is the news, so surface it instead of returning
+                    # normally with a corrupted workspace left behind.
+                    raise
         return False  # never suppress the original exception, if any
 
 
@@ -519,6 +524,17 @@ def parse_coder_output(output: str, declared_files: list[str]) -> list[FileChang
 
         changes.append(FileChange(path=path, mode=mode, body=body))
 
+    missing = declared - seen_paths
+    if missing:
+        # A declared file with no FILE section usually means the Coder's
+        # response was cut off mid-section (e.g. hit a provider's output
+        # cap) rather than deliberately omitted - surfacing it here beats
+        # silently handing back a partial patch that fails to apply later.
+        raise MalformedOutputError(
+            f"coder output is missing declared file(s) {sorted(missing)} "
+            "(response may have been truncated)"
+        )
+
     return changes
 
 
@@ -550,12 +566,21 @@ def apply_file_change(repo_path: str, change: FileChange) -> None:
     _run_git(repo_path, "apply", "--recount", "-", input_text=change.body)
 
 
-def get_working_diff(repo_path: str) -> str:
-    """Stage every change (including new/deleted files) and return the
+def get_working_diff(repo_path: str, declared_files: list[str] | None = None) -> str:
+    """Stage changes (including new/deleted files) and return the
     resulting diff against HEAD - the patch a passing attempt hands back
     to the caller for commit-and-push.
+
+    When ``declared_files`` is given, only those paths are staged, so a
+    stray untracked/modified file already sitting in the working tree
+    (left over from a previous attempt, a build artifact, etc.) is never
+    swept into the diff. Falls back to staging everything when no paths
+    are declared.
     """
-    _run_git(repo_path, "add", "-A")
+    if declared_files:
+        _run_git(repo_path, "add", "-A", "--", *declared_files)
+    else:
+        _run_git(repo_path, "add", "-A")
     return _run_git(repo_path, "diff", "--cached", "HEAD", check=False).stdout
 
 
@@ -886,6 +911,12 @@ def run_revision_attempt(
     attempt's diff/full-file output, run CI checks, and leave the repo
     clean again unless the attempt fully passed. ``env`` is forwarded to
     the CI-check subprocess (see :func:`run_ci_checks`).
+
+    Normally returns a :class:`WorkspaceResult` even on failure - but if
+    the post-failure rollback to ``start_commit`` itself fails, a
+    ``WorkspaceError`` propagates instead (see :class:`_RollbackGuard`):
+    that leaves the workspace in an unknown state, which is worse than
+    the failure being reported and must not be swallowed.
     """
     if start_commit is None:
         start_commit = get_current_commit(repo_path)
@@ -904,7 +935,11 @@ def run_revision_attempt(
         except MalformedOutputError as exc:
             return WorkspaceResult(success=False, error=f"{APPLY_FAILED_ERROR_PREFIX} {exc}")
 
-        diff_output = get_working_diff(repo_path)
+        # Stage the sanitized paths parse_coder_output actually applied,
+        # not the raw declared_files - Triage's FILES: entries are often
+        # decorated (`` `a.py` ``, `** a.py`) and would fail as a git
+        # pathspec if handed to `git add` unsanitized.
+        diff_output = get_working_diff(repo_path, [change.path for change in changes])
 
         passed, test_output = run_ci_checks(repo_path, ci_command, env=env)
         if not passed:

@@ -86,6 +86,26 @@ def test_load_config_model_fallback(monkeypatch):
     assert config["coder_config"].ollama_model == "qwen:14b"
 
 
+def test_load_config_endpoint_fallback(monkeypatch):
+    """Test that CODER_ENDPOINT falls back from CODER_OLLAMA_ENDPOINT."""
+    monkeypatch.setenv("CODER_ENDPOINT", "http://coder-host:11434")
+    monkeypatch.delenv("CODER_OLLAMA_ENDPOINT", raising=False)
+
+    config = load_config()
+
+    assert config["coder_config"].ollama_endpoint == "http://coder-host:11434"
+
+
+def test_load_config_endpoint_prefers_ollama_endpoint(monkeypatch):
+    """Test that CODER_OLLAMA_ENDPOINT wins over CODER_ENDPOINT when both are set."""
+    monkeypatch.setenv("CODER_OLLAMA_ENDPOINT", "http://ollama-host:11434")
+    monkeypatch.setenv("CODER_ENDPOINT", "http://generic-host:11434")
+
+    config = load_config()
+
+    assert config["coder_config"].ollama_endpoint == "http://ollama-host:11434"
+
+
 # --- MCP doc lookup (issue #15) --------------------------------------------
 
 _MCP_ENV_VARS = (
