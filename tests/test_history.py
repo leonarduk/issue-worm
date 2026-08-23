@@ -6,6 +6,7 @@ local stand-in rather than importing the private orchestrator module.
 """
 
 import json
+import logging
 from dataclasses import dataclass
 
 from history import count_rejections, get_run, load_runs, record_rejection, record_run
@@ -87,6 +88,22 @@ def test_load_runs_skips_malformed_lines(tmp_path):
     runs = load_runs(str(history_path))
 
     assert runs == [{"task_id": "good"}]
+
+
+def test_load_runs_warns_on_malformed_lines(tmp_path, caplog):
+    history_path = tmp_path / "history.jsonl"
+    history_path.write_text(
+        json.dumps({"task_id": "good"}) + "\nnot-json\n\n",
+        encoding="utf-8",
+    )
+
+    with caplog.at_level(logging.WARNING):
+        load_runs(str(history_path))
+
+    records = [r for r in caplog.records if r.name == "history"]
+    assert len(records) == 1
+    assert "line 2" in records[0].message
+    assert str(history_path) in records[0].message
 
 
 def test_get_run_returns_matching_run(tmp_path):

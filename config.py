@@ -131,6 +131,9 @@ def _load_role_config(role_prefix: str) -> RoleConfig:
     ollama_endpoint = os.getenv(f"{role_prefix}_OLLAMA_ENDPOINT")
     ollama_model = os.getenv(f"{role_prefix}_OLLAMA_MODEL")
 
+    if not ollama_endpoint:
+        ollama_endpoint = os.getenv(f"{role_prefix}_ENDPOINT")
+
     if not ollama_model:
         ollama_model = os.getenv(f"{role_prefix}_MODEL")
 
