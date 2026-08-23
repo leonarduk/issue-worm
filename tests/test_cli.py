@@ -1,6 +1,7 @@
 """Tests for the free-shell CLI: history/create/build work standalone; the
-issue-worm-pro commands (triage/poll) report themselves unavailable
-rather than crashing on a missing private package.
+issue-worm-pro commands (triage/poll) delegate to the installed `pro_cli`
+module when issue-worm-pro is present, and report themselves unavailable
+rather than crashing when it isn't (#352).
 """
 
 import os
@@ -26,6 +27,187 @@ def test_core_command_reports_unavailable(command, capsys):
     captured = capsys.readouterr()
     assert command in captured.err
     assert "issue-worm-pro" in captured.err
+
+
+@pytest.mark.parametrize("command", ["triage", "poll"])
+def test_core_command_dispatches_to_pro_cli_when_installed(command, monkeypatch, capsys):
+    """#352: pro_cli.main() re-parses the original sys.argv itself (it has
+    its own full argparse setup), so this shell's placeholder subparser
+    for `command` never needs to forward specific flags - it just has to
+    get out of the way."""
+    fake_pro_cli = MagicMock()
+    fake_pro_cli.main.side_effect = SystemExit(0)
+    monkeypatch.setitem(sys.modules, "pro_cli", fake_pro_cli)
+
+    with patch.object(
+        sys, "argv", ["issue-worm", command, "--repo", "owner/name"]
+    ), pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    fake_pro_cli.main.assert_called_once_with()
+    assert exc.value.code == 0
+    assert "issue-worm-pro" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("command", ["triage", "poll"])
+def test_core_command_help_dispatches_before_this_shells_own_parser(command, monkeypatch, capsys):
+    """The bug #352 flags as the reason it survived review: --help used to
+    be swallowed by this shell's own placeholder subparser, silently
+    showing the wrong (stub) flag set even when pro was installed. It must
+    now reach pro_cli.main() like any other flag.
+
+    Load-bearing for #352 in a way the --repo variant above isn't: --repo
+    parses fine under the placeholder subparser too, so that test alone
+    can't tell "dispatched before this shell's own parser ran" apart from
+    "dispatched after parse_args() picked it out of args.command." Only
+    --help (unknown to the placeholder subparser under the old design)
+    actually distinguishes the two.
+    """
+    fake_pro_cli = MagicMock()
+    fake_pro_cli.main.side_effect = SystemExit(0)
+    monkeypatch.setitem(sys.modules, "pro_cli", fake_pro_cli)
+
+    with patch.object(
+        sys, "argv", ["issue-worm", command, "--help"]
+    ), pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    fake_pro_cli.main.assert_called_once_with()
+    assert exc.value.code == 0
+
+
+@pytest.mark.parametrize("command", ["triage", "poll"])
+def test_core_command_help_falls_back_to_this_shell_when_pro_not_installed(
+    command, monkeypatch, capsys
+):
+    """Without issue-worm-pro installed, --help still works and shows this
+    shell's placeholder flag set, rather than erroring. Patches
+    _try_import_pro_cli directly (rather than relying on `pro_cli` simply
+    not being on sys.path) so this test is correct even in an environment
+    where issue-worm-pro genuinely is installed alongside issue-worm."""
+    monkeypatch.setattr(cli, "_try_import_pro_cli", lambda: None)
+
+    with patch.object(
+        sys, "argv", ["issue-worm", command, "--help"]
+    ), pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+    assert "--repo" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("flag", ["--version", "--vers"])
+@pytest.mark.parametrize("command", ["triage", "poll"])
+def test_version_flag_wins_over_dispatch_regardless_of_abbreviation(
+    flag, command, monkeypatch, capsys
+):
+    """`--version` (and argparse's own abbreviations of it, like --vers)
+    must always mean "print this shell's version and exit," even combined
+    with a core command and even with pro_cli installed - dispatching to
+    pro here would silently print pro's version instead."""
+    fake_pro_cli = MagicMock()
+    monkeypatch.setitem(sys.modules, "pro_cli", fake_pro_cli)
+
+    with patch.object(
+        sys, "argv", ["issue-worm", flag, command]
+    ), pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    fake_pro_cli.main.assert_not_called()
+    assert exc.value.code == 0
+    assert "issue-worm" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("command", ["build", "history", "create"])
+def test_non_core_command_never_dispatches_even_with_pro_installed(command, monkeypatch):
+    """Only triage/poll are issue-worm-pro-only; every other command must
+    keep running standalone in this shell regardless of whether pro_cli
+    happens to be importable."""
+    fake_pro_cli = MagicMock()
+    monkeypatch.setitem(sys.modules, "pro_cli", fake_pro_cli)
+
+    argv = {
+        "build": ["issue-worm", "build", "--dry-run"],
+        "history": ["issue-worm", "history"],
+        "create": ["issue-worm", "create"],
+    }[command]
+    with patch.object(sys, "argv", argv), patch("subprocess.run"):
+        with pytest.raises(SystemExit):
+            cli.main()
+
+    fake_pro_cli.main.assert_not_called()
+
+
+@pytest.mark.parametrize("command", ["triage", "poll"])
+def test_check_and_prompt_runs_once_either_way(command, monkeypatch):
+    """check_and_prompt (this shell's self-update check) is skipped on the
+    early-dispatch path in main() - but not lost: pro_cli.main() calls the
+    same check itself. Confirms both halves of that claim: this shell's
+    own check_and_prompt is skipped when dispatching, and still runs on
+    the non-dispatch (pro not installed) path."""
+    fake_pro_cli = MagicMock()
+    fake_pro_cli.main.side_effect = SystemExit(0)
+    monkeypatch.setitem(sys.modules, "pro_cli", fake_pro_cli)
+
+    with patch.object(
+        sys, "argv", ["issue-worm", command, "--repo", "owner/name"]
+    ), patch("cli.check_and_prompt") as mock_check:
+        with pytest.raises(SystemExit):
+            cli.main()
+    mock_check.assert_not_called()
+
+    monkeypatch.setattr(cli, "_try_import_pro_cli", lambda: None)
+    with patch.object(
+        sys, "argv", ["issue-worm", command]
+    ), patch("cli.check_and_prompt") as mock_check:
+        with pytest.raises(SystemExit):
+            cli.main()
+    mock_check.assert_called_once()
+
+
+def test_dispatch_to_pro_exits_if_pro_cli_main_returns_normally():
+    """pro_cli.main() should always sys.exit itself; this is only a safety
+    net in case a future version of it doesn't - forwarding None (like
+    `sys.exit()` with no arguments) is a clean exit, same as returning 0."""
+    fake_pro_cli = MagicMock()
+    fake_pro_cli.main.return_value = None
+
+    with pytest.raises(SystemExit) as exc:
+        cli._dispatch_to_pro(fake_pro_cli)
+
+    assert exc.value.code is None
+
+
+def test_dispatch_to_pro_forwards_pro_cli_mains_return_code():
+    """If a future pro_cli.main() returns an int instead of calling
+    sys.exit itself, that code must propagate - not be silently reported
+    as success."""
+    fake_pro_cli = MagicMock()
+    fake_pro_cli.main.return_value = 2
+
+    with pytest.raises(SystemExit) as exc:
+        cli._dispatch_to_pro(fake_pro_cli)
+
+    assert exc.value.code == 2
+
+
+def test_try_import_pro_cli_reraises_unrelated_module_not_found_error(monkeypatch):
+    """A ModuleNotFoundError for one of pro_cli's own missing dependencies
+    must not be reported as "issue-worm-pro isn't installed" - that would
+    point a real installation problem at the wrong fix."""
+
+    def _broken_import(name, *args, **kwargs):
+        if name == "pro_cli":
+            raise ModuleNotFoundError("No module named 'some_pro_dependency'", name="some_pro_dependency")
+        return real_import(name, *args, **kwargs)
+
+    import builtins
+
+    real_import = builtins.__import__
+    monkeypatch.setattr(builtins, "__import__", _broken_import)
+
+    with pytest.raises(ModuleNotFoundError, match="some_pro_dependency"):
+        cli._try_import_pro_cli()
 
 
 def test_history_with_no_runs_prints_message(tmp_path, capsys):
