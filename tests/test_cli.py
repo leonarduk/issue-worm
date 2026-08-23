@@ -191,6 +191,17 @@ def test_dispatch_to_pro_forwards_pro_cli_mains_return_code():
     assert exc.value.code == 2
 
 
+def test_dispatch_to_pro_propagates_unexpected_exceptions():
+    """A non-SystemExit exception from pro_cli.main() must propagate, not be
+    silently swallowed by a future refactor wrapping the dispatch in a
+    catch-all try/except."""
+    fake_pro_cli = MagicMock()
+    fake_pro_cli.main.side_effect = RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        cli._dispatch_to_pro(fake_pro_cli)
+
+
 def test_try_import_pro_cli_reraises_unrelated_module_not_found_error(monkeypatch):
     """A ModuleNotFoundError for one of pro_cli's own missing dependencies
     must not be reported as "issue-worm-pro isn't installed" - that would
