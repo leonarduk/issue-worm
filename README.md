@@ -61,6 +61,40 @@ The credentials that clone was made with — an SSH key, a stored HTTPS
 token, a credential helper — are what the later fetches and pushes use,
 since they run inside that checkout.
 
+**If those credentials lapse**, what you see depends on where you are
+running.
+
+When **stdin is not a terminal** — the Scheduler, CI, or any invocation
+with stdin redirected — every prompt is disabled and git fails
+immediately:
+
+| Remote | Message |
+|---|---|
+| HTTPS | `fatal: could not read Username for 'https://github.com': terminal prompts disabled` |
+| SSH | `Permission denied (publickey)`, or `Host key verification failed` |
+
+That takes three settings, not one. `GIT_TERMINAL_PROMPT=0` covers only
+git's *own* prompt; `GIT_ASKPASS`/`SSH_ASKPASS` are consulted **before**
+it, so a process launched from a desktop session could otherwise block on
+a GUI dialog; and for an SSH remote git execs `ssh`, which reads a
+passphrase from `/dev/tty` directly and never sees any of git's
+variables — so `BatchMode=yes` is appended to `GIT_SSH_COMMAND`. Since
+the pre-clone above is normally an SSH checkout, that last one is the one
+that matters here.
+
+Without them a `git fetch` would wait for typing nobody can see until the
+120-second fetch timeout, once per pass, and report a *timeout* — naming
+the wrong cause.
+
+Note that stdin is what decides this, not stdout: `issue-worm build |
+tee run.log` still has a terminal on stdin and still prompts.
+
+**Run by hand from a terminal**, you get git's normal prompts and can
+answer them — but the same 120-second bound applies to the fetch, so
+dawdling at the prompt turns into `git fetch origin timed out after
+120.0s`. The clone is the exception: it disables prompts unconditionally,
+because its bound is ten minutes.
+
 A reused checkout is checked against the repo you asked for: if its
 `origin` names a different project the run stops rather than committing
 to the wrong codebase. SSH and HTTPS remotes of the same repo count as

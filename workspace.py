@@ -50,6 +50,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -164,6 +165,90 @@ DEFAULT_CI_TIMEOUT = 600.0
 FETCH_TIMEOUT = 120.0
 
 
+def _stdin_is_a_terminal() -> bool:
+    """True when stdin is a TTY a human could type a git password into.
+
+    Defensive because this decides whether git may block: a missing or
+    closed stdin (pythonw, a daemonised runner, a closed descriptor)
+    answers False, so the safe non-interactive path is the default and
+    only a stdin we positively know is a terminal opts out of it.
+    ``None.isatty`` raises AttributeError, which the same handler covers.
+    """
+    try:
+        return bool(sys.stdin.isatty())
+    except (AttributeError, ValueError, OSError):
+        # AttributeError: stdin is None, or an object without isatty.
+        # ValueError: operation on a closed file. OSError: a stdin whose
+        # fileno() cannot be queried. (io.UnsupportedOperation subclasses
+        # both of the latter two.)
+        return False
+
+
+def _non_interactive_env(env: dict[str, str] | None) -> dict[str, str] | None:
+    """``env`` with every credential prompt disabled off a terminal (#58).
+
+    ``subprocess.run(capture_output=True)`` redirects stdout and stderr
+    but *not* stdin, so a git that decides it needs a credential inherits
+    the parent's terminal and blocks on a prompt nobody can see. Bounded
+    by the call's timeout, so it is not a hang - but a 120s
+    ``FETCH_TIMEOUT`` spent waiting for typing is reported as a timeout,
+    which names the wrong cause. (The two ``input_text=`` callers are the
+    exception: passing ``input=`` puts stdin on a pipe, so ``git apply``
+    could never have prompted.)
+
+    One variable does not cover it, because there are three ways to ask:
+
+    ``GIT_TERMINAL_PROMPT=0``
+        git's *own* prompt, for HTTP(S) username/password. Yields
+        ``could not read Username ... terminal prompts disabled``.
+    ``GIT_ASKPASS=""`` and ``SSH_ASKPASS_REQUIRE=never``
+        git consults ``GIT_ASKPASS`` -> ``core.askPass`` -> ``SSH_ASKPASS``
+        *before* the terminal, and ``GIT_TERMINAL_PROMPT`` gates only that
+        last hop. A desktop-launched process inherits one of these (VS
+        Code sets ``GIT_ASKPASS``) and would block on a GUI dialog with
+        stdin nowhere near a terminal. An empty value reads as "no
+        askpass" and, being checked first, also suppresses
+        ``core.askPass``.
+    ``GIT_SSH_COMMAND=... -o BatchMode=yes``
+        for an ``ssh://``/``git@`` remote git execs ``ssh``, which reads a
+        key passphrase or a host-key confirmation from ``/dev/tty``
+        **directly** - it never sees ``GIT_TERMINAL_PROMPT``, and opening
+        ``/dev/tty`` succeeds whenever the process has a controlling
+        terminal, whatever stdin points at. This matters most: the
+        pre-cloned SSH checkout is the setup the README recommends for
+        private repos. Appended to any existing value rather than
+        replacing it, so a user's own ``GIT_SSH_COMMAND`` survives.
+
+    Applied only when stdin is not a terminal, so `issue-worm build` run
+    by hand can still be prompted the way git normally would; the
+    Scheduler, CI, and any invocation whose stdin is redirected get the
+    fast failure instead.
+
+    An explicit ``env`` is still the subprocess's full environment, as
+    :func:`_run_git` documents - these keys are added to it, not merged
+    underneath it, so a caller that deliberately restricts the
+    environment (#159) does not get ``os.environ`` leaked back in. Any
+    key the caller set explicitly wins.
+    """
+    if _stdin_is_a_terminal():
+        return env
+    result = dict(os.environ if env is None else env)
+    result.setdefault("GIT_TERMINAL_PROMPT", "0")
+    result.setdefault("GIT_ASKPASS", "")
+    result.setdefault("SSH_ASKPASS_REQUIRE", "never")
+    ssh_command = result.get("GIT_SSH_COMMAND") or "ssh"
+    # Match "batchmode=", not bare "batchmode": the option can only be
+    # set as `BatchMode=<value>`, so requiring the "=" keeps an
+    # incidental mention elsewhere in the command - a path, a
+    # ProxyCommand - from reading as "already set". That mistake fails
+    # in the unsafe direction: it would skip the append and leave ssh
+    # free to prompt, which is the whole bug (#58). Case-insensitive
+    # because ssh's own option parsing is.
+    if "batchmode=" not in ssh_command.lower():
+        result["GIT_SSH_COMMAND"] = f"{ssh_command} -o BatchMode=yes"
+    return result
+
+
 def _run_git(
     repo_path: str,
     *args: str,
@@ -185,6 +270,11 @@ def _run_git(
     add one variable must spread the parent explicitly::
 
         env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+
+    When stdin is not a terminal, ``GIT_TERMINAL_PROMPT=0`` is added by
+    default (#58) - see :func:`_non_interactive_env`. An explicit ``env``
+    still wins, so a caller that sets the variable itself keeps its value
+    on a TTY too.
     """
     effective_timeout = DEFAULT_GIT_TIMEOUT if timeout is None else timeout
     try:
@@ -196,7 +286,7 @@ def _run_git(
             encoding="utf-8",
             input=input_text,
             timeout=effective_timeout,
-            env=env,
+            env=_non_interactive_env(env),
         )
     except subprocess.TimeoutExpired as exc:
         raise WorkspaceError(
@@ -714,6 +804,9 @@ def ensure_base_clone(repo_path: str, repo: str) -> str:
     # supply non-interactively would sit on a username prompt until
     # CLONE_TIMEOUT (ten minutes). Fail fast instead, so the private-repo
     # case surfaces as an auth error the caller can act on (#177).
+    # Set explicitly rather than left to _non_interactive_env's default
+    # (#58): that one steps aside on a TTY so an interactive run can be
+    # prompted, but a ten-minute stall is too long to offer even there.
     result = _run_git(
         str(path.parent),
         "clone",
