@@ -202,6 +202,38 @@ def test_dispatch_to_pro_propagates_unexpected_exceptions():
         cli._dispatch_to_pro(fake_pro_cli)
 
 
+def test_dispatch_to_pro_propagates_system_exit_with_its_code():
+    """SystemExit from pro_cli.main() (its normal, expected way of exiting)
+    must keep propagating with its own code - not be caught, converted, or
+    reported as this shell's own exit status by a future refactor."""
+    fake_pro_cli = MagicMock()
+    fake_pro_cli.main.side_effect = SystemExit(42)
+
+    with pytest.raises(SystemExit) as exc:
+        cli._dispatch_to_pro(fake_pro_cli)
+
+    assert exc.value.code == 42
+
+
+@pytest.mark.parametrize("command", ["triage", "poll"])
+def test_main_propagates_unexpected_exceptions_through_dispatch(command, monkeypatch):
+    """The exception-propagation contract must hold through the full
+    main() -> _dispatch_to_pro() -> pro_cli.main() call chain, not just
+    through _dispatch_to_pro() in isolation - guards against a future
+    refactor wrapping the dispatch call *inside* main() in a swallowing
+    try/except, which test_dispatch_to_pro_propagates_unexpected_exceptions
+    alone would not catch."""
+    fake_pro_cli = MagicMock()
+    fake_pro_cli.main.side_effect = RuntimeError("boom")
+    monkeypatch.setitem(sys.modules, "pro_cli", fake_pro_cli)
+
+    with patch.object(sys, "argv", ["issue-worm", command]):
+        with pytest.raises(RuntimeError, match="boom"):
+            cli.main()
+
+    fake_pro_cli.main.assert_called_once_with()
+
+
 def test_try_import_pro_cli_reraises_unrelated_module_not_found_error(monkeypatch):
     """A ModuleNotFoundError for one of pro_cli's own missing dependencies
     must not be reported as "issue-worm-pro isn't installed" - that would

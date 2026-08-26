@@ -792,6 +792,125 @@ def test_ensure_base_clone_raises_when_clone_fails(tmp_path):
             ensure_base_clone(str(tmp_path / "base"), "owner/repo")
 
 
+def test_ensure_base_clone_fresh_reclones_an_existing_checkout(tmp_path, repo):
+    """fresh=True discards an existing checkout and re-clones from scratch,
+    instead of reusing it as-is."""
+    target = tmp_path / "base"
+    with patch("workspace._clone_url", return_value=repo):
+        ensure_base_clone(str(target), "owner/repo")
+        stale_marker = target / "stale.txt"
+        stale_marker.write_text("from the old checkout")
+
+        result = ensure_base_clone(str(target), "owner/repo", fresh=True)
+
+    assert result == str(target)
+    assert (target / ".git").exists()
+    assert not stale_marker.exists()
+    assert get_current_commit(str(target)) == get_current_commit(repo)
+
+
+def test_ensure_base_clone_fresh_refuses_a_checkout_of_another_repo(repo):
+    """fresh=True must not turn the wrong-repo safety error (#178) into a
+    silent delete-and-replace: the same-repo check still runs first, and
+    a mismatch is still refused, checkout untouched."""
+    head = get_current_commit(repo)
+    with patch("workspace._run_git") as m_git:
+
+        def _fake(path, *args, **kwargs):
+            if args[:1] == ("rev-parse",):
+                return subprocess.CompletedProcess([], 0, stdout="", stderr="")
+            if args[:3] == ("remote", "get-url", "origin"):
+                return subprocess.CompletedProcess(
+                    [], 0, stdout="https://github.com/someone/other.git\n", stderr=""
+                )
+            raise AssertionError(f"unexpected git call: {args}")
+
+        m_git.side_effect = _fake
+        with pytest.raises(WorkspaceError, match="not 'github.com/owner/name'"):
+            ensure_base_clone(repo, "owner/name", fresh=True)
+
+    assert Path(repo).exists()
+    assert get_current_commit(repo) == head
+
+
+def test_ensure_base_clone_fresh_refuses_a_directory_nested_in_another_checkout(repo):
+    """fresh=True must only ever discard a checkout rooted at repo_path
+    itself. `_is_git_checkout` is true for any path *inside* a git
+    working tree (it walks up to find one), so a WORKSPACE_ROOT that is
+    really a subdirectory of some other checkout — no `.git` of its own —
+    must be refused, not have that surrounding repo's working tree
+    deleted out from under it."""
+    nested = Path(repo) / "workspace"
+    nested.mkdir()
+    assert not (nested / ".git").exists()
+
+    with pytest.raises(WorkspaceError, match="not that tree's own root"):
+        ensure_base_clone(str(nested), "owner/repo", fresh=True)
+
+    # The surrounding checkout (and the nested directory itself) survive.
+    assert (Path(repo) / ".git").exists()
+    assert nested.exists()
+
+
+def test_ensure_base_clone_fresh_rename_failure_raises_and_leaves_checkout_intact(
+    repo,
+):
+    """If the existing checkout can't even be moved aside, fresh=True must
+    raise rather than attempt to clone into a path that's still occupied
+    — and the original checkout must be left exactly as it was."""
+    head = get_current_commit(repo)
+    with patch("workspace.Path.rename", side_effect=OSError("Permission denied")):
+        with pytest.raises(WorkspaceError, match="could not move aside"):
+            ensure_base_clone(repo, "owner/repo", fresh=True)
+
+    assert get_current_commit(repo) == head
+
+
+def test_ensure_base_clone_fresh_survives_a_stale_rmtree_failure(tmp_path, repo, caplog):
+    """A failure deleting the *moved-aside* old checkout must never block
+    the fresh clone, and must never leave repo_path itself in the
+    non-empty-non-git 'wedged' state fresh exists to avoid — the fresh
+    clone must land at repo_path regardless, with only a logged warning
+    about the orphaned leftover."""
+    target = tmp_path / "base"
+    with patch("workspace._clone_url", return_value=repo):
+        ensure_base_clone(str(target), "owner/repo")
+
+        with patch("workspace.shutil.rmtree", side_effect=OSError("stale NFS handle")):
+            with caplog.at_level("WARNING"):
+                result = ensure_base_clone(str(target), "owner/repo", fresh=True)
+
+    assert result == str(target)
+    assert (target / ".git").exists()
+    assert get_current_commit(str(target)) == get_current_commit(repo)
+    assert "could not fully delete" in caplog.text
+
+
+def test_ensure_base_clone_fresh_still_refuses_non_empty_non_git_directory(tmp_path):
+    """fresh=True must not widen what's safe to delete: a non-empty
+    non-git directory is still refused, not clobbered, exactly as
+    without fresh — fresh discards a stale *clone*, not arbitrary data."""
+    target = tmp_path / "base"
+    target.mkdir()
+    (target / "precious.txt").write_text("keep me")
+
+    with pytest.raises(WorkspaceError, match="non-empty"):
+        ensure_base_clone(str(target), "owner/repo", fresh=True)
+
+    assert (target / "precious.txt").read_text() == "keep me"
+
+
+def test_ensure_base_clone_fresh_is_a_no_op_precondition_when_missing(tmp_path, repo):
+    """fresh=True on a missing path behaves exactly like a normal clone —
+    there is nothing to discard first."""
+    target = tmp_path / "base"
+    with patch("workspace._clone_url", return_value=repo):
+        result = ensure_base_clone(str(target), "owner/repo", fresh=True)
+
+    assert result == str(target)
+    assert (target / ".git").exists()
+
+
 # --- subprocess timeouts (#45) ---------------------------------------------
 
 
