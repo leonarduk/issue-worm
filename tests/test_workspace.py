@@ -863,16 +863,17 @@ def test_ensure_base_clone_fresh_discards_a_linked_worktree(tmp_path, repo):
     worktree = tmp_path / "worktree"
     _git(repo, "worktree", "add", "-q", str(worktree))
     assert (worktree / ".git").is_file()  # the linked-worktree marker, not a dir
+    main_head = get_current_commit(repo)
 
     with patch("workspace._clone_url", return_value=repo):
         result = ensure_base_clone(str(worktree), "owner/repo", fresh=True)
 
     assert result == str(worktree)
     assert (worktree / ".git").exists()
-    assert get_current_commit(str(worktree)) == get_current_commit(repo)
+    assert get_current_commit(str(worktree)) == main_head
     # The main checkout the worktree was linked from is unharmed.
     assert (Path(repo) / ".git").is_dir()
-    assert get_current_commit(repo) == get_current_commit(repo)
+    assert get_current_commit(repo) == main_head
 
 
 def test_ensure_base_clone_fresh_rename_failure_raises_and_leaves_checkout_intact(
