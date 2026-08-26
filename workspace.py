@@ -49,6 +49,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -752,7 +753,47 @@ def _check_existing_remote(path: Path, repo: str) -> None:
     )
 
 
-def ensure_base_clone(repo_path: str, repo: str) -> str:
+def _discard_checkout(path: Path) -> None:
+    """Move ``path`` out of the way and best-effort delete it, for `fresh`.
+
+    Renamed aside first, then removed: the rename is a single filesystem
+    operation, so from the caller's perspective ``path`` either still has
+    its old, intact checkout (rename failed - the checkout is untouched
+    and the caller should not proceed with a clone into an occupied path)
+    or ``path`` is already free for a fresh clone, full stop. A `shutil.
+    rmtree` failure on the *renamed* copy (a read-only object file, a
+    stale NFS handle, ...) is logged and otherwise ignored, never raised:
+    the whole point of `fresh` is to reliably reach a usable checkout, and
+    an orphaned, harmlessly-named leftover directory is a far smaller
+    problem than the alternative — `rmtree` dying midway through the
+    checkout actually being reused would leave a non-empty, non-git
+    directory at ``path`` itself, which every future run (fresh or not)
+    then permanently refuses to touch (the exact "wedged" state `fresh`
+    exists to get out of).
+    """
+    stale = path.with_name(f"{path.name}.stale-{os.getpid()}")
+    try:
+        path.rename(stale)
+    except OSError as exc:
+        raise WorkspaceError(
+            f"fresh=True could not move aside the existing checkout at "
+            f"{str(path)!r} before re-cloning: {exc}"
+        ) from exc
+    try:
+        shutil.rmtree(stale)
+    except OSError as exc:
+        logger.warning(
+            "fresh=True: moved the old checkout at %s aside to %s but "
+            "could not fully delete it (%s) — remove it manually; a fresh "
+            "clone is proceeding at %s regardless",
+            path,
+            stale,
+            exc,
+            path,
+        )
+
+
+def ensure_base_clone(repo_path: str, repo: str, *, fresh: bool = False) -> str:
     """Ensure ``repo_path`` (WORKSPACE_ROOT) is a usable git checkout of ``repo``.
 
     The base clone every issue's worktree is created from. Reused as-is
@@ -762,6 +803,18 @@ def ensure_base_clone(repo_path: str, repo: str) -> str:
     — that is user data, so a ``WorkspaceError`` is raised and the caller
     should skip rather than clobber it. No fetch/pull of an existing
     checkout: the worker's own ``commit-and-push`` is what advances it.
+
+    ``fresh=True`` forces a re-clone even when ``repo_path`` is already a
+    usable git checkout — the existing checkout is deleted first, then
+    the normal missing-path clone path below runs. It never widens what
+    counts as safe to delete beyond a checkout genuinely rooted at
+    ``repo_path`` itself: an existing non-empty *non*-git directory still
+    raises rather than being removed, exactly as without ``fresh`` (that
+    guard is about not clobbering unrelated user data, which ``fresh`` —
+    a way to discard a stale *clone* — has no bearing on); and the
+    same-repo check (below) still runs before anything is deleted, so
+    ``fresh`` cannot silently discard a checkout of the *wrong* repository
+    — it still raises, exactly as without ``fresh``.
 
     A reused checkout is checked against ``repo`` first (#178): if its
     ``origin`` names a different repository, that is a misconfigured
@@ -795,6 +848,9 @@ def ensure_base_clone(repo_path: str, repo: str) -> str:
     Args:
         repo_path: The base-clone path (WORKSPACE_ROOT).
         repo: Repository in "owner/name" format.
+        fresh: Delete an existing git checkout at ``repo_path`` first and
+            re-clone, instead of reusing it as-is. Has no effect when the
+            path is already missing/empty (there is nothing to discard).
 
     Returns:
         The base-clone path (in the same relative/absolute form it was
@@ -802,8 +858,10 @@ def ensure_base_clone(repo_path: str, repo: str) -> str:
 
     Raises:
         WorkspaceError when the path cannot be made a usable checkout — a
-        non-empty non-git directory, a non-directory path, or a failed
-        clone. The caller should skip the pass with nothing attempted.
+        non-empty non-git directory, a non-directory path, a checkout of
+        a different repository, a failed clone, or (``fresh=True`` only)
+        a checkout that could not be moved aside to be discarded. The
+        caller should skip the pass with nothing attempted.
     """
     path = Path(repo_path)
     if path.exists():
@@ -812,9 +870,33 @@ def ensure_base_clone(repo_path: str, repo: str) -> str:
                 f"WORKSPACE_ROOT {repo_path!r} is not a directory"
             )
         if _is_git_checkout(path):
+            # Run regardless of `fresh`: this is the guard against
+            # discarding the *wrong* repository, which matters exactly as
+            # much when about to delete it as when about to reuse it.
             _check_existing_remote(path, repo)
-            return str(path)
-        if any(path.iterdir()):
+            if not fresh:
+                return str(path)
+            if not (path / ".git").exists():
+                # _is_git_checkout only proves `path` is somewhere *inside*
+                # a git working tree (it runs `git rev-parse` from `path`,
+                # which walks up to find one) — not that `path` is that
+                # tree's own root. Without this check, fresh=True on a
+                # WORKSPACE_ROOT nested inside an unrelated checkout would
+                # delete that surrounding repo's working tree, entirely
+                # unrelated to whatever `_check_existing_remote` just
+                # approved. (A linked worktree does have its own `.git`
+                # — a file, not a directory, pointing back at the main
+                # checkout's git-dir — so this check passes it through;
+                # deleting it only orphans its worktree registration,
+                # never touches the main checkout.)
+                raise WorkspaceError(
+                    f"WORKSPACE_ROOT {repo_path!r} is inside a git working "
+                    "tree but is not that tree's own root (no .git directly "
+                    "in it) — refusing to delete it with fresh=True; point "
+                    "WORKSPACE_ROOT at the checkout's own top-level directory"
+                )
+            _discard_checkout(path)
+        elif any(path.iterdir()):
             raise WorkspaceError(
                 f"WORKSPACE_ROOT {repo_path!r} exists, is non-empty, and is "
                 "not a git checkout — refusing to touch it; point "
