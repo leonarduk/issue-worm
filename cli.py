@@ -38,10 +38,20 @@ _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
 
-# `build` is implemented standalone in this shell (heuristic review + local
-# Ollama coder, single pass, no verifier/retry loop); `triage` and `poll`
-# still require the scheduler/label-lifecycle machinery that only exists in
-# issue-worm-pro.
+# Commands handed to issue-worm-pro when it is installed. `build` belongs
+# here even though this shell implements it too (#372): pro's build is the
+# full Coder -> Verifier -> Analyser loop that both repos' READMEs already
+# describe, and installing pro has to upgrade `build` the way it already
+# upgrades triage/poll. Leaving it out made pro users silently get the
+# free-tier single pass instead - the same "ran the wrong implementation"
+# failure #352 was about.
+_PRO_COMMANDS = ("triage", "build", "poll")
+
+# The subset of _PRO_COMMANDS with no free-tier implementation to fall back
+# on: `triage` and `poll` need the scheduler/label-lifecycle machinery that
+# only exists in issue-worm-pro, so without it they report themselves
+# unavailable. `build` instead falls back to this shell's `_run_build`
+# (heuristic review + local Ollama coder, single pass).
 _CORE_COMMANDS = ("triage", "poll")
 
 # issue-worm-pro, once installed, ships its implementation as a top-level
@@ -325,6 +335,9 @@ def _build_parser() -> argparse.ArgumentParser:
     triage_parser.add_argument("--limit", type=int, default=200)
     triage_parser.add_argument("--dry-run", action="store_true")
 
+    # Only ever reached when issue-worm-pro is absent: with pro installed,
+    # `build` is dispatched before this parser is built (#372), so pro's
+    # own subparser is what answers --help and defines the real flag set.
     build_parser = subparsers.add_parser(
         "build",
         help="Heuristic review + local Ollama coder, single pass "
@@ -341,7 +354,9 @@ def _build_parser() -> argparse.ArgumentParser:
     build_parser.add_argument(
         "--workspace",
         help="Directory to clone --repo into (overrides WORKSPACE_ROOT; "
-        "default: .issue-worm-workspace/<repo>)",
+        "default: .issue-worm-workspace/<repo>). Free-tier only — with "
+        "issue-worm-pro installed, `build` runs pro's implementation, "
+        "which resolves its own workspace and rejects this flag",
     )
 
     poll_parser = subparsers.add_parser(
@@ -361,9 +376,10 @@ def main():
     """Main CLI entry point."""
     _reconfigure_utf8()
 
-    # triage/poll are issue-worm-pro-only. When it's genuinely installed,
-    # dispatched here - before this shell's own argparse parser is even
-    # built - rather than after parse_args() picks _CORE_COMMANDS out of
+    # triage/poll are issue-worm-pro-only, and `build` is pro-upgraded
+    # (#372). When pro is genuinely installed, all three are dispatched
+    # here - before this shell's own argparse parser is even
+    # built - rather than after parse_args() picks _PRO_COMMANDS out of
     # args.command: that would mean any flag this shell's placeholder
     # subparser for the command doesn't know - most visibly --help - is
     # handled by the *wrong* parser and reports the wrong flag set instead
@@ -371,7 +387,8 @@ def main():
     # survived review). When it's not installed, falls through to this
     # shell's own parser as before, so --help still shows the placeholder
     # subparser's flags and a real invocation reports "not installed" via
-    # the args.command branch below.
+    # the args.command branch below - except `build`, which falls through
+    # to this shell's own single-pass implementation instead.
     #
     # ``sys.argv[1]`` exactly, not a scan for the first non-flag token:
     # `--version` is the only flag this parser accepts before the
@@ -386,7 +403,7 @@ def main():
     # calls the same check_and_prompt against the same PACKAGE_NAME
     # ("issue-worm"), so the update check still runs exactly once either
     # way.
-    if sys.argv[1:2] and sys.argv[1] in _CORE_COMMANDS:
+    if sys.argv[1:2] and sys.argv[1] in _PRO_COMMANDS:
         pro_cli = _try_import_pro_cli()
         if pro_cli is not None:
             _dispatch_to_pro(pro_cli)

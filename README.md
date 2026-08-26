@@ -9,6 +9,10 @@ verifier/retry loop and a scheduler (`triage`, `poll`) is
 [issue-worm-pro](https://github.com/leonarduk/issue-worm-pro), a private
 package — see [Access](#access) below.
 
+Installing issue-worm-pro upgrades this shell in place rather than
+replacing it: the `issue-worm` command stays the same, and `build` starts
+running pro's full pipeline instead of the single pass described here.
+
 ## What this package does today
 
 - `issue-worm create` — file a new issue, guided interactively (via
@@ -17,7 +21,9 @@ package — see [Access](#access) below.
   (non-LLM) check that the issue is scoped enough to dispatch (an
   `## Implementation notes` section with `FILES:`/`DONE:`), then a single
   pass through a local Ollama coder that writes the proposed changes to
-  the working tree. No verifier/retry loop, no scheduler.
+  the working tree. No verifier/retry loop, no scheduler. **With
+  issue-worm-pro installed this command runs pro's pipeline instead**, so
+  the behaviour described here is what you get on the free tier alone.
 - `issue-worm history` — list or inspect past runs recorded by the
   pipeline.
 - `issue-worm triage` / `poll` — parse their flags (so `--help` stays
@@ -32,9 +38,10 @@ pip install issue-worm
 
 ## Working with private repositories
 
-`issue-worm build` works in a checkout it calls the workspace, chosen by
-`--workspace`, else `WORKSPACE_ROOT`, else a default under
-`.issue-worm-workspace/`. When that path is missing or empty it is
+`issue-worm build` — the free-tier one; issue-worm-pro's resolves its own
+workspace and does not accept `--workspace` — works in a checkout it calls
+the workspace, chosen by `--workspace`, else `WORKSPACE_ROOT`, else a
+default under `.issue-worm-workspace/`. When that path is missing or empty it is
 fresh-cloned over **HTTPS with no credentials** — `ensure_base_clone`
 builds `https://github.com/<owner>/<name>.git` and nothing attaches a
 token.
