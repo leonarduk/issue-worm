@@ -852,6 +852,29 @@ def test_ensure_base_clone_fresh_refuses_a_directory_nested_in_another_checkout(
     assert nested.exists()
 
 
+def test_ensure_base_clone_fresh_discards_a_linked_worktree(tmp_path, repo):
+    """A linked worktree's `.git` is a file (pointing back at the main
+    checkout), not a directory - the `(path / ".git").exists()` check
+    must still treat it as a checkout rooted at its own path (it is one:
+    it has its own working tree and HEAD), not refuse it as "nested".
+    fresh=True discards it like any other checkout; the main checkout it
+    points back to is untouched (only its own worktree registration for
+    this one is orphaned, which is not this function's problem)."""
+    worktree = tmp_path / "worktree"
+    _git(repo, "worktree", "add", "-q", str(worktree))
+    assert (worktree / ".git").is_file()  # the linked-worktree marker, not a dir
+
+    with patch("workspace._clone_url", return_value=repo):
+        result = ensure_base_clone(str(worktree), "owner/repo", fresh=True)
+
+    assert result == str(worktree)
+    assert (worktree / ".git").exists()
+    assert get_current_commit(str(worktree)) == get_current_commit(repo)
+    # The main checkout the worktree was linked from is unharmed.
+    assert (Path(repo) / ".git").is_dir()
+    assert get_current_commit(repo) == get_current_commit(repo)
+
+
 def test_ensure_base_clone_fresh_rename_failure_raises_and_leaves_checkout_intact(
     repo,
 ):
