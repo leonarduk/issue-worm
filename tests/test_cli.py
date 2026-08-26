@@ -6,6 +6,7 @@ rather than crashing when it isn't (#352).
 
 import os
 import sys
+from types import ModuleType
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -118,16 +119,20 @@ def test_version_flag_wins_over_dispatch_regardless_of_abbreviation(
     assert "issue-worm" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("command", ["build", "history", "create"])
-def test_non_core_command_never_dispatches_even_with_pro_installed(command, monkeypatch):
-    """Only triage/poll are issue-worm-pro-only; every other command must
-    keep running standalone in this shell regardless of whether pro_cli
-    happens to be importable."""
+@pytest.mark.parametrize("command", ["history", "create"])
+def test_free_only_command_never_dispatches_even_with_pro_installed(
+    command, monkeypatch
+):
+    """`history` and `create` are this shell's alone and must never dispatch.
+
+    `build` used to be in this list. It moved out under #372: pro ships a
+    fuller build, so installing pro now upgrades it the way it already
+    upgrades triage/poll - see test_build_dispatches_to_pro_when_installed.
+    """
     fake_pro_cli = MagicMock()
     monkeypatch.setitem(sys.modules, "pro_cli", fake_pro_cli)
 
     argv = {
-        "build": ["issue-worm", "build", "--dry-run"],
         "history": ["issue-worm", "history"],
         "create": ["issue-worm", "create"],
     }[command]
@@ -624,3 +629,73 @@ def test_fetch_issue_body_reports_generic_request_error(capsys):
 
     assert result is None
     assert "GitHub request failed" in capsys.readouterr().err
+
+
+# --- `build` is pro-upgraded, not pro-only (#372) -----------------------
+
+
+def test_build_dispatches_to_pro_when_installed(monkeypatch):
+    """With pro installed, `build` must reach pro's orchestrator pipeline.
+
+    The #372 regression: `build` was left out of the dispatch set, so a pro
+    user silently got this shell's single-pass heuristic build instead of
+    the Coder -> Verifier -> Analyser loop both READMEs describe.
+    """
+    fake_pro_cli = ModuleType("pro_cli")
+    seen = []
+    fake_pro_cli.main = lambda: seen.append(list(sys.argv)) or 0
+    monkeypatch.setattr(cli, "_try_import_pro_cli", lambda: fake_pro_cli)
+
+    ran_free_build = []
+    monkeypatch.setattr(cli, "_run_build", lambda *a: ran_free_build.append(a) or 0)
+
+    argv = ["issue-worm", "build", "--dry-run"]
+    with patch.object(sys, "argv", argv), pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+    assert seen == [argv], "pro_cli.main() did not receive the invocation"
+    assert not ran_free_build, "the free-tier build ran despite pro being installed"
+
+
+def test_build_dispatch_happens_before_this_shells_parser(monkeypatch):
+    """A pro-only flag must reach pro, not be rejected by the stub parser.
+
+    Dispatch is pre-parse for exactly this reason (the flag sets differ:
+    this shell has --workspace, pro doesn't). Asserting it here stops a
+    future refactor from moving the check after parse_args().
+    """
+    fake_pro_cli = ModuleType("pro_cli")
+    fake_pro_cli.main = lambda: 0
+    monkeypatch.setattr(cli, "_try_import_pro_cli", lambda: fake_pro_cli)
+
+    with patch.object(
+        sys, "argv", ["issue-worm", "build", "--a-pro-only-flag"]
+    ), pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+
+
+def test_build_falls_back_to_this_shell_when_pro_absent(monkeypatch, capsys):
+    """Unlike triage/poll, `build` has a free-tier implementation to use."""
+    monkeypatch.setattr(cli, "_try_import_pro_cli", lambda: None)
+
+    ran = []
+    monkeypatch.setattr(cli, "_run_build", lambda *a: ran.append(a) or 0)
+
+    with patch.object(
+        sys, "argv", ["issue-worm", "build", "1", "--repo", "owner/name"]
+    ), pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+    assert len(ran) == 1
+    assert "issue-worm-pro" not in capsys.readouterr().err
+
+
+def test_build_is_dispatched_but_never_reported_unavailable():
+    """`build` is pro-upgraded, so it must be in one set and not the other."""
+    assert "build" in cli._PRO_COMMANDS
+    assert "build" not in cli._CORE_COMMANDS
+    assert set(cli._CORE_COMMANDS) < set(cli._PRO_COMMANDS)
