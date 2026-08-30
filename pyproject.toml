@@ -12,7 +12,13 @@ requires-python = ">=3.11"
 dependencies = [
     # `create` shells out to the `cicaid` CLI; not a Python import, but it
     # must be on PATH for that command to work.
-    "cicaid-devtools[dotenv] @ git+https://github.com/leonarduk/cicaid.git@v0.2.4",
+    # >=v0.4.0: issue-worm-pro (which depends on both this package and
+    # cicaid-devtools directly) needs cicaid-devtools>=v0.4.0 for
+    # publish-pr's --body-file flag (cicaid#27/#28) - pip resolves one
+    # version of a git-pinned package across the whole dependency graph,
+    # so this pin has to stay at least that current or any installer
+    # pulling in both packages hits an unresolvable conflict.
+    "cicaid-devtools[dotenv] @ git+https://github.com/leonarduk/cicaid.git@v0.4.0",
     "python-dotenv>=1.0",
     # Direct imports in version_checker.py (the update check).
     "packaging>=24,<27",
