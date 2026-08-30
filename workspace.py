@@ -108,11 +108,22 @@ _FILE_SECTION_RE = re.compile(
 # where a MODE: DIFF section's diff body starts amid surrounding prose.
 _DIFF_START_RE = re.compile(r"^(diff --git |--- )", re.MULTILINE)
 _DIFF_LINE_PREFIXES = ("diff --git", "index ", "---", "+++", "@@", " ", "+", "-", "\\")
-# Modalities may wrap the raw diff in a Markdown fenced code block (```diff /
-# ```) in addition to the mandated FILE/MODE delimiters (agents/coder.py); the
-# fence lines are not diff syntax, so strip them before handing the body to
-# git apply (issue #248).
-_FENCE_RE = re.compile(r"^[ \t]*```[ \t]*(?:diff)?[ \t]*\r?\n?$", re.MULTILINE)
+# Modalities may wrap a section's body in a Markdown fenced code block
+# (```diff / ```python / bare ``` / ...) in addition to the mandated
+# FILE/MODE delimiters (agents/coder.py); the fence lines are not diff
+# syntax or file content, so strip them before handing the body to git
+# apply (MODE_DIFF, issue #248) or writing it straight to disk (MODE_FULL,
+# issue #401 - a bare ```python fence silently landed inside a "full file"
+# write with no verifier to catch the resulting SyntaxError, since only
+# the diff path had fence-stripping). Matches any (or no) language tag,
+# not just "diff", since a full-file body is just as likely to be fenced
+# with the target language - but *not* at column 0 tolerance: no leading
+# whitespace is allowed before the backticks, deliberately, since a real
+# wrapping fence is always flush-left while a unified diff's own context
+# lines are always prefixed with a space and can legitimately look
+# fence-like (e.g. " ```python" when the diff edits a Markdown file) -
+# see test_parse_diff_section_preserves_fence_like_context_lines.
+_FENCE_RE = re.compile(r"^```[ \t]*[A-Za-z0-9_+-]*[ \t]*\r?\n?$", re.MULTILINE)
 
 
 class WorkspaceError(RuntimeError):
@@ -428,6 +439,24 @@ def sanitize_file_path(path: str) -> str | None:
     return cleaned
 
 
+def _strip_edge_fences(text: str) -> str:
+    """Drop a Markdown fence line wrapping `text`, if present.
+
+    Only fence lines at the very edges are removed - a fence-like line in
+    the *middle* of the text (e.g. a " ```" context line in a diff that
+    edits a Markdown file, or a triple-backtick a full-file rewrite is
+    legitimately meant to contain) is real content and must be preserved.
+    A no-op when there's no wrapping fence, so callers can apply this
+    unconditionally rather than needing to detect fencing themselves.
+    """
+    lines = text.splitlines()
+    if lines and _FENCE_RE.match(lines[0]):
+        lines = lines[1:]
+    if lines and _FENCE_RE.match(lines[-1]):
+        lines = lines[:-1]
+    return "\n".join(lines)
+
+
 def _extract_diff(body: str) -> str | None:
     """Pull the unified-diff hunk out of a MODE: DIFF section's body.
 
@@ -455,16 +484,9 @@ def _extract_diff(body: str) -> str | None:
         return None
     # Drop a Markdown fence line wrapping the block (issue #248): the
     # Coder's ```diff / ``` wrapper is not diff syntax, and handing it to
-    # git apply produces a "corrupt patch" error. Only fence lines at the
-    # very edges of the extracted body are removed - a fence-like line
-    # inside the diff (e.g. a " ```" context line when editing Markdown)
-    # is real diff content and must be preserved.
-    lines = diff_text.splitlines()
-    if lines and _FENCE_RE.match(lines[0]):
-        lines = lines[1:]
-    if lines and _FENCE_RE.match(lines[-1]):
-        lines = lines[:-1]
-    return "\n".join(lines).rstrip("\n") + "\n"
+    # git apply produces a "corrupt patch" error.
+    diff_text = _strip_edge_fences(diff_text)
+    return diff_text.rstrip("\n") + "\n"
 
 
 def parse_coder_output(output: str, declared_files: list[str]) -> list[FileChange]:
@@ -522,6 +544,14 @@ def parse_coder_output(output: str, declared_files: list[str]) -> list[FileChang
                     f"MODE: DIFF section for {path!r} contains no parseable unified diff"
                 )
             body = diff_text
+        else:
+            # A full-file rewrite wrapped in a Markdown fence (```python /
+            # bare ``` / ...) is not part of the file's real content, and
+            # there's no verifier here (free-tier build, #401) to catch the
+            # resulting SyntaxError the way issue-worm-pro's loop would -
+            # strip it before writing, the same way MODE_DIFF already does
+            # for its own fencing (issue #248).
+            body = _strip_edge_fences(body)
 
         changes.append(FileChange(path=path, mode=mode, body=body))
 

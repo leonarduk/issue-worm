@@ -241,6 +241,58 @@ def test_apply_diff_change_wrapped_in_markdown_fence_still_applies(repo):
     apply_file_change(repo, changes)
 
     assert (Path(repo) / "a.py").read_text() == "value = 2\n"
+
+
+def test_parse_full_section_wrapped_in_markdown_fence_strips_it(repo):
+    """Issue #401: a MODE: FULL body wrapped in a Markdown fence (```python
+    / bare ```) is not part of the file's real content. Unlike MODE: DIFF
+    (issue #248), nothing was stripping this for a full-file rewrite, so
+    the fence landed in the written file verbatim - silently producing a
+    file with a SyntaxError while `build` still reported success, since
+    the free-tier flow has no verifier to catch it."""
+    output = (
+        "=== FILE: a.py ===\n=== MODE: FULL ===\n```python\nvalue = 2\n```\n=== END FILE ===\n"
+    )
+
+    (change,) = parse_coder_output(output, ["a.py"])
+
+    assert change.mode == "FULL"
+    assert "```" not in change.body
+    assert change.body == "value = 2"
+
+
+def test_apply_full_change_wrapped_in_markdown_fence_writes_valid_content(repo):
+    """End-to-end: a fenced FULL body must write clean file content, not a
+    file containing the fence markers themselves - the exact failure mode
+    seen on issue #401."""
+    output = (
+        "=== FILE: a.py ===\n=== MODE: FULL ===\n```python\nvalue = 2\n```\n=== END FILE ===\n"
+    )
+    (change,) = parse_coder_output(output, ["a.py"])
+
+    apply_file_change(repo, change)
+
+    assert (Path(repo) / "a.py").read_text() == "value = 2\n"
+
+
+def test_parse_full_section_preserves_fence_like_content_lines():
+    """A full-file rewrite of a file that legitimately contains triple
+    backticks (e.g. a Markdown or docs file) must keep interior fence-like
+    lines - only a fence wrapping the whole body may be stripped, mirroring
+    MODE: DIFF's same rule (issue #248 review) for MODE: FULL (issue #401)."""
+    output = (
+        "=== FILE: README.md ===\n=== MODE: FULL ===\n"
+        "```python\ntitle\n```\n```python\n```\n"
+        "=== END FILE ===\n"
+    )
+
+    (change,) = parse_coder_output(output, ["README.md"])
+
+    # The wrapping fence (the very first ```python) is gone; the interior
+    # ```/```python lines, which are the file's real content, survive.
+    assert change.body == "title\n```\n```python"
+
+
 def test_parse_full_section_marker_inside_content_does_not_truncate():
     """Issue #254: `=== END FILE ===` inside file content (e.g. the
     malformed-diff prompt text in agents/analyser.py) must not terminate the
