@@ -18,12 +18,7 @@ dependencies = [
     # version of a git-pinned package across the whole dependency graph,
     # so this pin has to stay at least that current or any installer
     # pulling in both packages hits an unresolvable conflict.
-    # Local path dependency (dev machine only): points at the sibling
-    # cicaid checkout so pip doesn't see two different direct-reference
-    # URLs for cicaid-devtools (this file's vs. issue-worm-pro's) and
-    # report an unresolvable conflict. Revert to a git@<tag> pin before
-    # publishing/releasing this package.
-    "cicaid-devtools[dotenv] @ file:///C:/Users/steph/workspace/GitHub/issue-worm/cicaid",
+    "cicaid-devtools[dotenv] @ git+https://github.com/leonarduk/cicaid.git@v0.4.0",
     "python-dotenv>=1.0",
     # Direct imports in version_checker.py (the update check).
     "packaging>=24,<27",
