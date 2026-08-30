@@ -7,6 +7,7 @@ from config import (
     CoderTarget,
     RoleConfig,
     TargetPool,
+    _parse_coder_targets,
     get_role_env_vars,
     load_config,
     target_env_vars,
@@ -260,6 +261,75 @@ def test_target_env_vars():
         "OLLAMA_ENDPOINT": "http://alpha:11434",
         "OLLAMA_MODEL": "qwen:7b",
     }
+
+
+def test_target_env_vars_adds_scheme_to_bare_host():
+    """A bare "host:port" (the .env.example format) isn't a valid URL on
+    its own - ollama_common builds f"{endpoint}/api/tags" directly, so a
+    scheme must be added here rather than left for the caller to notice.
+    """
+    target = CoderTarget(name="desk", host="192.168.1.20:11434", model="qwen2.5-coder")
+
+    env_vars = target_env_vars(target)
+
+    assert env_vars["OLLAMA_ENDPOINT"] == "http://192.168.1.20:11434"
+
+
+def test_target_env_vars_preserves_model_tag():
+    """The model field is passed through untouched, tag and all."""
+    target = CoderTarget(name="desk", host="localhost:11434", model="qwen2.5-coder:7b")
+
+    env_vars = target_env_vars(target)
+
+    assert env_vars["OLLAMA_MODEL"] == "qwen2.5-coder:7b"
+
+
+def test_parse_coder_targets_host_and_port():
+    """The documented CODER_TARGETS format is name:host:port:model - port
+    is a separate field, not folded into a free-form host, precisely so
+    it can't collide with a tag inside the model name."""
+    targets = _parse_coder_targets("desk:192.168.1.20:11434:qwen2.5-coder")
+
+    assert targets == [
+        CoderTarget(name="desk", host="192.168.1.20:11434", model="qwen2.5-coder")
+    ]
+
+
+def test_parse_coder_targets_multiple_targets():
+    """Comma-separated targets each keep their own host:port intact."""
+    targets = _parse_coder_targets(
+        "desk:192.168.1.20:11434:qwen2.5-coder,gpu-box:192.168.1.50:11434:qwen2.5-coder"
+    )
+
+    assert [t.name for t in targets] == ["desk", "gpu-box"]
+    assert [t.host for t in targets] == ["192.168.1.20:11434", "192.168.1.50:11434"]
+
+
+def test_parse_coder_targets_model_with_tag():
+    """An Ollama model name can itself contain a ":tag" (e.g. "...:7b") -
+    without a fixed host:port split point, this would be misread as the
+    port/model boundary instead of part of the model name."""
+    targets = _parse_coder_targets("desk:localhost:11434:qwen2.5-coder:7b")
+
+    assert targets == [
+        CoderTarget(name="desk", host="localhost:11434", model="qwen2.5-coder:7b")
+    ]
+
+
+def test_parse_coder_targets_missing_port_skipped():
+    """The port is mandatory (disambiguates host from a tagged model
+    name), so a spec without one is dropped rather than misparsed."""
+    targets = _parse_coder_targets("desk:localhost:qwen2.5-coder")
+
+    assert targets == []
+
+
+def test_parse_coder_targets_malformed_spec_skipped():
+    """A spec with too few colons has no way to separate
+    name/host/port/model and is dropped rather than raising."""
+    targets = _parse_coder_targets("just-a-name")
+
+    assert targets == []
 
 
 def test_load_config_loads_dotenv_from_working_directory(tmp_path, monkeypatch):

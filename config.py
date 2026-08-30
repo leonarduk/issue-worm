@@ -188,7 +188,16 @@ def _env_int(name: str, default: int) -> int:
 def _parse_coder_targets(targets_str: str) -> list[CoderTarget]:
     """Parse CODER_TARGETS environment variable into a list of CoderTarget.
 
-    Format: "name1:host1:model1,name2:host2:model2"
+    Format: "name:host:port:model,...", e.g.
+    "desk:192.168.1.20:11434:qwen2.5-coder,gpu-box:192.168.1.50:11434:qwen2.5-coder".
+
+    The port is mandatory and split off separately from the model (rather
+    than folded into a free-form "host" that swallows all remaining
+    colons) because an Ollama model name can itself contain a ":tag"
+    (e.g. "qwen2.5-coder:7b" - often necessary, since an untagged name
+    implicitly requests ":latest", which may not be the tag actually
+    pulled locally). With both host and model able to contain colons,
+    only a fixed split point disambiguates the two reliably.
 
     Args:
         targets_str: Comma-separated list of colon-separated target specs.
@@ -201,9 +210,12 @@ def _parse_coder_targets(targets_str: str) -> list[CoderTarget]:
         return targets
 
     for target_spec in targets_str.split(","):
-        parts = target_spec.strip().split(":")
-        if len(parts) == 3:
-            targets.append(CoderTarget(name=parts[0], host=parts[1], model=parts[2]))
+        spec = target_spec.strip()
+        parts = spec.split(":", 3)
+        if len(parts) != 4:
+            continue
+        name, host, port, model = parts
+        targets.append(CoderTarget(name=name, host=f"{host}:{port}", model=model))
 
     return targets
 
@@ -307,10 +319,18 @@ def get_role_env_vars(role_config: RoleConfig) -> dict[str, str]:
 def target_env_vars(target: CoderTarget) -> dict[str, str]:
     """Convert a CoderTarget to Ollama environment variables.
 
+    ollama_common builds URLs as f"{OLLAMA_ENDPOINT}/api/tags", which needs
+    a scheme - a bare "host:port" (the CODER_TARGETS format documented in
+    .env.example) isn't itself a valid URL, so a scheme is added here if
+    the host doesn't already have one.
+
     Args:
         target: The CoderTarget to convert.
 
     Returns:
         Dict of environment variables to set when dispatching to the target.
     """
-    return {"OLLAMA_ENDPOINT": target.host, "OLLAMA_MODEL": target.model}
+    host = target.host
+    if not host.startswith(("http://", "https://")):
+        host = f"http://{host}"
+    return {"OLLAMA_ENDPOINT": host, "OLLAMA_MODEL": target.model}
