@@ -188,6 +188,49 @@ def test_load_config_endpoint_prefers_ollama_endpoint(monkeypatch):
     assert config["coder_config"].ollama_endpoint == "http://ollama-host:11434"
 
 
+# --- Defensive fallback on unrecognized config values -----------------------
+
+
+def test_load_config_unknown_model_source_falls_back_to_local(monkeypatch, caplog):
+    """A typo'd *_MODEL_SOURCE must not silently misconfigure the role -
+    fall back to the safe (private, no-cost) default and say why."""
+    monkeypatch.setenv("CODER_MODEL_SOURCE", "cluod")
+
+    config = load_config()
+
+    assert config["coder_config"].model_source == "local"
+    assert "CODER_MODEL_SOURCE='cluod'" in caplog.text
+
+
+def test_load_config_unknown_coder_backend_falls_back_to_native(monkeypatch, caplog):
+    """CODER_BACKEND only has two valid values (native/aider); anything
+    else must not pass through and fail confusingly downstream."""
+    monkeypatch.setenv("CODER_BACKEND", "aidr")
+
+    config = load_config()
+
+    assert config["coder_backend"] == "native"
+    assert "CODER_BACKEND='aidr'" in caplog.text
+
+
+def test_load_config_unknown_log_level_falls_back_to_info(monkeypatch, caplog):
+    """logging.Logger.setLevel raises on an unrecognized name - a typo'd
+    LOG_LEVEL must be caught here, not crash the process later."""
+    monkeypatch.setenv("LOG_LEVEL", "DEBUGG")
+
+    config = load_config()
+
+    assert config["log_level"] == "INFO"
+    assert "LOG_LEVEL='DEBUGG'" in caplog.text
+
+
+def test_load_config_log_level_is_case_insensitive(monkeypatch):
+    """A lowercase level name (as written in most examples) is still valid."""
+    monkeypatch.setenv("LOG_LEVEL", "debug")
+
+    assert load_config()["log_level"] == "DEBUG"
+
+
 # --- MCP doc lookup (issue #15) --------------------------------------------
 
 _MCP_ENV_VARS = (
@@ -411,6 +454,46 @@ def test_parse_coder_targets_malformed_spec_skipped():
     targets = _parse_coder_targets("just-a-name")
 
     assert targets == []
+
+
+def test_parse_coder_targets_wrong_field_count_warns(caplog):
+    """A dropped entry must be logged, not silently swallowed - otherwise
+    an empty pool from a typo looks identical to CODER_TARGETS being
+    unset (#193)."""
+    targets = _parse_coder_targets("cloud:api.deepseek.com:deepseek-v4-flash")
+
+    assert targets == []
+    assert "cloud:api.deepseek.com:deepseek-v4-flash" in caplog.text
+    assert "4 colon-separated fields" in caplog.text
+
+
+def test_parse_coder_targets_non_numeric_port_warns(caplog):
+    """A non-numeric port can never be dialed - drop the entry loudly
+    instead of handing out a target that will only fail at connect time."""
+    targets = _parse_coder_targets("desk:localhost:notaport:qwen2.5-coder")
+
+    assert targets == []
+    assert "port 'notaport' is not numeric" in caplog.text
+
+
+def test_parse_coder_targets_duplicate_name_warns_and_keeps_first(caplog):
+    """TargetPool tracks busy/unavailable state by name (config.py), so two
+    entries sharing a name would make it treat distinct hosts as one -
+    keep the first and drop the rest with a warning."""
+    targets = _parse_coder_targets(
+        "desk:192.168.1.20:11434:qwen2.5-coder,desk:192.168.1.50:11434:qwen2.5-coder"
+    )
+
+    assert [t.host for t in targets] == ["192.168.1.20:11434"]
+    assert "name 'desk' already used" in caplog.text
+
+
+def test_parse_coder_targets_ignores_trailing_comma():
+    """A stray trailing/leading comma is a harmless formatting artifact,
+    not a config error - it should not be treated as a malformed entry."""
+    targets = _parse_coder_targets("desk:localhost:11434:qwen2.5-coder,")
+
+    assert [t.name for t in targets] == ["desk"]
 
 
 def test_load_config_loads_dotenv_from_working_directory(tmp_path, monkeypatch):

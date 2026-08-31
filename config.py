@@ -81,7 +81,7 @@ def load_config() -> dict:
     load_dotenv(dotenv_path=os.getenv("ISSUE_WORM_ENV_FILE", ".env"), override=False)
 
     config = {
-        "coder_backend": os.getenv("CODER_BACKEND", "native"),
+        "coder_backend": _parse_coder_backend(os.getenv("CODER_BACKEND", "native")),
         "workspace_root": os.getenv("WORKSPACE_ROOT", "."),
         "test_command": os.getenv("TEST_COMMAND", "pytest"),
         "max_concurrent_issues": _parse_max_concurrent_issues(
@@ -94,7 +94,7 @@ def load_config() -> dict:
         "analyser_config": _load_role_config("ANALYSER"),
         "triage_config": _load_role_config("TRIAGE"),
         "coder_targets": _parse_coder_targets(os.getenv("CODER_TARGETS", "")),
-        "log_level": os.getenv("LOG_LEVEL", "INFO"),
+        "log_level": _parse_log_level(os.getenv("LOG_LEVEL", "INFO")),
         "log_file": os.getenv("LOG_FILE", ""),
     }
 
@@ -137,6 +137,43 @@ def _parse_max_concurrent_issues(raw: str) -> int:
     return value
 
 
+_VALID_CODER_BACKENDS = {"native", "aider"}
+
+
+def _parse_coder_backend(raw: str) -> str:
+    """Parse CODER_BACKEND, falling back to 'native' on an unknown value."""
+    if raw not in _VALID_CODER_BACKENDS:
+        logger.warning(
+            "CODER_BACKEND=%r is not one of %s; using 'native'",
+            raw, sorted(_VALID_CODER_BACKENDS),
+        )
+        return "native"
+    return raw
+
+
+_VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+
+
+def _parse_log_level(raw: str) -> str:
+    """Parse LOG_LEVEL, falling back to 'INFO' on an unknown value.
+
+    logging.Logger.setLevel raises ValueError on an unrecognized name, so
+    an unvalidated typo here would crash the process instead of just
+    mis-logging - resolve it to a name Python's logging module accepts.
+    """
+    upper = raw.strip().upper()
+    if upper not in _VALID_LOG_LEVELS:
+        logger.warning(
+            "LOG_LEVEL=%r is not one of %s; using 'INFO'",
+            raw, sorted(_VALID_LOG_LEVELS),
+        )
+        return "INFO"
+    return upper
+
+
+_VALID_MODEL_SOURCES = {"local", "cloud", "remote", "claude"}
+
+
 def _load_role_config(role_prefix: str) -> RoleConfig:
     """Load configuration for a specific role from environment variables.
 
@@ -147,6 +184,12 @@ def _load_role_config(role_prefix: str) -> RoleConfig:
         RoleConfig with model source and Ollama settings.
     """
     model_source = os.getenv(f"{role_prefix}_MODEL_SOURCE", "local")
+    if model_source not in _VALID_MODEL_SOURCES:
+        logger.warning(
+            "%s_MODEL_SOURCE=%r is not one of %s; using 'local'",
+            role_prefix, model_source, sorted(_VALID_MODEL_SOURCES),
+        )
+        model_source = "local"
 
     ollama_endpoint = os.getenv(f"{role_prefix}_OLLAMA_ENDPOINT")
     ollama_model = os.getenv(f"{role_prefix}_OLLAMA_MODEL")
@@ -219,6 +262,11 @@ def _parse_coder_targets(targets_str: str) -> list[CoderTarget]:
     pulled locally). With both host and model able to contain colons,
     only a fixed split point disambiguates the two reliably.
 
+    A malformed entry (wrong field count, non-numeric port, or a name
+    reused from an earlier entry) is dropped with a logged warning rather
+    than silently ignored - a pool that ends up empty because of a typo
+    should never look identical to CODER_TARGETS being unset (#193).
+
     Args:
         targets_str: Comma-separated list of colon-separated target specs.
 
@@ -229,12 +277,34 @@ def _parse_coder_targets(targets_str: str) -> list[CoderTarget]:
     if not targets_str:
         return targets
 
+    seen: dict[str, str] = {}
     for target_spec in targets_str.split(","):
         spec = target_spec.strip()
+        if not spec:
+            continue
         parts = spec.split(":", 3)
         if len(parts) != 4:
+            logger.warning(
+                "CODER_TARGETS entry %r ignored: expected "
+                "'name:host:port:model' (4 colon-separated fields), got %d",
+                spec, len(parts),
+            )
             continue
         name, host, port, model = parts
+        if not port.isdigit():
+            logger.warning(
+                "CODER_TARGETS entry %r ignored: port %r is not numeric",
+                spec, port,
+            )
+            continue
+        if name in seen:
+            logger.warning(
+                "CODER_TARGETS entry %r ignored: name %r already used by "
+                "entry %r (target names must be unique)",
+                spec, name, seen[name],
+            )
+            continue
+        seen[name] = spec
         targets.append(CoderTarget(name=name, host=f"{host}:{port}", model=model))
 
     return targets
