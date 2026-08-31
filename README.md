@@ -13,6 +13,22 @@ Installing issue-worm-pro upgrades this shell in place rather than
 replacing it: the `issue-worm` command stays the same, and `build` starts
 running pro's full pipeline instead of the single pass described here.
 
+## Demo
+
+**This is the free shell** — no subscription, no cloud API key, honest
+about what it does and doesn't do: AI writes the code, you do the rest.
+
+<video src="docs/assets/demo-2026-08-31-free.mp4" controls width="720"></video>
+
+For comparison, [issue-worm-pro](https://github.com/leonarduk/issue-worm-pro)
+runs AI through the whole pipeline — triage, coding, judging its own
+failures, and drafting the PR description:
+
+<video src="docs/assets/demo-2026-08-31-pro.mp4" controls width="720"></video>
+
+Watch both: this free tier is genuinely useful on its own for a
+well-scoped task, but pro is what "AI does the whole loop" looks like.
+
 ## What this package does today
 
 - `issue-worm create` — file a new issue, guided interactively (via
