@@ -69,11 +69,16 @@ def load_config() -> dict:
     - max_rejections: AI-review rejections allowed before an issue is
       handed off to a human instead of re-dispatched (default 3, #306)
     """
-    # `dotenv_path=".env"` resolves from the process working directory,
-    # not from this module's location — otherwise a pip-installed CLI
-    # would search next to config.py and never see the user's `.env`.
+    # `dotenv_path` resolves from the process working directory, not from
+    # this module's location — otherwise a pip-installed CLI would search
+    # next to config.py and never see the user's env file.
     # override=False keeps real environment variables on top.
-    load_dotenv(dotenv_path=".env", override=False)
+    #
+    # ISSUE_WORM_ENV_FILE lets several named env files coexist (e.g.
+    # .env-local, .env-deepseek, .env-claude - see .env-example-*) so
+    # switching providers is one env var, not copying a file over .env:
+    # ISSUE_WORM_ENV_FILE=.env-deepseek issue-worm build
+    load_dotenv(dotenv_path=os.getenv("ISSUE_WORM_ENV_FILE", ".env"), override=False)
 
     config = {
         "coder_backend": os.getenv("CODER_BACKEND", "native"),
@@ -92,6 +97,21 @@ def load_config() -> dict:
         "log_level": os.getenv("LOG_LEVEL", "INFO"),
         "log_file": os.getenv("LOG_FILE", ""),
     }
+
+    if not config["coder_targets"] and config["coder_config"].model_source != "local":
+        # CODER_TARGETS exists to pool multiple local Ollama machines by
+        # host - that has no meaning for a cloud/remote/lmstudio/claude
+        # coder, which doesn't route to a specific host at all. Requiring
+        # a CODER_TARGETS entry anyway meant every non-local setup needed
+        # a dummy, unused "name:host:port:model" line just to get a
+        # dispatch slot. Synthesize one placeholder target per configured
+        # concurrency slot instead, so non-local setups need no
+        # CODER_TARGETS entry at all.
+        config["coder_targets"] = [
+            CoderTarget(name=f"{config['coder_config'].model_source}-{i + 1}", host="", model="")
+            for i in range(config["max_concurrent_issues"])
+        ]
+
     return config
 
 

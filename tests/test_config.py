@@ -60,6 +60,87 @@ def test_load_config_defaults(monkeypatch):
     assert config["triage_config"].model_source == "local"
 
 
+def test_load_config_local_source_leaves_targets_empty_when_unset(monkeypatch):
+    """A local coder still needs an explicit CODER_TARGETS - synthesizing
+    one would silently point at a nonexistent Ollama host."""
+    monkeypatch.setenv("CODER_MODEL_SOURCE", "local")
+    monkeypatch.delenv("CODER_TARGETS", raising=False)
+
+    assert load_config()["coder_targets"] == []
+
+
+def test_load_config_synthesizes_targets_for_cloud_source(monkeypatch):
+    """A cloud/remote/lmstudio/claude coder doesn't route to a specific
+    host, so CODER_TARGETS being unset shouldn't leave it with no
+    dispatch capacity at all - a synthetic placeholder target is
+    generated instead."""
+    monkeypatch.setenv("CODER_MODEL_SOURCE", "cloud")
+    monkeypatch.delenv("CODER_TARGETS", raising=False)
+
+    targets = load_config()["coder_targets"]
+
+    assert len(targets) == 1
+    assert targets[0].host == ""
+    assert targets[0].model == ""
+
+
+def test_load_config_synthesized_targets_match_max_concurrent_issues(monkeypatch):
+    """The synthesized pool has one slot per configured concurrency, same
+    as an explicit CODER_TARGETS would need to provide."""
+    monkeypatch.setenv("CODER_MODEL_SOURCE", "claude")
+    monkeypatch.setenv("MAX_CONCURRENT_ISSUES", "3")
+    monkeypatch.delenv("CODER_TARGETS", raising=False)
+
+    targets = load_config()["coder_targets"]
+
+    assert len(targets) == 3
+    assert [t.name for t in targets] == ["claude-1", "claude-2", "claude-3"]
+
+
+def test_load_config_explicit_coder_targets_not_overridden_for_cloud_source(monkeypatch):
+    """An explicitly configured CODER_TARGETS is never replaced, even for
+    a non-local source - someone may still want named, load-balanced
+    targets (e.g. several REMOTE_LLM endpoints)."""
+    monkeypatch.setenv("CODER_MODEL_SOURCE", "cloud")
+    monkeypatch.setenv("CODER_TARGETS", "desk:192.168.1.20:11434:qwen2.5-coder")
+
+    targets = load_config()["coder_targets"]
+
+    assert len(targets) == 1
+    assert targets[0].name == "desk"
+
+
+def test_load_config_reads_named_env_file(tmp_path, monkeypatch):
+    """ISSUE_WORM_ENV_FILE selects a named env file instead of `.env`, so
+    several provider configs (.env-local, .env-deepseek, ...) can coexist
+    without copying one over `.env` to switch."""
+    (tmp_path / ".env-deepseek").write_text(
+        "CODER_MODEL_SOURCE=cloud\nDEEPSEEK_API_KEY=sk-from-named-file\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ISSUE_WORM_ENV_FILE", ".env-deepseek")
+    monkeypatch.delenv("CODER_MODEL_SOURCE", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+
+    config = load_config()
+
+    assert config["coder_config"].model_source == "cloud"
+    assert os.environ["DEEPSEEK_API_KEY"] == "sk-from-named-file"
+
+
+def test_load_config_defaults_to_plain_dotenv_when_env_file_unset(tmp_path, monkeypatch):
+    """With ISSUE_WORM_ENV_FILE unset, behaviour is unchanged: `.env`."""
+    (tmp_path / ".env").write_text("CODER_MODEL_SOURCE=cloud\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ISSUE_WORM_ENV_FILE", raising=False)
+    monkeypatch.delenv("CODER_MODEL_SOURCE", raising=False)
+
+    config = load_config()
+
+    assert config["coder_config"].model_source == "cloud"
+
+
 def test_load_config_with_env_vars(monkeypatch):
     """Test loading config with custom environment variables."""
     monkeypatch.setenv("CODER_MODEL_SOURCE", "cloud")
