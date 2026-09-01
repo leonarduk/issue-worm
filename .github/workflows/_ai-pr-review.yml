@@ -81,15 +81,10 @@ jobs:
       # modules. pip_install_cicaid_pro.sh validates the token up front and
       # exposes the credential only to the pip process through GIT_CONFIG_*
       # variables.
-      # cicaid-devtools-pro's own pyproject.toml declares a bare
-      # "cicaid-devtools" dependency (no URL - per cicaid-pro's MIGRATION.md
-      # it expects the free package already installed). This is a fresh venv
-      # unrelated to this repo's own requirements files, so it must be
-      # installed explicitly here too. Public repo, no token needed.
       - name: Install cicaid-devtools + cicaid-devtools-pro (PR review helpers)
         env:
           CICAID_PRO_TOKEN: ${{ secrets.cicaid_pro_token }}
-        run: bash .github/scripts/pip_install_cicaid_pro.sh pip install --retries 10 "cicaid-devtools @ git+https://github.com/leonarduk/cicaid.git@v0.2.4" "cicaid-devtools-pro @ git+https://github.com/leonarduk/cicaid-pro.git@v0.11.4"
+        run: bash .github/scripts/pip_install_cicaid_pro.sh pip install --retries 10 "cicaid-devtools @ git+https://github.com/leonarduk/cicaid.git@v0.5.0" "cicaid-devtools-pro @ git+https://github.com/leonarduk/cicaid-pro.git@v0.11.3"
 
       - name: Get linked issue body
         id: issue
@@ -226,9 +221,24 @@ jobs:
           # even if the gh pr comment call below fails.
           cat /tmp/${{ inputs.provider_id }}_comment_body.md >> "$GITHUB_STEP_SUMMARY"
 
-          if ! gh pr comment "$PR_NUMBER" --body-file /tmp/${{ inputs.provider_id }}_comment_body.md; then
-            echo "::warning title=${{ inputs.provider_name }} review comment::Failed to post the ${{ inputs.provider_name }} review comment to PR #$PR_NUMBER — check the Actions log above for the gh error (rate limit, token scope, or network)."
-            echo "WARNING: failed to post review comment — check the Actions log" >&2
+          # Retry with backoff: a transient rate limit shouldn't silently drop
+          # the review comment (the step summary above is a fallback, not a
+          # substitute -- reviewers watching the PR don't see the summary).
+          posted=false
+          for delay in 0 5 10 20 40; do
+            if [ "$delay" -gt 0 ]; then
+              echo "gh pr comment failed, retrying in ${delay}s..." >&2
+              sleep "$delay"
+            fi
+            if gh pr comment "$PR_NUMBER" --body-file /tmp/${{ inputs.provider_id }}_comment_body.md; then
+              posted=true
+              break
+            fi
+          done
+
+          if [ "$posted" != true ]; then
+            echo "::warning title=${{ inputs.provider_name }} review comment::Failed to post the ${{ inputs.provider_name }} review comment to PR #$PR_NUMBER after retries — check the Actions log above for the gh error (rate limit, token scope, or network)."
+            echo "WARNING: failed to post review comment after retries — check the Actions log" >&2
             exit 0
           fi
 
