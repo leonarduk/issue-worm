@@ -164,7 +164,7 @@ def test_latest_strips_leading_v():
         "update_dependency_pins._http_json", return_value={"tag_name": "v0.9.0"}
     ):
         assert latest_version("cicaid-devtools") == "0.9.0"
-        assert latest_version("cicaid-devtools-pro") == "0.9.0"
+        assert latest_version("cicaid-devtools-pro", token="secret") == "0.9.0"
 
 
 def test_latest_pro_passes_token():
@@ -177,6 +177,24 @@ def test_latest_pro_passes_token():
             "https://api.github.com/repos/leonarduk/cicaid-pro/releases/latest",
             token="secret",
         )
+
+
+def test_latest_pro_without_token_raises_clear_error():
+    # A missing token would otherwise surface as an opaque 404 from GitHub
+    # (the same response a private repo gives for "no releases exist").
+    with patch("update_dependency_pins._http_json") as mock_http:
+        with pytest.raises(PinError, match="GITHUB_TOKEN"):
+            latest_version("cicaid-devtools-pro")
+        mock_http.assert_not_called()
+
+
+def test_latest_pro_404_error_names_the_likely_cause():
+    with patch(
+        "update_dependency_pins._http_json",
+        side_effect=PinError("failed to fetch https://example.invalid: HTTP Error 404"),
+    ):
+        with pytest.raises(PinError, match="token has expired or lost read access"):
+            latest_version("cicaid-devtools-pro", token="secret")
 
 
 def test_latest_free_does_not_pass_token():
@@ -229,7 +247,8 @@ def test_check_mode_reports_up_to_date(repo, capsys):
     assert capsys.readouterr().out.splitlines() == ["UP-TO-DATE cicaid-devtools 0.8.1"]
 
 
-def test_write_mode_updates_and_exits_zero(repo):
+def test_write_mode_updates_and_exits_zero(repo, monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "secret")
     with (
         patch(
             "update_dependency_pins._http_json", return_value={"tag_name": "v0.14.1"}

@@ -81,14 +81,20 @@ jobs:
           BRANCH_VERSION=${NEW_VERSION//+/-}
           if [[ "${{ matrix.dependency }}" == "cicaid-devtools" ]]; then
             RELEASE_URL="https://github.com/leonarduk/cicaid/releases/tag/v${NEW_VERSION}"
+            RELEASE_NOTE=""
           else
+            # This repo is public but leonarduk/cicaid-pro is not, so the
+            # release link 404s for readers without access to it. The pinned
+            # version itself is already public in _ai-pr-review.yml.
             RELEASE_URL="https://github.com/leonarduk/cicaid-pro/releases/tag/v${NEW_VERSION}"
+            RELEASE_NOTE=" (private repo; requires access)"
           fi
           {
             echo "old_version=$OLD_VERSION"
             echo "new_version=$NEW_VERSION"
             echo "branch_version=$BRANCH_VERSION"
             echo "release_url=$RELEASE_URL"
+            echo "release_note=$RELEASE_NOTE"
           } >> "$GITHUB_OUTPUT"
 
       - name: Skip if a PR for this update already exists
@@ -112,6 +118,12 @@ jobs:
 
       - name: Update pins on a dependency branch
         if: steps.check.outputs.new_version != '' && steps.skip.outputs.skip != 'true'
+        env:
+          # Rewriting re-fetches the latest release to rewrite to (it does
+          # not reuse the Check step's output), and cicaid-devtools-pro's
+          # call needs this the same way the Check step does -- without it
+          # the private repo's releases API 404s here.
+          GITHUB_TOKEN: ${{ secrets.CICAID_PRO_TOKEN }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -161,6 +173,7 @@ jobs:
           OLD_VERSION: ${{ steps.check.outputs.old_version }}
           NEW_VERSION: ${{ steps.check.outputs.new_version }}
           RELEASE_URL: ${{ steps.check.outputs.release_url }}
+          RELEASE_NOTE: ${{ steps.check.outputs.release_note }}
           DEPENDENCY: ${{ matrix.dependency }}
         run: |
           TITLE="Update ${DEPENDENCY} to v${NEW_VERSION}"
@@ -176,7 +189,7 @@ jobs:
           BODY=$(cat <<EOF
           Update \`${DEPENDENCY}\` from ${OLD_VERSION} to ${NEW_VERSION}.
 
-          - Release notes: ${RELEASE_URL}
+          - Release notes: ${RELEASE_URL}${RELEASE_NOTE}
           - Opened by the update-dependencies workflow; the dependency PR
             links back to this issue and closes it on merge.
           EOF
@@ -194,6 +207,7 @@ jobs:
           NEW_VERSION: ${{ steps.check.outputs.new_version }}
           BRANCH_VERSION: ${{ steps.check.outputs.branch_version }}
           RELEASE_URL: ${{ steps.check.outputs.release_url }}
+          RELEASE_NOTE: ${{ steps.check.outputs.release_note }}
           ISSUE_NUMBER: ${{ steps.issue.outputs.issue_number }}
           DEPENDENCY: ${{ matrix.dependency }}
         run: |
@@ -214,7 +228,7 @@ jobs:
           BODY=$(cat <<EOF
           Update \`${DEPENDENCY}\` from ${OLD_VERSION} to ${NEW_VERSION}.
 
-          - Release notes: ${RELEASE_URL}
+          - Release notes: ${RELEASE_URL}${RELEASE_NOTE}
           - Verified in this workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
           Closes #${ISSUE_NUMBER}

@@ -153,7 +153,24 @@ def _http_json(url: str, token: str | None = None) -> dict:
 def latest_version(dep: str, token: str | None = None) -> str:
     """Latest released version of ``dep`` (never a v-prefixed string)."""
     spec = _spec(dep)
-    data = _http_json(spec.releases_api, token=token if spec.needs_token else None)
+    if spec.needs_token and not token:
+        # GitHub answers an unauthenticated request for a private repo with
+        # 404, which is indistinguishable from "no releases yet" - say what
+        # is actually wrong instead of letting that surface as a fetch error.
+        raise PinError(
+            f"{dep} lives in the private leonarduk/{spec.repo_slug}: checking it "
+            "needs GITHUB_TOKEN set to a PAT with read access there (the workflow "
+            "passes the CICAID_PRO_TOKEN secret)"
+        )
+    try:
+        data = _http_json(spec.releases_api, token=token if spec.needs_token else None)
+    except PinError as exc:
+        if spec.needs_token:
+            raise PinError(
+                f"{exc} - for the private leonarduk/{spec.repo_slug} a 404 usually "
+                "means the token has expired or lost read access to that repo"
+            ) from exc
+        raise
     tag = data.get("tag_name", "")
     if not tag.startswith("v"):
         raise PinError(
