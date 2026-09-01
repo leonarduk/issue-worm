@@ -17,8 +17,13 @@ dependencies = [
     # publish-pr's --body-file flag (cicaid#27/#28) - pip resolves one
     # version of a git-pinned package across the whole dependency graph,
     # so this pin has to stay at least that current or any installer
-    # pulling in both packages hits an unresolvable conflict.
-    "cicaid-devtools[dotenv] @ git+https://github.com/leonarduk/cicaid.git@v0.4.0",
+    # pulling in both packages hits an unresolvable conflict. For the same
+    # reason a bump here needs the matching bump in issue-worm-pro: an
+    # installer that pulls in both wants the same ref from each.
+    # Kept current by .github/workflows/update-dependencies.yml, which also
+    # rewrites the copies in requirements.txt and _ai-pr-review.yml - the
+    # three must always name the same tag.
+    "cicaid-devtools[dotenv] @ git+https://github.com/leonarduk/cicaid.git@v0.5.0",
     "python-dotenv>=1.0",
     # Direct imports in version_checker.py (the update check).
     "packaging>=24,<27",
