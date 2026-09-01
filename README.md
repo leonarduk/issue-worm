@@ -29,6 +29,11 @@ failures, and drafting the PR description:
 Watch both: this free tier is genuinely useful on its own for a
 well-scoped task, but pro is what "AI does the whole loop" looks like.
 
+For a deeper look at pro's retry loop and scheduler in action — real
+transcripts, a bounded 3-attempt retry with genuine Analyser feedback,
+and a real PR opened end to end — see
+[docs/demo-2026-08-30-issue-388.md](docs/demo-2026-08-30-issue-388.md).
+
 ## What this package does today
 
 - `issue-worm create` — file a new issue, guided interactively (via
