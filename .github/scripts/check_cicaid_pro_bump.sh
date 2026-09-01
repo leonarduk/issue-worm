@@ -17,7 +17,12 @@ if [ -z "${CICAID_PRO_TOKEN:-}" ]; then
   exit 1
 fi
 
-CURRENT=$(grep -oP 'cicaid-devtools-pro @ git\+https://github\.com/leonarduk/cicaid-pro\.git@\Kv[0-9]+\.[0-9]+\.[0-9]+' "$WORKFLOW_FILE")
+CURRENT=$(grep -oP 'cicaid-devtools-pro @ git\+https://github\.com/leonarduk/cicaid-pro\.git@\Kv[0-9]+\.[0-9]+\.[0-9]+' "$WORKFLOW_FILE" || true)
+
+if [ -z "$CURRENT" ]; then
+  echo "::error::Could not find a 'cicaid-devtools-pro @ git+...@vX.Y.Z' pin in $WORKFLOW_FILE — has the line been reformatted?" >&2
+  exit 1
+fi
 
 LATEST=$(git -c "url.https://x-access-token:${CICAID_PRO_TOKEN}@github.com/leonarduk/cicaid-pro.insteadOf=https://github.com/leonarduk/cicaid-pro" \
   ls-remote --tags --refs https://github.com/leonarduk/cicaid-pro.git \
