@@ -84,7 +84,7 @@ jobs:
       - name: Install cicaid-devtools + cicaid-devtools-pro (PR review helpers)
         env:
           CICAID_PRO_TOKEN: ${{ secrets.cicaid_pro_token }}
-        run: bash .github/scripts/pip_install_cicaid_pro.sh pip install --retries 10 "cicaid-devtools @ git+https://github.com/leonarduk/cicaid.git@v0.5.0" "cicaid-devtools-pro @ git+https://github.com/leonarduk/cicaid-pro.git@v0.11.3"
+        run: bash .github/scripts/pip_install_cicaid_pro.sh pip install --retries 10 "cicaid-devtools @ git+https://github.com/leonarduk/cicaid.git@v0.5.0" "cicaid-devtools-pro @ git+https://github.com/leonarduk/cicaid-pro.git@v0.11.4"
 
       - name: Get linked issue body
         id: issue
