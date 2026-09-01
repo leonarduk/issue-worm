@@ -162,7 +162,14 @@ jobs:
         env:
           CICAID_PRO_TOKEN: ${{ secrets.CICAID_PRO_TOKEN }}
         run: |
+          # cicaid-devtools-pro depends on cicaid-devtools, which is not on
+          # PyPI (git-only) -- a plain `pip install cicaid-devtools-pro`
+          # can't resolve that dependency and 404s looking for it there.
+          # _ai-pr-review.yml's real install works because it passes both
+          # packages' git+https URLs to one pip invocation, same as here.
+          CICAID_PIN=$(grep -oP 'cicaid\.git@\Kv[0-9][A-Za-z0-9.+-]*' .github/workflows/_ai-pr-review.yml)
           bash .github/scripts/pip_install_cicaid_pro.sh python -m pip install \
+            "cicaid-devtools @ git+https://github.com/leonarduk/cicaid.git@${CICAID_PIN}" \
             "cicaid-devtools-pro @ git+https://github.com/leonarduk/cicaid-pro.git@v${{ steps.check.outputs.new_version }}"
 
       - name: Create or reuse linked issue for the update
