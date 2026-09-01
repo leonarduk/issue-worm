@@ -247,7 +247,8 @@ def test_check_mode_reports_up_to_date(repo, capsys):
     assert capsys.readouterr().out.splitlines() == ["UP-TO-DATE cicaid-devtools 0.8.1"]
 
 
-def test_write_mode_updates_and_exits_zero(repo):
+def test_write_mode_updates_and_exits_zero(repo, monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "secret")
     with (
         patch(
             "update_dependency_pins._http_json", return_value={"tag_name": "v0.14.1"}
