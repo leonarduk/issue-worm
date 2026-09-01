@@ -1,0 +1,57 @@
+name: cicaid-pro Bump Check
+
+# Nothing else keeps the cicaid-devtools-pro pin in _ai-pr-review.yml current
+# -- it's a hardcoded git tag, and it silently drifted backwards once already
+# (issue #135 / PR #136). This runs on a schedule, checks the latest tag on
+# leonarduk/cicaid-pro, and opens a PR bumping the pin when it's behind.
+on:
+  schedule:
+    - cron: '0 6 * * 1' # weekly, Monday 06:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check-bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check for a newer cicaid-devtools-pro tag
+        id: check
+        env:
+          CICAID_PRO_TOKEN: ${{ secrets.CICAID_PRO_TOKEN }}
+        run: bash .github/scripts/check_cicaid_pro_bump.sh
+
+      - name: Open or update the bump PR
+        if: steps.check.outputs.bumped == 'true'
+        env:
+          # The default GITHUB_TOKEN can create the PR, but GitHub does not
+          # let a GITHUB_TOKEN-authored pull_request trigger other workflows
+          # (recursion guard) -- so CI won't auto-run on this PR. Closing and
+          # reopening it, or pushing an empty commit, triggers a normal run.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OLD_VERSION: ${{ steps.check.outputs.old_version }}
+          NEW_VERSION: ${{ steps.check.outputs.new_version }}
+        run: |
+          BRANCH="chore/bump-cicaid-devtools-pro-${NEW_VERSION}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add .github/workflows/_ai-pr-review.yml
+          git commit -m "chore: bump cicaid-devtools-pro ${OLD_VERSION} -> ${NEW_VERSION}"
+          git push -f origin "$BRANCH"
+
+          if gh pr view "$BRANCH" --json state -q .state >/dev/null 2>&1; then
+            echo "PR already open for $BRANCH, branch updated."
+          else
+            gh pr create \
+              --title "chore: bump cicaid-devtools-pro ${OLD_VERSION} -> ${NEW_VERSION}" \
+              --body "Automated bump of the \`cicaid-devtools-pro\` pin in \`_ai-pr-review.yml\` from \`${OLD_VERSION}\` to \`${NEW_VERSION}\`, detected by the scheduled cicaid-pro-bump-check workflow.
+
+          Refs #135" \
+              --base main \
+              --head "$BRANCH"
+          fi
