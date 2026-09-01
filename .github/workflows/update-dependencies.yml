@@ -9,6 +9,17 @@ name: Update Dependencies
 # Ported from issue-worm-pro's workflow of the same name; it replaces the
 # narrower cicaid-pro-bump-check.yml, which only tracked the
 # cicaid-devtools-pro pin in _ai-pr-review.yml.
+#
+# One of the rewritten files (_ai-pr-review.yml) lives under
+# .github/workflows/, and the default GITHUB_TOKEN can never push a commit
+# that touches that directory -- GitHub rejects it server-side regardless of
+# the permissions block below ("refusing to allow a GitHub App to create or
+# update workflow ... without workflows permission"). PIN_UPDATE_TOKEN, a
+# fine-grained PAT scoped to this repo with Contents: Read and write and
+# Workflows: Read and write, is checked out with instead when it exists; the
+# `|| secrets.GITHUB_TOKEN` fallback keeps today's (broken, for this one
+# push) behavior if that secret is never added, rather than failing checkout
+# itself.
 on:
   schedule:
     # Daily at 06:00 UTC.
@@ -37,6 +48,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # See the comment at the top of this file: the default token
+          # cannot push to _ai-pr-review.yml, one of the files this
+          # workflow rewrites.
+          token: ${{ secrets.PIN_UPDATE_TOKEN || secrets.GITHUB_TOKEN }}
 
       - uses: actions/setup-python@v5
         with:
