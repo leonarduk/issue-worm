@@ -26,6 +26,7 @@ from workspace import (
     _run_git,
     apply_file_change,
     ensure_base_clone,
+    ensure_gitignored,
     get_current_commit,
     get_working_diff,
     parse_coder_output,
@@ -1022,6 +1023,118 @@ def test_ensure_base_clone_clone_uses_generous_timeout(tmp_path):
         m_git.return_value = subprocess.CompletedProcess([], 0, stdout="", stderr="")
         ensure_base_clone(str(tmp_path / "clone"), "owner/repo")
     assert m_git.call_args.kwargs["timeout"] == CLONE_TIMEOUT
+
+
+# --- ensure_gitignored -------------------------------------------------
+
+
+def test_ensure_gitignored_creates_file_with_default_patterns(tmp_path):
+    """No .gitignore yet: one is created with issue-worm's own artifact
+    directory and .env, mirroring this project's own .gitignore."""
+    ensure_gitignored(str(tmp_path))
+
+    content = (tmp_path / ".gitignore").read_text(encoding="utf-8")
+    assert "/.issue-worm/" in content.splitlines()
+    assert ".env" in content.splitlines()
+
+
+def test_ensure_gitignored_appends_only_missing_patterns(tmp_path):
+    """An existing .gitignore keeps its content; only the patterns it
+    doesn't already have are appended, and none are duplicated."""
+    gitignore = tmp_path / ".gitignore"
+    gitignore.write_text("__pycache__/\n.env\n", encoding="utf-8")
+
+    ensure_gitignored(str(tmp_path), patterns=(".env", "/.issue-worm/"))
+
+    lines = gitignore.read_text(encoding="utf-8").splitlines()
+    assert lines.count(".env") == 1
+    assert lines.count("/.issue-worm/") == 1
+    assert "__pycache__/" in lines
+
+
+def test_ensure_gitignored_adds_missing_newline_before_appending(tmp_path):
+    """A .gitignore with no trailing newline still gets each pattern on
+    its own line, not concatenated onto the last existing one."""
+    gitignore = tmp_path / ".gitignore"
+    gitignore.write_text("__pycache__/", encoding="utf-8")
+
+    ensure_gitignored(str(tmp_path), patterns=(".env",))
+
+    assert gitignore.read_text(encoding="utf-8").splitlines() == [
+        "__pycache__/",
+        ".env",
+    ]
+
+
+def test_ensure_gitignored_is_a_noop_when_patterns_already_present(tmp_path):
+    """Nothing is rewritten when every pattern is already covered."""
+    gitignore = tmp_path / ".gitignore"
+    original = "/.issue-worm/\n.env\n"
+    gitignore.write_text(original, encoding="utf-8")
+
+    ensure_gitignored(str(tmp_path))
+
+    assert gitignore.read_text(encoding="utf-8") == original
+
+
+def test_ensure_gitignored_survives_an_unwritable_gitignore(tmp_path, caplog):
+    """A .gitignore that can't be written is logged and left alone rather
+    than failing the caller's pass over it. Only the append (write) open
+    is made to fail here — read_text is itself built on Path.open, so
+    failing every open would mask this as an unreadable-file case
+    instead (see the sibling test above)."""
+    (tmp_path / ".gitignore").write_text("__pycache__/\n", encoding="utf-8")
+    real_open = Path.open
+
+    def _fail_only_on_append(self, mode="r", *args, **kwargs):
+        if mode == "a":
+            raise OSError("permission denied")
+        return real_open(self, mode, *args, **kwargs)
+
+    with patch("workspace.Path.open", _fail_only_on_append):
+        with caplog.at_level(logging.WARNING):
+            ensure_gitignored(str(tmp_path))
+
+    assert "Could not add" in caplog.text
+
+
+def test_ensure_gitignored_survives_an_unreadable_gitignore(tmp_path, caplog):
+    """A .gitignore that exists but can't be read is logged and left
+    alone rather than raising out of the caller's pass."""
+    (tmp_path / ".gitignore").write_text("__pycache__/\n", encoding="utf-8")
+
+    with patch("workspace.Path.read_text", side_effect=OSError("i/o error")):
+        with caplog.at_level(logging.WARNING):
+            ensure_gitignored(str(tmp_path))
+
+    assert "Could not read" in caplog.text
+
+
+def test_ensure_gitignored_makes_the_workspace_artifacts_invisible_to_git(repo):
+    """End-to-end regression: issue-worm's own .issue-worm/ bookkeeping,
+    written untracked into a repo-in-place WORKSPACE_ROOT, used to make
+    every later `git status --porcelain` (and so the Scheduler's
+    _workspace_is_dirty) see the workspace as dirty forever - the only
+    way out was a manual .gitignore edit. Once ensure_gitignored has run
+    and its one-line .gitignore change is committed (like any other real
+    edit to a tracked repo), the bookkeeping no longer shows up."""
+    (Path(repo) / ".issue-worm").mkdir()
+    (Path(repo) / ".issue-worm" / "history.jsonl").write_text("{}\n", encoding="utf-8")
+    assert ".issue-worm" in _git(repo, "status", "--porcelain").stdout
+
+    ensure_gitignored(repo)
+
+    # .gitignore is now a new, uncommitted file - a real, reviewable
+    # one-line change, not the old irresolvable lockout - but the
+    # bookkeeping it covers has already dropped out of git's view.
+    status = _git(repo, "status", "--porcelain").stdout
+    assert ".issue-worm" not in status
+    assert ".gitignore" in status
+
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-q", "-m", "gitignore issue-worm artifacts")
+
+    assert _git(repo, "status", "--porcelain").stdout.strip() == ""
 
 
 def test_run_ci_checks_passes_default_timeout(repo):
