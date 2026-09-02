@@ -18,7 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from update_dependency_pins import (  # noqa: E402
-    AI_REVIEW_WORKFLOW,
+    CICAID_PINS,
     PinError,
     _versions_equal,
     apply_update,
@@ -59,20 +59,20 @@ PYPROJECT = (
     '    "python-dotenv>=1.0",\n'
     "]\n"
 )
-# Both pins share a line in the real workflow's install step; keep that here,
-# since "rewrite one without touching the other" is the sharp edge.
-AI_REVIEW = (
-    "      - name: Install cicaid-devtools + cicaid-devtools-pro\n"
-    "        run: bash .github/scripts/pip_install_cicaid_pro.sh pip install "
-    '"cicaid-devtools @ git+https://github.com/leonarduk/cicaid.git@v0.8.1" '
-    '"cicaid-devtools-pro @ git+https://github.com/leonarduk/'
-    'cicaid-pro.git@v0.11.4"\n'
+# The two pins sit on adjacent lines of the pins file, and one key is a
+# prefix of the other (CICAID_REF / CICAID_PRO_REF), so "rewrite one without
+# touching the other" is still the sharp edge -- just a different shape of it
+# than when both shared a line in the workflow's install step.
+CICAID_PINS_TEXT = (
+    "# Managed by the pin updater; only KEY=<tag> lines are honoured.\n"
+    "CICAID_REF=v0.8.1\n"
+    "CICAID_PRO_REF=v0.11.4\n"
 )
 
 PIN_FILES = {
     "requirements.txt": REQUIREMENTS,
     "pyproject.toml": PYPROJECT,
-    AI_REVIEW_WORKFLOW: AI_REVIEW,
+    CICAID_PINS: CICAID_PINS_TEXT,
 }
 
 
@@ -98,36 +98,45 @@ def repo(tmp_path):
 
 def test_free_update_rewrites_every_file_that_pins_it(repo):
     changed = apply_update("cicaid-devtools", "0.9.0", root=repo)
-    assert changed == ["requirements.txt", "pyproject.toml", AI_REVIEW_WORKFLOW]
-    for name in PIN_FILES:
-        assert "cicaid.git@v0.9.0" in _read(repo.joinpath(*name.split("/")))
+    assert changed == ["requirements.txt", "pyproject.toml", CICAID_PINS]
+    # The two syntaxes the one pattern has to cover: a git+https URL in the
+    # dependency files, a KEY=<tag> line in the pins file.
+    expected = {
+        "requirements.txt": "cicaid.git@v0.9.0",
+        "pyproject.toml": "cicaid.git@v0.9.0",
+        CICAID_PINS: "CICAID_REF=v0.9.0",
+    }
+    for name, pin in expected.items():
+        assert pin in _read(repo.joinpath(*name.split("/")))
 
 
-def test_pro_update_rewrites_the_workflow_only(repo):
+def test_pro_update_rewrites_the_pins_file_only(repo):
     # cicaid-devtools-pro is not an issue-worm dependency: it is pinned in
-    # the review workflow and nowhere else.
+    # the pins file the review workflow reads, and nowhere else.
     changed = apply_update("cicaid-devtools-pro", "0.14.1", root=repo)
-    assert changed == [AI_REVIEW_WORKFLOW]
-    assert "cicaid-pro.git@v0.14.1" in _read(
-        repo.joinpath(*AI_REVIEW_WORKFLOW.split("/"))
+    assert changed == [CICAID_PINS]
+    assert "CICAID_PRO_REF=v0.14.1" in _read(
+        repo.joinpath(*CICAID_PINS.split("/"))
     )
     assert _read(repo / "requirements.txt") == REQUIREMENTS
     assert _read(repo / "pyproject.toml") == PYPROJECT
 
 
-def test_free_update_does_not_touch_the_pro_pin_on_the_same_line(repo):
+def test_free_update_does_not_touch_the_pro_pin(repo):
+    # CICAID_REF is a prefix of CICAID_PRO_REF, so a pattern anchored only
+    # on the shared part would rewrite both.
     apply_update("cicaid-devtools", "0.9.0", root=repo)
-    text = _read(repo.joinpath(*AI_REVIEW_WORKFLOW.split("/")))
-    assert "cicaid.git@v0.9.0" in text
-    assert "cicaid-pro.git@v0.11.4" in text
-    assert "cicaid-pro.git@v0.9.0" not in text
+    text = _read(repo.joinpath(*CICAID_PINS.split("/")))
+    assert "CICAID_REF=v0.9.0" in text
+    assert "CICAID_PRO_REF=v0.11.4" in text
+    assert "CICAID_PRO_REF=v0.9.0" not in text
 
 
-def test_pro_update_does_not_touch_the_free_pin_on_the_same_line(repo):
+def test_pro_update_does_not_touch_the_free_pin(repo):
     apply_update("cicaid-devtools-pro", "0.14.1", root=repo)
-    text = _read(repo.joinpath(*AI_REVIEW_WORKFLOW.split("/")))
-    assert "cicaid-pro.git@v0.14.1" in text
-    assert "cicaid.git@v0.8.1" in text
+    text = _read(repo.joinpath(*CICAID_PINS.split("/")))
+    assert "CICAID_PRO_REF=v0.14.1" in text
+    assert "CICAID_REF=v0.8.1" in text
 
 
 def test_update_preserves_crlf(tmp_path):
@@ -149,7 +158,7 @@ def test_up_to_date_is_noop(repo):
 
 def test_dry_run_writes_nothing(repo):
     changed = apply_update("cicaid-devtools", "0.9.0", root=repo, dry_run=True)
-    assert changed == ["requirements.txt", "pyproject.toml", AI_REVIEW_WORKFLOW]
+    assert changed == ["requirements.txt", "pyproject.toml", CICAID_PINS]
     for name, original in PIN_FILES.items():
         assert _read(repo.joinpath(*name.split("/"))) == original
 
@@ -256,21 +265,21 @@ def test_write_mode_updates_and_exits_zero(repo, monkeypatch):
         patch("update_dependency_pins.ROOT", repo),
     ):
         assert main(["cicaid-devtools-pro"]) == 0
-    assert "cicaid-pro.git@v0.14.1" in _read(
-        repo.joinpath(*AI_REVIEW_WORKFLOW.split("/"))
+    assert "CICAID_PRO_REF=v0.14.1" in _read(
+        repo.joinpath(*CICAID_PINS.split("/"))
     )
 
 
 def test_rewrites_all_pin_occurrences_in_a_file(repo):
-    # A second install step pinning the same package must be rewritten too,
-    # not just the first.
-    doubled = AI_REVIEW + AI_REVIEW
-    repo.joinpath(*AI_REVIEW_WORKFLOW.split("/")).write_bytes(doubled.encode("utf-8"))
+    # A second line pinning the same package must be rewritten too, not just
+    # the first.
+    doubled = CICAID_PINS_TEXT + CICAID_PINS_TEXT
+    repo.joinpath(*CICAID_PINS.split("/")).write_bytes(doubled.encode("utf-8"))
     apply_update("cicaid-devtools", "0.9.0", root=repo)
-    text = _read(repo.joinpath(*AI_REVIEW_WORKFLOW.split("/")))
-    assert text.count("cicaid.git@v0.9.0") == 2
-    assert "cicaid.git@v0.8.1" not in text
-    assert text.count("cicaid-pro.git@v0.11.4") == 2
+    text = _read(repo.joinpath(*CICAID_PINS.split("/")))
+    assert text.count("CICAID_REF=v0.9.0") == 2
+    assert "CICAID_REF=v0.8.1" not in text
+    assert text.count("CICAID_PRO_REF=v0.11.4") == 2
 
 
 def test_drift_between_files_raises(tmp_path, capsys):

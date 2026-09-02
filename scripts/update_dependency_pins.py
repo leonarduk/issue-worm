@@ -2,18 +2,25 @@
 
 Two dependencies are tracked:
 
-- cicaid-devtools — the public leonarduk/cicaid "free shell", pinned as a
-  git+https URL in three places: ``requirements.txt``, ``pyproject.toml``
-  (the package's own dependency) and the install step of
-  ``.github/workflows/_ai-pr-review.yml`` (the PR-review jobs). "latest"
-  comes from the GitHub Releases API, no token needed since the repo is
-  public.
-- cicaid-devtools-pro — the private leonarduk/cicaid-pro, pinned only in
-  ``.github/workflows/_ai-pr-review.yml``: the review modules that workflow
-  imports (review_diff, review_comment, deepseek_review, gpt_review, ...)
-  live in that package, but issue-worm itself never depends on it. "latest"
-  comes from the GitHub Releases API, which needs GITHUB_TOKEN since
-  cicaid-pro is private.
+- cicaid-devtools — the public leonarduk/cicaid "free shell", pinned in
+  three places: as a git+https URL in ``requirements.txt`` and
+  ``pyproject.toml`` (the package's own dependency), and as ``CICAID_REF``
+  in ``.github/cicaid-pins.env``, which the PR-review jobs read at install
+  time. "latest" comes from the GitHub Releases API, no token needed since
+  the repo is public.
+- cicaid-devtools-pro — the private leonarduk/cicaid-pro, pinned only as
+  ``CICAID_PRO_REF`` in ``.github/cicaid-pins.env``: the review modules
+  ``.github/workflows/_ai-pr-review.yml`` imports (review_diff,
+  review_comment, deepseek_review, gpt_review, ...) live in that package,
+  but issue-worm itself never depends on it. "latest" comes from the GitHub
+  Releases API, which needs GITHUB_TOKEN since cicaid-pro is private.
+
+Both review-workflow pins moved out of ``.github/workflows/_ai-pr-review.yml``
+and into the pins file (#142, #156): GitHub hard-blocks a workflow's default
+GITHUB_TOKEN from pushing any change under ``.github/workflows/``, whatever
+permissions the job is granted, so while the versions lived inline there
+this script could rewrite them but the update run could never push the
+result.
 
 Every file that pins a dependency must agree on the version — a pin that
 silently drifts backwards in one of them is what issue #135 was — so
@@ -47,7 +54,13 @@ ROOT = Path(__file__).resolve().parent.parent
 # joins them against the repo root in a platform-correct way.
 REQUIREMENTS = "requirements.txt"
 PYPROJECT = "pyproject.toml"
-AI_REVIEW_WORKFLOW = ".github/workflows/_ai-pr-review.yml"
+# Replaces .github/workflows/_ai-pr-review.yml as the review workflow's pin
+# location. The workflow now reads this file at install time instead of
+# carrying the versions inline, because the default GITHUB_TOKEN can never
+# push a commit touching .github/workflows/ -- which is what made every
+# update run fail at the final push (#142, #156). Nothing else about the
+# arrangement changes: the same two pins, still rewritten by this script.
+CICAID_PINS = ".github/cicaid-pins.env"
 
 DEPS = ("cicaid-devtools", "cicaid-devtools-pro")
 
@@ -58,16 +71,27 @@ CICAID_PRO_RELEASES_API = (
     "https://api.github.com/repos/leonarduk/cicaid-pro/releases/latest"
 )
 
-# The negative lookahead on cicaid-devtools' pattern (not immediately
+# Each dependency is pinned in two syntaxes now: a git+https URL in
+# requirements.txt/pyproject.toml, and a KEY=v<version> line in the pins
+# file. One alternation per dependency keeps a single pattern per spec (and
+# so the existing cross-file drift check) rather than a regex per file.
+# Group 1 is whichever prefix matched and group 2 the version, so _rewrite
+# stays prefix-agnostic. MULTILINE is what makes the "^" in the pins-file
+# branch anchor per line rather than to the start of the file.
+#
+# The negative lookahead on cicaid-devtools' URL branch (not immediately
 # followed by "-pro") keeps it from also matching the cicaid-devtools-pro
-# pin - both share a "cicaid" prefix in their git+https URL, and in
-# _ai-pr-review.yml both pins sit on the same line.
+# pin - both share a "cicaid" prefix. Its pins-file branch needs no such
+# guard: "^CICAID_REF=" cannot match the CICAID_PRO_REF line.
 _CICAID_FREE_PIN_RE = re.compile(
-    r"(git\+https://github\.com/leonarduk/cicaid(?!-pro)\.git@v)"
-    r"([0-9][A-Za-z0-9.+-]*)"
+    r"(git\+https://github\.com/leonarduk/cicaid(?!-pro)\.git@v|^CICAID_REF=v)"
+    r"([0-9][A-Za-z0-9.+-]*)",
+    re.MULTILINE,
 )
 _CICAID_PRO_PIN_RE = re.compile(
-    r"(git\+https://github\.com/leonarduk/cicaid-pro\.git@v)([0-9][A-Za-z0-9.+-]*)"
+    r"(git\+https://github\.com/leonarduk/cicaid-pro\.git@v|^CICAID_PRO_REF=v)"
+    r"([0-9][A-Za-z0-9.+-]*)",
+    re.MULTILINE,
 )
 
 
@@ -89,14 +113,14 @@ _SPECS = {
         pin_re=_CICAID_FREE_PIN_RE,
         releases_api=CICAID_FREE_RELEASES_API,
         needs_token=False,
-        files=(REQUIREMENTS, PYPROJECT, AI_REVIEW_WORKFLOW),
+        files=(REQUIREMENTS, PYPROJECT, CICAID_PINS),
         repo_slug="cicaid",
     ),
     "cicaid-devtools-pro": _Spec(
         pin_re=_CICAID_PRO_PIN_RE,
         releases_api=CICAID_PRO_RELEASES_API,
         needs_token=True,
-        files=(AI_REVIEW_WORKFLOW,),
+        files=(CICAID_PINS,),
         repo_slug="cicaid-pro",
     ),
 }
@@ -247,8 +271,10 @@ def _rewrite(dep: str, text: str, new_version: str) -> str:
     new_text, count = spec.pin_re.subn(replace, text)
     if count == 0:
         raise PinError(
-            f"could not find the {dep} git+https pin in the file "
-            f"(expected git+https://github.com/leonarduk/{spec.repo_slug}.git@vX.Y.Z)"
+            f"could not find the {dep} pin in the file (expected "
+            f"git+https://github.com/leonarduk/{spec.repo_slug}.git@vX.Y.Z, or "
+            f"a {'CICAID_PRO_REF' if spec.needs_token else 'CICAID_REF'}=vX.Y.Z "
+            f"line in {CICAID_PINS})"
         )
     return new_text
 

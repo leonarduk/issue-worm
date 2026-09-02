@@ -10,16 +10,12 @@ name: Update Dependencies
 # narrower cicaid-pro-bump-check.yml, which only tracked the
 # cicaid-devtools-pro pin in _ai-pr-review.yml.
 #
-# One of the rewritten files (_ai-pr-review.yml) lives under
-# .github/workflows/, and the default GITHUB_TOKEN can never push a commit
-# that touches that directory -- GitHub rejects it server-side regardless of
-# the permissions block below ("refusing to allow a GitHub App to create or
-# update workflow ... without workflows permission"). PIN_UPDATE_TOKEN, a
-# fine-grained PAT scoped to this repo with Contents: Read and write and
-# Workflows: Read and write, is checked out with instead when it exists; the
-# `|| secrets.GITHUB_TOKEN` fallback keeps today's (broken, for this one
-# push) behavior if that secret is never added, rather than failing checkout
-# itself.
+# No pin this workflow rewrites lives under .github/workflows/ any more --
+# the review workflow's two are in .github/cicaid-pins.env, which it reads
+# at install time. That is deliberate: the default GITHUB_TOKEN can never
+# push a commit touching .github/workflows/, whatever the permissions block
+# below grants, so keeping the pins out of that directory is what lets this
+# workflow push unattended with no PAT at all (#142, #156).
 on:
   schedule:
     # Daily at 06:00 UTC.
@@ -48,11 +44,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          # See the comment at the top of this file: the default token
-          # cannot push to _ai-pr-review.yml, one of the files this
-          # workflow rewrites.
-          token: ${{ secrets.PIN_UPDATE_TOKEN || secrets.GITHUB_TOKEN }}
 
       - uses: actions/setup-python@v5
         with:
@@ -182,8 +173,9 @@ jobs:
           # PyPI (git-only) -- a plain `pip install cicaid-devtools-pro`
           # can't resolve that dependency and 404s looking for it there.
           # _ai-pr-review.yml's real install works because it passes both
-          # packages' git+https URLs to one pip invocation, same as here.
-          CICAID_PIN=$(grep -oP 'cicaid\.git@\Kv[0-9][A-Za-z0-9.+-]*' .github/workflows/_ai-pr-review.yml)
+          # packages' git+https URLs to one pip invocation, same as here --
+          # reading the cicaid-devtools pin from the same pins file it does.
+          CICAID_PIN=$(grep -oP '^CICAID_REF=\Kv[0-9][A-Za-z0-9.+-]*' .github/cicaid-pins.env)
           bash .github/scripts/pip_install_cicaid_pro.sh python -m pip install \
             "cicaid-devtools @ git+https://github.com/leonarduk/cicaid.git@${CICAID_PIN}" \
             "cicaid-devtools-pro @ git+https://github.com/leonarduk/cicaid-pro.git@v${{ steps.check.outputs.new_version }}"
