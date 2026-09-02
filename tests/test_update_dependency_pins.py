@@ -59,12 +59,14 @@ PYPROJECT = (
     '    "python-dotenv>=1.0",\n'
     "]\n"
 )
-# The two pins sit on adjacent lines of the pins file, and one key is a
-# prefix of the other (CICAID_REF / CICAID_PRO_REF), so "rewrite one without
-# touching the other" is still the sharp edge -- just a different shape of it
-# than when both shared a line in the workflow's install step.
+# The two pins sit on adjacent lines of the pins file, so "rewrite one
+# without touching the other" is still the sharp edge -- a different shape
+# of it than when both shared a line in the workflow's install step. The
+# commented-out pin covers the other property the "^" anchor buys: only a
+# real assignment at the start of a line counts.
 CICAID_PINS_TEXT = (
     "# Managed by the pin updater; only KEY=<tag> lines are honoured.\n"
+    "# was CICAID_REF=v9.9.9 before the migration\n"
     "CICAID_REF=v0.8.1\n"
     "CICAID_PRO_REF=v0.11.4\n"
 )
@@ -123,13 +125,29 @@ def test_pro_update_rewrites_the_pins_file_only(repo):
 
 
 def test_free_update_does_not_touch_the_pro_pin(repo):
-    # CICAID_REF is a prefix of CICAID_PRO_REF, so a pattern anchored only
-    # on the shared part would rewrite both.
+    # Both keys carry a "CICAID_" prefix and sit next to each other, the
+    # pins-file counterpart of the shared "cicaid" prefix in the git+https
+    # URLs the other two files use.
     apply_update("cicaid-devtools", "0.9.0", root=repo)
     text = _read(repo.joinpath(*CICAID_PINS.split("/")))
     assert "CICAID_REF=v0.9.0" in text
     assert "CICAID_PRO_REF=v0.11.4" in text
     assert "CICAID_PRO_REF=v0.9.0" not in text
+
+
+def test_pins_file_comments_are_not_treated_as_pins(repo):
+    """What the "^" in each pattern's pins-file branch is for: only a real
+    assignment at the start of a line counts. Without it the commented-out
+    version in the fixture would be read as the current pin, and the file's
+    explanatory header would be a rewrite hazard.
+    """
+    assert current_pin("cicaid-devtools", root=repo) == "0.8.1"
+
+    apply_update("cicaid-devtools", "0.9.0", root=repo)
+
+    text = _read(repo.joinpath(*CICAID_PINS.split("/")))
+    assert "# was CICAID_REF=v9.9.9 before the migration" in text
+    assert "CICAID_REF=v0.9.0" in text
 
 
 def test_pro_update_does_not_touch_the_free_pin(repo):
