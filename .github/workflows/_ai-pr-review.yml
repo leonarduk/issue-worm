@@ -84,7 +84,26 @@ jobs:
       - name: Install cicaid-devtools + cicaid-devtools-pro (PR review helpers)
         env:
           CICAID_PRO_TOKEN: ${{ secrets.cicaid_pro_token }}
-        run: bash .github/scripts/pip_install_cicaid_pro.sh pip install --retries 10 "cicaid-devtools @ git+https://github.com/leonarduk/cicaid.git@v0.5.0" "cicaid-devtools-pro @ git+https://github.com/leonarduk/cicaid-pro.git@v0.11.4"
+        run: |
+          set -euo pipefail
+          PINS=".github/cicaid-pins.env"
+          if [ ! -f "$PINS" ]; then
+            echo "::error::$PINS is missing. Run 'cicaid setup-review-actions' in this repo to restore it." >&2
+            exit 1
+          fi
+          CICAID_REF=$(grep -oP '^CICAID_REF=\K(?:main|v[0-9][A-Za-z0-9.+-]*)(?=\r?$)' "$PINS" || true)
+          if [ -z "${CICAID_REF}" ]; then
+            echo "::error::no valid CICAID_REF=<tag> line in $PINS." >&2
+            exit 1
+          fi
+          CICAID_PRO_REF=$(grep -oP '^CICAID_PRO_REF=\K(?:main|v[0-9][A-Za-z0-9.+-]*)(?=\r?$)' "$PINS" || true)
+          if [ -z "${CICAID_PRO_REF}" ]; then
+            echo "::error::no valid CICAID_PRO_REF=<tag> line in $PINS." >&2
+            exit 1
+          fi
+          bash .github/scripts/pip_install_cicaid_pro.sh pip install --retries 10 \
+            "cicaid-devtools @ git+https://github.com/leonarduk/cicaid.git@${CICAID_REF}" \
+            "cicaid-devtools-pro @ git+https://github.com/leonarduk/cicaid-pro.git@${CICAID_PRO_REF}"
 
       - name: Get linked issue body
         id: issue
