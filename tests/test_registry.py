@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+import history
 import registry
 
 
@@ -40,13 +41,35 @@ def test_register_creates_run_file_with_expected_fields(tmp_path, _state_dir):
     assert record["task_id"] == "task-1"
     assert record["command"] == "build"
     assert record["workspace"] == str(workspace.resolve())
-    assert record["history_path"] == str(workspace.resolve() / "history.jsonl")
+    assert record["history_path"] == str(
+        workspace.resolve() / ".issue-worm" / "history.jsonl"
+    )
     assert record["status"] == "running"
     assert record["phase"] is None
     assert record["pid"] == os.getpid()
     assert record["package"] == "issue-worm"
     assert "version" in record
     assert record["started_at"] == record["updated_at"]
+
+
+def test_register_history_path_matches_where_history_actually_writes(
+    tmp_path, _state_dir
+):
+    """The monitoring UI locates completed runs through this field.
+
+    ``history.py`` appends to ``<workspace>/.issue-worm/history.jsonl``
+    (its ``DEFAULT_HISTORY_PATH``). An earlier version of ``register``
+    stamped ``<workspace>/history.jsonl``, which pointed every reader at a
+    file that never exists - the UI's "recent runs" panel was silently
+    empty rather than failing loudly, so assert the two agree.
+    """
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    registry.register("task-1", command="build", workspace=str(workspace))
+
+    recorded = _read(_state_dir, "task-1")["history_path"]
+    assert recorded == str(workspace.resolve() / history.DEFAULT_HISTORY_PATH)
 
 
 def test_register_creates_state_dir_if_missing(tmp_path, _state_dir):

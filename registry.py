@@ -23,6 +23,8 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Optional
 
+from history import DEFAULT_HISTORY_PATH
+
 logger = logging.getLogger(__name__)
 
 STATE_DIR_ENV = "ISSUE_WORM_STATE_DIR"
@@ -216,7 +218,11 @@ def register(
                 "status": "running",
                 "command": command,
                 "workspace": str(workspace_path),
-                "history_path": str(workspace_path / "history.jsonl"),
+                # Derived from history.py's own constant rather than spelled
+                # out here: the file lives at <workspace>/.issue-worm/
+                # history.jsonl, and a reader that guessed <workspace>/
+                # history.jsonl would silently find no history at all.
+                "history_path": str(workspace_path / DEFAULT_HISTORY_PATH),
                 "phase": None,
                 "started_at": now,
                 "updated_at": now,
