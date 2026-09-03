@@ -752,6 +752,17 @@ def test_build_records_completed_run_to_history(tmp_path, _state_dir):
     assert record["description"] == "it works"
     assert "type" not in record
 
+    # The fields mirroring issue-worm-pro's TaskRun (its #509), which the
+    # monitoring UI renders as Command / Workspace / Started / Duration.
+    # Without them a free-recorded run shows "-" in those columns while a
+    # pro-recorded one shows real values. Timestamps must be ISO-8601
+    # strings, never datetimes, or `json.dumps(asdict(run))` would raise.
+    assert record["command"] == "build"
+    assert record["workspace"] == str(tmp_path)
+    started = datetime.fromisoformat(record["started_at"])
+    finished = datetime.fromisoformat(record["finished_at"])
+    assert started <= finished
+
     # the registry record and the history record share the same task_id,
     # so a reader can correlate them (#179's task id, reused per #183)
     registry_record = _read_registry_record(_state_dir, "o_r-5")

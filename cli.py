@@ -219,6 +219,15 @@ class _FreeBuildRun:
     description: str
     status: str
     files: list[str] = field(default_factory=list)
+    # Mirrors the fields issue-worm-pro's TaskRun gained in its own #509, so
+    # a free-recorded run fills the monitoring UI's Started/Duration/
+    # Workspace/Command columns exactly like a pro-recorded one instead of
+    # rendering "-". Optional with None defaults, so history lines written
+    # before this existed still load.
+    started_at: str | None = None
+    finished_at: str | None = None
+    workspace: str | None = None
+    command: str | None = None
 
 
 def _run_build(args, config: dict) -> int:
@@ -293,6 +302,11 @@ def _run_build(args, config: dict) -> int:
     # reaches a terminal status, including on Ctrl-C.
     task_id = f"{args.repo.replace('/', '_')}-{issue_number}"
     register(task_id, command="build", workspace=repo_path)
+    # Stamped here rather than at record time so the history record spans the
+    # whole build, matching what the registry record already reports. Kept as
+    # an ISO-8601 string, never a datetime: `record_run` does
+    # `json.dumps(asdict(run))`, which a datetime would break.
+    started_at = datetime.now(timezone.utc).isoformat()
     # Same path the registry record itself points readers at (registry.py's
     # `register` stamps `history_path` as `<workspace>/.issue-worm/
     # history.jsonl`) — recording here instead of DEFAULT_HISTORY_PATH's
@@ -354,6 +368,10 @@ def _run_build(args, config: dict) -> int:
                 description=review.done,
                 status="completed" if success else "failed",
                 files=review.files,
+                started_at=started_at,
+                finished_at=datetime.now(timezone.utc).isoformat(),
+                workspace=repo_path,
+                command="build",
             ),
             history_path=history_path,
         )
