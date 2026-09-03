@@ -14,13 +14,15 @@ import logging
 import os
 import re
 import sys
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
 
 from config import load_config
 from coder import LocalOllamaCoder
-from history import DEFAULT_HISTORY_PATH, get_run, load_runs
+from history import DEFAULT_HISTORY_PATH, get_run, load_runs, record_run
 from registry import finish, heartbeat, list_runs, register
 from review import review_issue
 from version_checker import PACKAGE_NAME, check_and_prompt, installed_version
@@ -193,6 +195,32 @@ def _fetch_issue_body(repo: str, issue_number: int) -> str | None:
         return None
 
 
+@dataclass
+class _FreeBuildRun:
+    """Minimal free-tier stand-in for issue-worm-pro's `orchestrator.TaskRun`
+    (#183), recorded by `_run_build` via `history.record_run`.
+
+    `TaskRun` lives in issue-worm-pro and this repo cannot depend on pro, so
+    this is a separate dataclass — but `history.record_run` only needs *a*
+    dataclass instance (it calls `dataclasses.asdict` on whatever it's
+    given), and this one deliberately reuses TaskRun's field names
+    (`task_id`, `source`, `description`, `files`, `status`, with `status`
+    one of "completed"/"failed") so a free-recorded record renders exactly
+    like a pro-recorded one everywhere `history.load_runs`'s dicts are
+    consumed — `_format_history_line`, `status`, and issue-worm-pro's
+    monitoring UI. Deliberately carries no `type` key (`history.load_runs`
+    filters out any record that has one, e.g. review-rejection events —
+    #306) and no `datetime` field (only JSON-serialisable values, since
+    `record_run` does `json.dumps(asdict(run))`).
+    """
+
+    task_id: str
+    source: str
+    description: str
+    status: str
+    files: list[str] = field(default_factory=list)
+
+
 def _run_build(args, config: dict) -> int:
     """Single-pass, free-tier `build`: heuristic review + local Ollama
     coder, writing changes straight to the working tree. No verifier/
@@ -265,6 +293,12 @@ def _run_build(args, config: dict) -> int:
     # reaches a terminal status, including on Ctrl-C.
     task_id = f"{args.repo.replace('/', '_')}-{issue_number}"
     register(task_id, command="build", workspace=repo_path)
+    # Same path the registry record itself points readers at (registry.py's
+    # `register` stamps `history_path` as `<workspace>/.issue-worm/
+    # history.jsonl`) — recording here instead of DEFAULT_HISTORY_PATH's
+    # bare relative path is what lets a run's registry record and its
+    # history record be found together (#183).
+    history_path = str(Path(repo_path).resolve() / DEFAULT_HISTORY_PATH)
 
     success = False
     try:
@@ -303,6 +337,26 @@ def _run_build(args, config: dict) -> int:
         # never sits at "running" forever. Exceptions are never caught
         # here, only observed via `success`, so they still propagate.
         finish(task_id, "done" if success else "failed")
+        # Free-tier's only history writer (#183): without this, a
+        # free-only install never appends to history.jsonl at all, so the
+        # shipped `history`/`status` commands can structurally never show
+        # a completed run. Recorded on both the success and failure paths
+        # (status "completed"/"failed", matching orchestrator.TaskRun's
+        # vocabulary) so a failed build is visible rather than vanishing.
+        # No double-recording risk: `_run_build` only ever runs when
+        # issue-worm-pro isn't installed/dispatched (main() hands `build`
+        # to pro_cli.main() before this function is even called when pro
+        # is present), and pro's own scheduler records its own run.
+        record_run(
+            _FreeBuildRun(
+                task_id=task_id,
+                source="cli",
+                description=review.done,
+                status="completed" if success else "failed",
+                files=review.files,
+            ),
+            history_path=history_path,
+        )
 
 
 # Icon shown per registry-record status in `status`'s active-runs section.

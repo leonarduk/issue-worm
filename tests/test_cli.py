@@ -709,6 +709,161 @@ def test_build_dry_run_never_registers(tmp_path, _state_dir):
     assert not _state_dir.exists()
 
 
+# --- history wiring around `build` (#183) --------------------------------
+#
+# `_run_build` computes its history_path the same way registry.register()
+# does (`<workspace>/.issue-worm/history.jsonl`), and every test below mocks
+# `cli.ensure_base_clone` to return `tmp_path` — so these tests are isolated
+# from the real `~/.issue-worm/` the way #184 flags real usage as leaking
+# into, without needing a separate fixture for it.
+
+
+def _read_history_records(repo_path):
+    history_file = repo_path / ".issue-worm" / "history.jsonl"
+    lines = history_file.read_text(encoding="utf-8").splitlines()
+    return [json.loads(line) for line in lines]
+
+
+def test_build_records_completed_run_to_history(tmp_path, _state_dir):
+    """A successful free build appends exactly one parseable record, with
+    the fields `_format_history_line` renders populated (not blank), and
+    the same task_id the registry record was stamped with (#179)."""
+    ready = ReviewResult(ready=True, files=["a.py"], done="it works")
+    change = FileChange(path="a.py", mode="FULL", body="print(1)\n")
+    with patch.object(
+        sys, "argv", ["issue-worm", "build", "5", "--repo", "o/r"]
+    ), patch("cli._fetch_issue_body", return_value="body"), patch(
+        "cli.review_issue", return_value=ready
+    ), patch("cli.ensure_base_clone", return_value=str(tmp_path)), patch(
+        "cli.LocalOllamaCoder"
+    ) as mock_coder_cls, patch(
+        "cli.parse_coder_output", return_value=[change]
+    ), patch("cli.apply_file_change"), pytest.raises(SystemExit) as exc:
+        mock_coder_cls.return_value.propose.return_value = "raw coder output"
+        cli.main()
+
+    assert exc.value.code == 0
+    records = _read_history_records(tmp_path)
+    assert len(records) == 1
+    record = records[0]
+    assert record["task_id"] == "o_r-5"
+    assert record["source"] == "cli"
+    assert record["status"] == "completed"
+    assert record["description"] == "it works"
+    assert "type" not in record
+
+    # the registry record and the history record share the same task_id,
+    # so a reader can correlate them (#179's task id, reused per #183)
+    registry_record = _read_registry_record(_state_dir, "o_r-5")
+    assert registry_record["task_id"] == record["task_id"]
+
+
+def test_build_records_failed_run_to_history(tmp_path, _state_dir):
+    """A failed build (empty Coder output) is recorded with a failed
+    status rather than silently vanishing from history."""
+    ready = ReviewResult(ready=True, files=["a.py"], done="it works")
+    with patch.object(
+        sys, "argv", ["issue-worm", "build", "5", "--repo", "o/r"]
+    ), patch("cli._fetch_issue_body", return_value="body"), patch(
+        "cli.review_issue", return_value=ready
+    ), patch("cli.ensure_base_clone", return_value=str(tmp_path)), patch(
+        "cli.LocalOllamaCoder"
+    ) as mock_coder_cls, pytest.raises(SystemExit) as exc:
+        mock_coder_cls.return_value.propose.return_value = ""
+        cli.main()
+
+    assert exc.value.code == 1
+    records = _read_history_records(tmp_path)
+    assert len(records) == 1
+    assert records[0]["status"] == "failed"
+    assert records[0]["task_id"] == "o_r-5"
+
+
+def test_build_records_failed_run_to_history_on_exception(tmp_path, _state_dir):
+    """A crash mid-build (e.g. the Coder erroring) is still recorded as
+    failed, and the original exception still propagates - matching the
+    registry's own `finish(..., "failed")` behaviour on the same path."""
+    ready = ReviewResult(ready=True, files=["a.py"], done="it works")
+    with patch.object(
+        sys, "argv", ["issue-worm", "build", "5", "--repo", "o/r"]
+    ), patch("cli._fetch_issue_body", return_value="body"), patch(
+        "cli.review_issue", return_value=ready
+    ), patch("cli.ensure_base_clone", return_value=str(tmp_path)), patch(
+        "cli.LocalOllamaCoder"
+    ) as mock_coder_cls:
+        mock_coder_cls.return_value.propose.side_effect = RuntimeError("boom")
+        with pytest.raises(RuntimeError, match="boom"):
+            cli.main()
+
+    records = _read_history_records(tmp_path)
+    assert len(records) == 1
+    assert records[0]["status"] == "failed"
+
+
+def test_history_command_renders_recorded_free_build_run(tmp_path, _state_dir, capsys):
+    """End-to-end: a free `build`'s record is readable back through the
+    shipped `history` command, with populated (not blank) columns."""
+    ready = ReviewResult(ready=True, files=["a.py"], done="it works")
+    change = FileChange(path="a.py", mode="FULL", body="print(1)\n")
+    with patch.object(
+        sys, "argv", ["issue-worm", "build", "5", "--repo", "o/r"]
+    ), patch("cli._fetch_issue_body", return_value="body"), patch(
+        "cli.review_issue", return_value=ready
+    ), patch("cli.ensure_base_clone", return_value=str(tmp_path)), patch(
+        "cli.LocalOllamaCoder"
+    ) as mock_coder_cls, patch(
+        "cli.parse_coder_output", return_value=[change]
+    ), patch("cli.apply_file_change"), pytest.raises(SystemExit):
+        mock_coder_cls.return_value.propose.return_value = "raw coder output"
+        cli.main()
+    capsys.readouterr()  # discard build's own stdout
+
+    history_path = str(tmp_path / ".issue-worm" / "history.jsonl")
+    with patch.object(
+        sys, "argv", ["issue-worm", "history", "--history-path", history_path]
+    ), pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "o_r-5" in out
+    assert "[cli]" in out
+    assert "completed" in out
+    assert "it works" in out
+
+
+def test_status_command_renders_recorded_free_build_run(tmp_path, _state_dir, capsys):
+    """End-to-end: a free `build`'s record shows up in `status`'s recent-
+    history section too, not just active runs (#181's asymmetry this issue
+    fixes)."""
+    ready = ReviewResult(ready=True, files=["a.py"], done="it works")
+    change = FileChange(path="a.py", mode="FULL", body="print(1)\n")
+    with patch.object(
+        sys, "argv", ["issue-worm", "build", "5", "--repo", "o/r"]
+    ), patch("cli._fetch_issue_body", return_value="body"), patch(
+        "cli.review_issue", return_value=ready
+    ), patch("cli.ensure_base_clone", return_value=str(tmp_path)), patch(
+        "cli.LocalOllamaCoder"
+    ) as mock_coder_cls, patch(
+        "cli.parse_coder_output", return_value=[change]
+    ), patch("cli.apply_file_change"), pytest.raises(SystemExit):
+        mock_coder_cls.return_value.propose.return_value = "raw coder output"
+        cli.main()
+    capsys.readouterr()  # discard build's own stdout
+
+    history_path = str(tmp_path / ".issue-worm" / "history.jsonl")
+    with patch.object(
+        sys, "argv", ["issue-worm", "status", "--history-path", history_path]
+    ), pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "o_r-5" in out
+    assert "completed" in out
+    assert "it works" in out
+
+
 def _mock_get_response(status_code, json_body=None, headers=None):
     response = MagicMock()
     response.status_code = status_code
