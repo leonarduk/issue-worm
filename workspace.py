@@ -961,6 +961,61 @@ def ensure_base_clone(repo_path: str, repo: str, *, fresh: bool = False) -> str:
     return str(path)
 
 
+# What issue-worm itself ever writes into a managed workspace unprompted:
+# history.py's and usage_metering.py's ".issue-worm/*.jsonl" bookkeeping,
+# and ".env" for anyone following the provider-credentials pattern
+# documented in ensure_base_clone above. Mirrors this project's own
+# .gitignore for the same two paths.
+WORM_GITIGNORE_PATTERNS = ("/.issue-worm/", ".env")
+
+
+def ensure_gitignored(
+    repo_path: str, patterns: tuple[str, ...] = WORM_GITIGNORE_PATTERNS
+) -> None:
+    """Append any of `patterns` missing from `repo_path`'s .gitignore.
+
+    A repo-in-place WORKSPACE_ROOT — the private-repo setup documented in
+    :func:`ensure_base_clone`, and the Scheduler's own default of "." — is
+    very often the user's real working checkout, not a throwaway clone.
+    Left unignored, the bookkeeping files issue-worm writes there show up
+    as untracked changes on every later pass, and ``_workspace_is_dirty``
+    has the Scheduler skip the pass every single time: a self-inflicted
+    lockout that previously took a manual .gitignore edit to clear.
+
+    Best-effort: a .gitignore that can't be read or written is logged and
+    left alone rather than failing the caller's pass over it.
+    """
+    gitignore_path = Path(repo_path) / ".gitignore"
+    try:
+        existing = (
+            gitignore_path.read_text(encoding="utf-8")
+            if gitignore_path.exists()
+            else ""
+        )
+    except OSError as exc:
+        logger.warning(
+            "Could not read %s (%s); leaving .gitignore untouched",
+            gitignore_path,
+            exc,
+        )
+        return
+    existing_lines = {line.strip() for line in existing.splitlines()}
+    missing = [p for p in patterns if p not in existing_lines]
+    if not missing:
+        return
+    prefix = "\n" if existing and not existing.endswith("\n") else ""
+    try:
+        with gitignore_path.open("a", encoding="utf-8") as f:
+            f.write(prefix + "\n".join(missing) + "\n")
+    except OSError as exc:
+        logger.warning(
+            "Could not add %s to %s (%s); leaving .gitignore untouched",
+            missing,
+            gitignore_path,
+            exc,
+        )
+
+
 def run_ci_checks(
     repo_path: str,
     command: list[str] | None = None,
