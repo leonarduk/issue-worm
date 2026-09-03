@@ -4,6 +4,7 @@ module when issue-worm-pro is present, and report themselves unavailable
 rather than crashing when it isn't (#352).
 """
 
+import json
 import os
 import sys
 from types import ModuleType
@@ -13,6 +14,7 @@ import pytest
 import requests
 
 import cli
+import registry
 from review import ReviewResult
 from workspace import FileChange, MalformedOutputError, WorkspaceError
 
@@ -564,6 +566,143 @@ def test_build_reports_apply_failure_without_crashing(tmp_path, capsys):
 
     assert exc.value.code == 1
     assert "git apply failed" in capsys.readouterr().err
+
+
+# --- registry wiring around `build` (#179) ------------------------------
+
+
+@pytest.fixture
+def _state_dir(tmp_path, monkeypatch):
+    """Point registry.py at an isolated state dir under tmp_path."""
+    state_dir = tmp_path / "agents"
+    monkeypatch.setenv(registry.STATE_DIR_ENV, str(state_dir))
+    return state_dir
+
+
+def _read_registry_record(state_dir, task_id):
+    return json.loads((state_dir / f"{task_id}.json").read_text(encoding="utf-8"))
+
+
+def test_build_registers_running_record_mid_run(tmp_path, _state_dir):
+    """A `running` record must exist for the task while the coder runs."""
+    ready = ReviewResult(ready=True, files=["a.py"], done="it works")
+    change = FileChange(path="a.py", mode="FULL", body="print(1)\n")
+    seen = {}
+
+    def _propose(*_args, **_kwargs):
+        seen["record"] = _read_registry_record(_state_dir, "o_r-5")
+        return "raw coder output"
+
+    with patch.object(
+        sys, "argv", ["issue-worm", "build", "5", "--repo", "o/r"]
+    ), patch("cli._fetch_issue_body", return_value="body"), patch(
+        "cli.review_issue", return_value=ready
+    ), patch("cli.ensure_base_clone", return_value=str(tmp_path)), patch(
+        "cli.LocalOllamaCoder"
+    ) as mock_coder_cls, patch(
+        "cli.parse_coder_output", return_value=[change]
+    ), patch("cli.apply_file_change"), pytest.raises(SystemExit) as exc:
+        mock_coder_cls.return_value.propose.side_effect = _propose
+        cli.main()
+
+    assert exc.value.code == 0
+    assert seen["record"]["status"] == "running"
+    assert seen["record"]["command"] == "build"
+    assert seen["record"]["phase"] == "coder"
+
+
+def test_build_terminal_record_is_done_on_success(tmp_path, _state_dir):
+    ready = ReviewResult(ready=True, files=["a.py"], done="it works")
+    change = FileChange(path="a.py", mode="FULL", body="print(1)\n")
+    with patch.object(
+        sys, "argv", ["issue-worm", "build", "5", "--repo", "o/r"]
+    ), patch("cli._fetch_issue_body", return_value="body"), patch(
+        "cli.review_issue", return_value=ready
+    ), patch("cli.ensure_base_clone", return_value=str(tmp_path)), patch(
+        "cli.LocalOllamaCoder"
+    ) as mock_coder_cls, patch(
+        "cli.parse_coder_output", return_value=[change]
+    ), patch("cli.apply_file_change"), pytest.raises(SystemExit) as exc:
+        mock_coder_cls.return_value.propose.return_value = "raw coder output"
+        cli.main()
+
+    assert exc.value.code == 0
+    record = _read_registry_record(_state_dir, "o_r-5")
+    assert record["status"] == "done"
+
+
+def test_build_terminal_record_is_failed_when_coder_produces_no_output(
+    tmp_path, _state_dir
+):
+    ready = ReviewResult(ready=True, files=["a.py"], done="it works")
+    with patch.object(
+        sys, "argv", ["issue-worm", "build", "5", "--repo", "o/r"]
+    ), patch("cli._fetch_issue_body", return_value="body"), patch(
+        "cli.review_issue", return_value=ready
+    ), patch("cli.ensure_base_clone", return_value=str(tmp_path)), patch(
+        "cli.LocalOllamaCoder"
+    ) as mock_coder_cls, pytest.raises(SystemExit) as exc:
+        mock_coder_cls.return_value.propose.return_value = ""
+        cli.main()
+
+    assert exc.value.code == 1
+    record = _read_registry_record(_state_dir, "o_r-5")
+    assert record["status"] == "failed"
+
+
+def test_build_terminal_record_is_failed_and_reraises_on_exception(
+    tmp_path, _state_dir
+):
+    """finish(..., "failed") must be recorded AND the original error must
+    still propagate — the registry write is observational, never a way to
+    swallow a real build failure."""
+    ready = ReviewResult(ready=True, files=["a.py"], done="it works")
+    with patch.object(
+        sys, "argv", ["issue-worm", "build", "5", "--repo", "o/r"]
+    ), patch("cli._fetch_issue_body", return_value="body"), patch(
+        "cli.review_issue", return_value=ready
+    ), patch("cli.ensure_base_clone", return_value=str(tmp_path)), patch(
+        "cli.LocalOllamaCoder"
+    ) as mock_coder_cls:
+        mock_coder_cls.return_value.propose.side_effect = RuntimeError("boom")
+        with pytest.raises(RuntimeError, match="boom"):
+            cli.main()
+
+    record = _read_registry_record(_state_dir, "o_r-5")
+    assert record["status"] == "failed"
+
+
+def test_build_terminal_record_is_failed_on_keyboard_interrupt(tmp_path, _state_dir):
+    """Ctrl-C mid-build must not leave the record stuck at `running`."""
+    ready = ReviewResult(ready=True, files=["a.py"], done="it works")
+    with patch.object(
+        sys, "argv", ["issue-worm", "build", "5", "--repo", "o/r"]
+    ), patch("cli._fetch_issue_body", return_value="body"), patch(
+        "cli.review_issue", return_value=ready
+    ), patch("cli.ensure_base_clone", return_value=str(tmp_path)), patch(
+        "cli.LocalOllamaCoder"
+    ) as mock_coder_cls:
+        mock_coder_cls.return_value.propose.side_effect = KeyboardInterrupt
+        with pytest.raises(KeyboardInterrupt):
+            cli.main()
+
+    record = _read_registry_record(_state_dir, "o_r-5")
+    assert record["status"] == "failed"
+
+
+def test_build_dry_run_never_registers(tmp_path, _state_dir):
+    """No workspace is ever prepared for --dry-run, so there is nothing to
+    register - the state dir must stay untouched."""
+    ready = ReviewResult(ready=True, files=["a.py"], done="it works")
+    with patch.object(
+        sys, "argv", ["issue-worm", "build", "5", "--repo", "o/r", "--dry-run"]
+    ), patch("cli._fetch_issue_body", return_value="body"), patch(
+        "cli.review_issue", return_value=ready
+    ), pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+    assert not _state_dir.exists()
 
 
 def _mock_get_response(status_code, json_body=None, headers=None):

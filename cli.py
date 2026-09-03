@@ -20,6 +20,7 @@ import requests
 from config import load_config
 from coder import LocalOllamaCoder
 from history import DEFAULT_HISTORY_PATH, get_run, load_runs
+from registry import finish, heartbeat, register
 from review import review_issue
 from version_checker import PACKAGE_NAME, check_and_prompt, installed_version
 from workspace import (
@@ -255,32 +256,52 @@ def _run_build(args, config: dict) -> int:
         print(f"✗ Could not prepare workspace: {exc}", file=sys.stderr)
         return 1
 
-    coder_config = config.get("coder_config")
-    coder = LocalOllamaCoder(
-        endpoint=getattr(coder_config, "ollama_endpoint", None),
-        model=getattr(coder_config, "ollama_model", None),
-    )
-    task = f"FILES: {', '.join(review.files)}\nDONE: {review.done}\n\n{body}"
-    output = coder.propose(repo_path, task, review.files)
-    if not output:
-        print(
-            "✗ The Coder produced no output — is Ollama reachable?",
-            file=sys.stderr,
-        )
-        return 1
+    # task id/workspace are only known once ensure_base_clone succeeds, so
+    # the run is registered here rather than at the top of _run_build -
+    # register/heartbeat/finish are all best-effort (never raise, see
+    # registry.py), so a monitoring-UI-free local run behaves exactly as
+    # before; the try/finally below just makes sure a registered run always
+    # reaches a terminal status, including on Ctrl-C.
+    task_id = f"{args.repo.replace('/', '_')}-{issue_number}"
+    register(task_id, command="build", workspace=repo_path)
 
+    success = False
     try:
-        changes: list[FileChange] = parse_coder_output(output, review.files)
-        for change in changes:
-            apply_file_change(repo_path, change)
-    except (MalformedOutputError, WorkspaceError, OSError) as exc:
-        print(f"✗ {exc}", file=sys.stderr)
-        return 1
+        coder_config = config.get("coder_config")
+        coder = LocalOllamaCoder(
+            endpoint=getattr(coder_config, "ollama_endpoint", None),
+            model=getattr(coder_config, "ollama_model", None),
+        )
+        task = f"FILES: {', '.join(review.files)}\nDONE: {review.done}\n\n{body}"
+        heartbeat(task_id, phase="coder")
+        output = coder.propose(repo_path, task, review.files)
+        if not output:
+            print(
+                "✗ The Coder produced no output — is Ollama reachable?",
+                file=sys.stderr,
+            )
+            return 1
 
-    print(f"✓ Applied changes to {len(changes)} file(s) in {repo_path}:")
-    for change in changes:
-        print(f"  {change.path}")
-    return 0
+        heartbeat(task_id, phase="apply")
+        try:
+            changes: list[FileChange] = parse_coder_output(output, review.files)
+            for change in changes:
+                apply_file_change(repo_path, change)
+        except (MalformedOutputError, WorkspaceError, OSError) as exc:
+            print(f"✗ {exc}", file=sys.stderr)
+            return 1
+
+        print(f"✓ Applied changes to {len(changes)} file(s) in {repo_path}:")
+        for change in changes:
+            print(f"  {change.path}")
+        success = True
+        return 0
+    finally:
+        # Runs unconditionally - normal return, an early return above, or
+        # any exception (KeyboardInterrupt included) - so a registered run
+        # never sits at "running" forever. Exceptions are never caught
+        # here, only observed via `success`, so they still propagate.
+        finish(task_id, "done" if success else "failed")
 
 
 def _build_parser() -> argparse.ArgumentParser:
