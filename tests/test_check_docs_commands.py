@@ -9,7 +9,14 @@ from check_docs_commands import _referenced_commands, _valid_commands  # noqa: E
 
 
 def test_valid_commands_matches_known_cli_subcommands():
-    assert _valid_commands() == {"history", "create", "triage", "build", "poll"}
+    assert _valid_commands() == {
+        "history",
+        "create",
+        "triage",
+        "build",
+        "poll",
+        "status",
+    }
 
 
 def test_referenced_commands_extracts_backtick_quoted_names(tmp_path):

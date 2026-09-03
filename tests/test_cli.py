@@ -121,11 +121,13 @@ def test_version_flag_wins_over_dispatch_regardless_of_abbreviation(
     assert "issue-worm" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("command", ["history", "create"])
+@pytest.mark.parametrize("command", ["history", "create", "status"])
 def test_free_only_command_never_dispatches_even_with_pro_installed(
     command, monkeypatch
 ):
     """`history` and `create` are this shell's alone and must never dispatch.
+    `status` (#180) joins them - it's a read-only consumer of this shell's
+    own registry/history, with no pro-specific version to upgrade to.
 
     `build` used to be in this list. It moved out under #372: pro ships a
     fuller build, so installing pro now upgrades it the way it already
@@ -137,6 +139,7 @@ def test_free_only_command_never_dispatches_even_with_pro_installed(
     argv = {
         "history": ["issue-worm", "history"],
         "create": ["issue-worm", "create"],
+        "status": ["issue-worm", "status"],
     }[command]
     with patch.object(sys, "argv", argv), patch("subprocess.run"):
         with pytest.raises(SystemExit):
@@ -838,3 +841,179 @@ def test_build_is_dispatched_but_never_reported_unavailable():
     assert "build" in cli._PRO_COMMANDS
     assert "build" not in cli._CORE_COMMANDS
     assert set(cli._CORE_COMMANDS) < set(cli._PRO_COMMANDS)
+
+
+# --- `status` command (#180) ---------------------------------------------
+
+
+def test_status_with_nothing_prints_empty_states(tmp_path, _state_dir, capsys):
+    """Zero registry files, a missing state dir, and a missing history file
+    are all normal - none may traceback, and the empty case must print the
+    exact `No active runs.` message rather than a blank screen."""
+    history_path = str(tmp_path / "history.jsonl")
+    with patch.object(
+        sys, "argv", ["issue-worm", "status", "--history-path", history_path]
+    ), pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "No active runs." in out
+    assert "No runs recorded yet." in out
+
+
+def test_status_missing_state_dir_does_not_traceback(tmp_path, monkeypatch, capsys):
+    """A state dir that has never been created (nothing has registered a
+    run yet) is normal, not an error."""
+    monkeypatch.setenv(
+        registry.STATE_DIR_ENV, str(tmp_path / "does" / "not" / "exist")
+    )
+    history_path = str(tmp_path / "history.jsonl")
+    with patch.object(
+        sys, "argv", ["issue-worm", "status", "--history-path", history_path]
+    ), pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+    assert "No active runs." in capsys.readouterr().out
+
+
+def test_status_lists_active_run_from_registry(tmp_path, _state_dir, capsys):
+    history_path = str(tmp_path / "history.jsonl")
+    registry.register("o_r-5", command="build", workspace=str(tmp_path))
+    registry.heartbeat("o_r-5", phase="coder")
+
+    with patch.object(
+        sys, "argv", ["issue-worm", "status", "--history-path", history_path]
+    ), pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "No active runs." not in out
+    assert "o_r-5" in out
+    assert "[build]" in out
+    assert "coder" in out
+
+
+def test_status_lists_completed_runs_from_history(tmp_path, _state_dir, capsys):
+    history_path = tmp_path / "history.jsonl"
+    history_path.write_text(
+        json.dumps(
+            {
+                "task_id": "task-1",
+                "source": "cli",
+                "description": "did a thing",
+                "status": "completed",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with patch.object(
+        sys, "argv", ["issue-worm", "status", "--history-path", str(history_path)]
+    ), pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "✓ task-1  [cli]  completed  did a thing" in out
+
+
+def test_status_limit_flag_caps_completed_runs(tmp_path, _state_dir, capsys):
+    history_path = tmp_path / "history.jsonl"
+    lines = [
+        json.dumps(
+            {
+                "task_id": f"task-{i}",
+                "source": "cli",
+                "description": "x",
+                "status": "completed",
+            }
+        )
+        for i in range(5)
+    ]
+    history_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with patch.object(
+        sys,
+        "argv",
+        ["issue-worm", "status", "--history-path", str(history_path), "-n", "3"],
+    ), pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert sum(1 for line in out.splitlines() if line.startswith("✓ task-")) == 3
+    # the most recent 3, i.e. task-2..task-4 (most-recent-first isn't
+    # required within the completed section - matching history's own
+    # oldest-to-newest tail slicing, see #180's "match history" note).
+    assert "task-4" in out and "task-0" not in out
+
+
+def test_status_json_emits_parseable_payload_with_both_sections(
+    tmp_path, _state_dir, capsys
+):
+    history_path = tmp_path / "history.jsonl"
+    history_path.write_text(
+        json.dumps(
+            {
+                "task_id": "task-1",
+                "source": "cli",
+                "description": "did a thing",
+                "status": "completed",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    registry.register("o_r-5", command="build", workspace=str(tmp_path))
+
+    with patch.object(
+        sys,
+        "argv",
+        ["issue-worm", "status", "--history-path", str(history_path), "--json"],
+    ), pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [r["task_id"] for r in payload["active"]] == ["o_r-5"]
+    assert [r["task_id"] for r in payload["completed"]] == ["task-1"]
+
+
+def test_status_never_writes_or_prunes_registry_files(tmp_path, _state_dir, capsys):
+    """Read-only constraint (#180): `status` must never write, prune, or
+    repair registry files, even a malformed one it can't fully parse."""
+    history_path = str(tmp_path / "history.jsonl")
+    registry.register("good", command="build", workspace=str(tmp_path))
+    malformed_path = _state_dir / "malformed.json"
+    malformed_path.write_text("not json", encoding="utf-8")
+    before = {
+        p.name: p.read_text(encoding="utf-8") for p in _state_dir.glob("*.json")
+    }
+
+    with patch.object(
+        sys, "argv", ["issue-worm", "status", "--history-path", history_path]
+    ), pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+    after = {p.name: p.read_text(encoding="utf-8") for p in _state_dir.glob("*.json")}
+    assert after == before
+    # the malformed file is skipped rather than crashing the command
+    assert "good" in capsys.readouterr().out
+
+
+def test_status_dispatches_to_run_status(monkeypatch):
+    monkeypatch.setattr(cli, "_try_import_pro_cli", lambda: None)
+    with patch.object(
+        sys, "argv", ["issue-worm", "status"]
+    ), patch("cli._run_status", return_value=0) as mock_run_status, pytest.raises(
+        SystemExit
+    ) as exc:
+        cli.main()
+
+    mock_run_status.assert_called_once()
+    assert exc.value.code == 0

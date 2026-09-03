@@ -14,13 +14,14 @@ import logging
 import os
 import re
 import sys
+from datetime import datetime, timezone
 
 import requests
 
 from config import load_config
 from coder import LocalOllamaCoder
 from history import DEFAULT_HISTORY_PATH, get_run, load_runs
-from registry import finish, heartbeat, register
+from registry import _state_dir, finish, heartbeat, register
 from review import review_issue
 from version_checker import PACKAGE_NAME, check_and_prompt, installed_version
 from workspace import (
@@ -304,6 +305,121 @@ def _run_build(args, config: dict) -> int:
         finish(task_id, "done" if success else "failed")
 
 
+# Icon shown per registry-record status in `status`'s active-runs section.
+# Distinct from `history`'s own completed/failed vocabulary (below) since
+# the registry uses "running"/"done"/"failed" (see registry.register and
+# registry.finish), not "completed".
+_ACTIVE_STATUS_ICONS = {"running": "⏳", "done": "✓", "failed": "✗"}
+
+
+def _format_history_line(run: dict) -> str:
+    """Render one completed run the way `history` always has.
+
+    Factored out so `status` can append the same recent-history lines
+    without inventing a second rendering (issue #180).
+    """
+    icon = "✓" if run.get("status") == "completed" else "✗"
+    return (
+        f"{icon} {run.get('task_id')}  [{run.get('source')}]  "
+        f"{run.get('status')}  {run.get('description')}"
+    )
+
+
+def _format_age(started_at: str | None) -> str:
+    """Elapsed time since ``started_at`` (an ISO-8601 timestamp), e.g. "5s",
+    "2m03s", "1h04m". Returns "?" for a missing or unparsable timestamp
+    rather than raising - registry records are best-effort (registry.py)
+    and `status` must never traceback on one it can't fully make sense of.
+    """
+    if not started_at:
+        return "?"
+    try:
+        started = datetime.fromisoformat(started_at)
+    except ValueError:
+        return "?"
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    seconds = max(int((datetime.now(timezone.utc) - started).total_seconds()), 0)
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m{seconds:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
+def _format_active_run_line(record: dict) -> str:
+    """Render one registry record - status icon, task id, command, phase,
+    age, workspace - matching `_format_history_line`'s style rather than
+    inventing a new one (issue #180)."""
+    icon = _ACTIVE_STATUS_ICONS.get(record.get("status"), "?")
+    phase = record.get("phase") or "-"
+    age = _format_age(record.get("started_at"))
+    return (
+        f"{icon} {record.get('task_id')}  [{record.get('command')}]  "
+        f"{phase}  {age}  {record.get('workspace')}"
+    )
+
+
+def _load_registry_records() -> list[dict]:
+    """Every parseable ``*.json`` record in the run registry state dir.
+
+    Read-only and best-effort, like registry.py itself: a missing state
+    dir, an unreadable file, or a malformed/non-object JSON file is
+    skipped rather than raised or repaired - `status` must never write,
+    prune, or fix up registry files (issue #180's read-only constraint),
+    and a missing state dir is normal, not an error (nothing has ever
+    registered a run there yet).
+    """
+    try:
+        paths = list(_state_dir().glob("*.json"))
+    except OSError:
+        return []
+    records = []
+    for path in paths:
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict):
+            records.append(data)
+    return records
+
+
+def _run_status(args) -> int:
+    """`status`: active runs from the registry, plus the last N completed
+    runs from history - the smallest useful consumer of the registry
+    (issue #180). Both sources are read-only here; an empty/missing
+    registry and an empty/missing history file are both normal.
+    """
+    active_records = sorted(
+        _load_registry_records(),
+        key=lambda record: record.get("updated_at") or "",
+        reverse=True,
+    )
+    completed = load_runs(args.history_path)[-args.limit :]
+
+    if args.json:
+        print(json.dumps({"active": active_records, "completed": completed}, indent=2))
+        return 0
+
+    if not active_records:
+        print("No active runs.")
+    else:
+        for record in active_records:
+            print(_format_active_run_line(record))
+
+    if not completed:
+        print("No runs recorded yet.")
+    else:
+        for run in completed:
+            print(_format_history_line(run))
+
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Build the top-level argument parser.
 
@@ -332,6 +448,28 @@ def _build_parser() -> argparse.ArgumentParser:
         "--limit", type=int, default=20, help="Max runs to list, most recent first"
     )
     history_parser.add_argument(
+        "--history-path",
+        default=DEFAULT_HISTORY_PATH,
+        help="Path to the JSONL run history file",
+    )
+
+    status_parser = subparsers.add_parser(
+        "status",
+        help="Show active runs (from the run registry) plus recent history",
+    )
+    status_parser.add_argument(
+        "-n",
+        "--limit",
+        type=int,
+        default=10,
+        help="Max completed runs to show, most recent first",
+    )
+    status_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit active runs and completed runs as one JSON document",
+    )
+    status_parser.add_argument(
         "--history-path",
         default=DEFAULT_HISTORY_PATH,
         help="Path to the JSONL run history file",
@@ -493,12 +631,11 @@ def main():
             sys.exit(0)
 
         for run in runs[-args.limit :]:
-            icon = "✓" if run.get("status") == "completed" else "✗"
-            print(
-                f"{icon} {run.get('task_id')}  [{run.get('source')}]  "
-                f"{run.get('status')}  {run.get('description')}"
-            )
+            print(_format_history_line(run))
         sys.exit(0)
+
+    elif args.command == "status":
+        sys.exit(_run_status(args))
     else:
         parser.print_help()
         sys.exit(1)
