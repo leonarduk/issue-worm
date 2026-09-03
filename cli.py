@@ -21,7 +21,7 @@ import requests
 from config import load_config
 from coder import LocalOllamaCoder
 from history import DEFAULT_HISTORY_PATH, get_run, load_runs
-from registry import _state_dir, finish, heartbeat, register
+from registry import finish, heartbeat, list_runs, register
 from review import review_issue
 from version_checker import PACKAGE_NAME, check_and_prompt, installed_version
 from workspace import (
@@ -307,9 +307,10 @@ def _run_build(args, config: dict) -> int:
 
 # Icon shown per registry-record status in `status`'s active-runs section.
 # Distinct from `history`'s own completed/failed vocabulary (below) since
-# the registry uses "running"/"done"/"failed" (see registry.register and
-# registry.finish), not "completed".
-_ACTIVE_STATUS_ICONS = {"running": "⏳", "done": "✓", "failed": "✗"}
+# the registry uses "running"/"done"/"failed"/"stale" (see registry.register,
+# registry.finish, and registry.list_runs's staleness annotation - #181),
+# not "completed".
+_ACTIVE_STATUS_ICONS = {"running": "⏳", "done": "✓", "failed": "✗", "stale": "⚠"}
 
 
 def _format_history_line(run: dict) -> str:
@@ -363,29 +364,20 @@ def _format_active_run_line(record: dict) -> str:
 
 
 def _load_registry_records() -> list[dict]:
-    """Every parseable ``*.json`` record in the run registry state dir.
+    """Every parseable record in the run registry state dir, via
+    `registry.list_runs()`.
 
     Read-only and best-effort, like registry.py itself: a missing state
     dir, an unreadable file, or a malformed/non-object JSON file is
     skipped rather than raised or repaired - `status` must never write,
     prune, or fix up registry files (issue #180's read-only constraint),
     and a missing state dir is normal, not an error (nothing has ever
-    registered a run there yet).
+    registered a run there yet). A "running" record whose heartbeat has
+    gone quiet comes back with ``status: "stale"`` (issue #181) - that
+    annotation lives only in the dict `list_runs()` returns, never on
+    disk.
     """
-    try:
-        paths = list(_state_dir().glob("*.json"))
-    except OSError:
-        return []
-    records = []
-    for path in paths:
-        try:
-            with path.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (OSError, ValueError):
-            continue
-        if isinstance(data, dict):
-            records.append(data)
-    return records
+    return list_runs()
 
 
 def _run_status(args) -> int:

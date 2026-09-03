@@ -7,6 +7,7 @@ rather than crashing when it isn't (#352).
 import json
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 from types import ModuleType
 from unittest.mock import MagicMock, patch
 
@@ -1004,6 +1005,61 @@ def test_status_never_writes_or_prunes_registry_files(tmp_path, _state_dir, caps
     assert after == before
     # the malformed file is skipped rather than crashing the command
     assert "good" in capsys.readouterr().out
+
+
+def test_status_renders_stale_run_distinctly_from_running(
+    tmp_path, _state_dir, monkeypatch, capsys
+):
+    """A `running` record whose heartbeat is older than the staleness
+    threshold must render with the stale icon, distinct from the
+    running-icon it would otherwise get (issue #181)."""
+    monkeypatch.setenv(registry.STALE_AFTER_SECONDS_ENV, "1")
+    registry.register("o_r-5", command="build", workspace=str(tmp_path))
+    record_path = _state_dir / "o_r-5.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record["updated_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=5)
+    ).isoformat()
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+
+    history_path = str(tmp_path / "history.jsonl")
+    with patch.object(
+        sys, "argv", ["issue-worm", "status", "--history-path", history_path]
+    ), pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert cli._ACTIVE_STATUS_ICONS["stale"] in out
+    assert cli._ACTIVE_STATUS_ICONS["running"] not in out
+
+
+def test_status_json_reports_stale_status_for_old_heartbeat(
+    tmp_path, _state_dir, monkeypatch, capsys
+):
+    monkeypatch.setenv(registry.STALE_AFTER_SECONDS_ENV, "1")
+    registry.register("o_r-5", command="build", workspace=str(tmp_path))
+    record_path = _state_dir / "o_r-5.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record["updated_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=5)
+    ).isoformat()
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+
+    history_path = str(tmp_path / "history.jsonl")
+    with patch.object(
+        sys,
+        "argv",
+        ["issue-worm", "status", "--history-path", history_path, "--json"],
+    ), pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["active"][0]["status"] == "stale"
+    # the on-disk record itself must be untouched by the read
+    on_disk = json.loads(record_path.read_text(encoding="utf-8"))
+    assert on_disk["status"] == "running"
 
 
 def test_status_dispatches_to_run_status(monkeypatch):

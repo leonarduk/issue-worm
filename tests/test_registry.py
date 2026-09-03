@@ -8,6 +8,7 @@ build) - several tests below assert exactly that.
 import json
 import logging
 import os
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -191,3 +192,200 @@ def test_finish_does_not_raise_when_run_file_is_malformed_json(tmp_path, _state_
     (_state_dir / "task-1.json").write_text("{not valid json", encoding="utf-8")
 
     registry.finish("task-1", "done")  # must not raise
+
+
+# --- Staleness detection on read (#181) ---------------------------------
+
+
+def _iso(delta: timedelta) -> str:
+    return (datetime.now(timezone.utc) + delta).isoformat()
+
+
+def _write_record(state_dir, task_id, **fields):
+    record = {
+        "task_id": task_id,
+        "pid": 4242,
+        "status": "running",
+        "command": "build",
+        "workspace": "/tmp/ws",
+        "history_path": "/tmp/ws/history.jsonl",
+        "phase": None,
+        "started_at": _iso(timedelta(hours=-1)),
+        "updated_at": _iso(timedelta()),
+        "package": "issue-worm",
+        "version": "0.0.0",
+    }
+    record.update(fields)
+    registry._write_run_atomic(state_dir / f"{task_id}.json", record)
+    return record
+
+
+def test_list_runs_marks_old_running_record_as_stale(tmp_path, _state_dir, monkeypatch):
+    monkeypatch.setenv(registry.STALE_AFTER_SECONDS_ENV, "1")
+    _write_record(
+        _state_dir, "task-1", updated_at=_iso(timedelta(seconds=-5))
+    )
+
+    [record] = registry.list_runs()
+
+    assert record["status"] == "stale"
+
+
+def test_list_runs_leaves_fresh_running_record_alone(tmp_path, _state_dir):
+    _write_record(_state_dir, "task-1", updated_at=_iso(timedelta()))
+
+    [record] = registry.list_runs()
+
+    assert record["status"] == "running"
+
+
+def test_list_runs_default_threshold_is_ten_minutes(tmp_path, _state_dir):
+    """A heartbeat 9 minutes old must still read as running under the
+    600s default; #181's success criteria only pins the override."""
+    _write_record(_state_dir, "task-1", updated_at=_iso(timedelta(minutes=-9)))
+
+    [record] = registry.list_runs()
+
+    assert record["status"] == "running"
+
+
+def test_list_runs_respects_stale_after_seconds_env_override(
+    tmp_path, _state_dir, monkeypatch
+):
+    """ISSUE_WORM_STALE_AFTER_SECONDS=1 makes a fresh record go stale
+    after a second - the override proof called out in #181."""
+    monkeypatch.setenv(registry.STALE_AFTER_SECONDS_ENV, "1")
+    _write_record(_state_dir, "task-1", updated_at=_iso(timedelta(seconds=-2)))
+
+    [record] = registry.list_runs()
+
+    assert record["status"] == "stale"
+
+
+def test_list_runs_does_not_mark_terminal_records_stale(tmp_path, _state_dir):
+    """Only "running" records can go stale - a "done"/"failed" record's
+    old heartbeat is just its last update, not a zombie run."""
+    _write_record(
+        _state_dir, "task-1", status="done", updated_at=_iso(timedelta(days=-2))
+    )
+
+    [record] = registry.list_runs()
+
+    assert record["status"] == "done"
+
+
+def test_list_runs_does_not_write_to_disk(tmp_path, _state_dir):
+    """Reading must never rewrite the file - even the record it marks
+    stale in the returned data stays untouched on disk (issue #181)."""
+    record_path = _state_dir / "task-1.json"
+    _write_record(_state_dir, "task-1", updated_at=_iso(timedelta(hours=-1)))
+    before = record_path.read_text(encoding="utf-8")
+
+    [record] = registry.list_runs()
+
+    assert record["status"] == "stale"
+    assert record_path.read_text(encoding="utf-8") == before
+
+
+def test_list_runs_skips_malformed_json(tmp_path, _state_dir):
+    _state_dir.mkdir(parents=True)
+    (_state_dir / "bad.json").write_text("{not valid json", encoding="utf-8")
+
+    assert registry.list_runs() == []
+
+
+def test_list_runs_on_missing_state_dir_returns_empty_list(_state_dir):
+    assert not _state_dir.exists()
+
+    assert registry.list_runs() == []
+
+
+# --- Opportunistic pruning of old terminal records (#181) ---------------
+
+
+def test_register_prunes_terminal_records_older_than_24h(tmp_path, _state_dir):
+    _write_record(
+        _state_dir, "old-done", status="done", updated_at=_iso(timedelta(hours=-25))
+    )
+
+    registry.register("new-task", command="build", workspace=str(tmp_path))
+
+    assert not (_state_dir / "old-done.json").exists()
+    assert (_state_dir / "new-task.json").exists()
+
+
+def test_register_prunes_stale_records_older_than_24h(tmp_path, _state_dir):
+    _write_record(
+        _state_dir, "old-stale", status="stale", updated_at=_iso(timedelta(hours=-25))
+    )
+
+    registry.register("new-task", command="build", workspace=str(tmp_path))
+
+    assert not (_state_dir / "old-stale.json").exists()
+
+
+def test_register_keeps_terminal_records_within_24h(tmp_path, _state_dir):
+    _write_record(
+        _state_dir,
+        "recent-done",
+        status="done",
+        updated_at=_iso(timedelta(hours=-1)),
+    )
+
+    registry.register("new-task", command="build", workspace=str(tmp_path))
+
+    assert (_state_dir / "recent-done.json").exists()
+
+
+def test_register_never_prunes_running_records_regardless_of_age(tmp_path, _state_dir):
+    """Pruning only ever removes terminal records - an old `running`
+    record is exactly the zombie case #181 wants surfaced as "stale" on
+    read, not silently deleted."""
+    _write_record(
+        _state_dir,
+        "old-running",
+        status="running",
+        updated_at=_iso(timedelta(hours=-25)),
+    )
+
+    registry.register("new-task", command="build", workspace=str(tmp_path))
+
+    assert (_state_dir / "old-running.json").exists()
+
+
+def test_register_pruning_does_not_raise_when_state_dir_unwritable(tmp_path, monkeypatch):
+    blocker = tmp_path / "blocked"
+    blocker.write_text("not a directory", encoding="utf-8")
+    monkeypatch.setenv(registry.STATE_DIR_ENV, str(blocker / "agents"))
+
+    result = registry.register("task-1", command="build", workspace=str(tmp_path))
+
+    assert result is None
+
+
+def test_register_pruning_skips_malformed_json_without_raising(tmp_path, _state_dir):
+    _state_dir.mkdir(parents=True)
+    (_state_dir / "bad.json").write_text("{not valid json", encoding="utf-8")
+
+    result = registry.register("task-1", command="build", workspace=str(tmp_path))
+
+    assert result is not None
+    assert (_state_dir / "bad.json").exists()  # left alone, not deleted
+
+
+# --- os.kill must never appear as a liveness probe (#181) ---------------
+
+
+def test_registry_module_never_calls_os_kill():
+    """No PID-liveness probe anywhere in the module (issue #181) - on
+    Windows os.kill(pid, 0) calls TerminateProcess, so even a "harmless"
+    liveness check would kill the run. Comments are allowed to *describe*
+    the trap (this test's own docstring does); only real code matters."""
+    import inspect
+
+    code_lines = [
+        line
+        for line in inspect.getsource(registry).splitlines()
+        if not line.strip().startswith("#")
+    ]
+    assert not any("os.kill" in line for line in code_lines)

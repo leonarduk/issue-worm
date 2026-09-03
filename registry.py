@@ -29,6 +29,18 @@ STATE_DIR_ENV = "ISSUE_WORM_STATE_DIR"
 DEFAULT_STATE_DIR = Path.home() / ".issue-worm" / "agents"
 PACKAGE_NAME = "issue-worm"
 
+# A "running" record whose heartbeat hasn't moved in this long is reported
+# as "stale" on read (issue #181) - inferred from `updated_at` only, never
+# from probing the PID (see module docstring: on Windows, os.kill(pid, 0)
+# calls TerminateProcess, so a liveness probe would actually kill the run).
+STALE_AFTER_SECONDS_ENV = "ISSUE_WORM_STALE_AFTER_SECONDS"
+DEFAULT_STALE_AFTER_SECONDS = 600  # 10 minutes
+
+# Terminal statuses eligible for opportunistic pruning in register(), and
+# how old (by `updated_at`) one has to be before it's removed.
+_TERMINAL_STATUSES = ("done", "failed", "stale")
+TERMINAL_RETENTION_SECONDS = 24 * 60 * 60  # 24 hours
+
 
 def _state_dir() -> Path:
     """Resolve the run-registry state directory (not created here)."""
@@ -55,6 +67,110 @@ def _read_run(path: Path) -> Optional[dict]:
             return json.load(f)
     except (OSError, ValueError):
         return None
+
+
+def _stale_after_seconds() -> float:
+    """Staleness threshold in seconds: $ISSUE_WORM_STALE_AFTER_SECONDS if
+    set to a valid number, else DEFAULT_STALE_AFTER_SECONDS."""
+    override = os.environ.get(STALE_AFTER_SECONDS_ENV)
+    if override is None:
+        return DEFAULT_STALE_AFTER_SECONDS
+    try:
+        return float(override)
+    except ValueError:
+        return DEFAULT_STALE_AFTER_SECONDS
+
+
+def _parse_timestamp(value: Any) -> Optional[datetime]:
+    """Parse an ISO-8601 timestamp, or None if missing/unparsable."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _with_staleness(record: dict) -> dict:
+    """Return ``record``, or a copy with ``status`` overridden to "stale"
+    if it's a "running" record whose ``updated_at`` heartbeat is older
+    than the staleness threshold.
+
+    Never mutates ``record`` in place and never touches disk - this is
+    purely an in-memory annotation applied on read, so a caller reading
+    the registry can never race a concurrent writer (issue #181).
+    """
+    if record.get("status") != "running":
+        return record
+    updated_at = _parse_timestamp(record.get("updated_at"))
+    if updated_at is None:
+        return record
+    age = (datetime.now(timezone.utc) - updated_at).total_seconds()
+    if age < _stale_after_seconds():
+        return record
+    marked = dict(record)
+    marked["status"] = "stale"
+    return marked
+
+
+def list_runs() -> list[dict]:
+    """Every parseable run record in the state dir, read-only.
+
+    Best-effort like the rest of this module: a missing state dir, an
+    unreadable file, or malformed/non-object JSON is skipped rather than
+    raised or repaired. A "running" record whose heartbeat is older than
+    the staleness threshold comes back with ``status: "stale"`` in the
+    returned dict - the on-disk file is never rewritten by this read
+    (issue #181; see also cli.py's `status` command, which relies on this
+    staying read-only).
+    """
+    try:
+        paths = list(_state_dir().glob("*.json"))
+    except OSError:
+        return []
+    records = []
+    for path in paths:
+        record = _read_run(path)
+        if isinstance(record, dict):
+            records.append(_with_staleness(record))
+    return records
+
+
+def _prune_terminal_records() -> None:
+    """Best-effort delete of terminal (done/failed/stale) records whose
+    ``updated_at`` heartbeat is older than ``TERMINAL_RETENTION_SECONDS``,
+    so the state dir doesn't grow without bound.
+
+    Called opportunistically from `register()` on every new run rather
+    than from a background thread or timer (issue #181 explicitly rules
+    those out). Any failure - a single unreadable/undeletable file, a
+    missing state dir - is swallowed per-file so it never blocks the
+    registration this call is piggybacking on.
+    """
+    try:
+        paths = list(_state_dir().glob("*.json"))
+    except OSError:
+        return
+    now = datetime.now(timezone.utc)
+    for path in paths:
+        try:
+            record = _read_run(path)
+            if not isinstance(record, dict):
+                continue
+            if record.get("status") not in _TERMINAL_STATUSES:
+                continue
+            updated_at = _parse_timestamp(record.get("updated_at"))
+            if updated_at is None:
+                continue
+            if (now - updated_at).total_seconds() < TERMINAL_RETENTION_SECONDS:
+                continue
+            path.unlink()
+        except OSError:
+            logger.debug("registry._prune_terminal_records: could not prune %s", path, exc_info=True)
+            continue
 
 
 def _write_run_atomic(path: Path, record: dict) -> None:
@@ -89,6 +205,7 @@ def register(
         if monitoring were disabled.
     """
     try:
+        _prune_terminal_records()
         workspace_path = Path(workspace).resolve()
         now = datetime.now(timezone.utc).isoformat()
         record: dict[str, Any] = dict(extra or {})
