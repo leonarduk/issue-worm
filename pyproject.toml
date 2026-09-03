@@ -39,7 +39,7 @@ dev = [
 issue-worm = "cli:main"
 
 [tool.setuptools]
-py-modules = ["cli", "coder", "config", "history", "review", "version_checker", "workspace"]
+py-modules = ["cli", "coder", "config", "history", "registry", "review", "version_checker", "workspace"]
 
 [tool.setuptools_scm]
 fallback_version = "0.1.0"
