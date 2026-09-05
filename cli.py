@@ -42,6 +42,10 @@ _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
 
+# Matches history.py/registry.py's convention. Used for best-effort,
+# observational failures that must not surface to the user or fail a build.
+logger = logging.getLogger(__name__)
+
 # Commands handed to issue-worm-pro when it is installed. `build` belongs
 # here even though this shell implements it too (#372): pro's build is the
 # full Coder -> Verifier -> Analyser loop that both repos' READMEs already
@@ -361,20 +365,36 @@ def _run_build(args, config: dict) -> int:
         # issue-worm-pro isn't installed/dispatched (main() hands `build`
         # to pro_cli.main() before this function is even called when pro
         # is present), and pro's own scheduler records its own run.
-        record_run(
-            _FreeBuildRun(
-                task_id=task_id,
-                source="cli",
-                description=review.done,
-                status="completed" if success else "failed",
-                files=review.files,
-                started_at=started_at,
-                finished_at=datetime.now(timezone.utc).isoformat(),
-                workspace=repo_path,
-                command="build",
-            ),
-            history_path=history_path,
-        )
+        #
+        # Wrapped because this runs in a `finally`: unlike the registry
+        # calls above, `history.record_run` makes no never-raise promise
+        # (it mkdirs and appends), and an exception raised *inside* a
+        # `finally` replaces whatever the body was returning or raising.
+        # An unwritable history file would otherwise turn a successful
+        # build into an OSError traceback, or mask the real failure on the
+        # error paths - exactly the "never fail a build over a purely
+        # observational feature" rule registry.py is built around.
+        try:
+            record_run(
+                _FreeBuildRun(
+                    task_id=task_id,
+                    source="cli",
+                    description=review.done,
+                    status="completed" if success else "failed",
+                    files=review.files,
+                    started_at=started_at,
+                    finished_at=datetime.now(timezone.utc).isoformat(),
+                    workspace=repo_path,
+                    command="build",
+                ),
+                history_path=history_path,
+            )
+        except Exception:  # noqa: BLE001 - observational; never fail a build
+            logger.debug(
+                "Could not record build run to history at %s",
+                history_path,
+                exc_info=True,
+            )
 
 
 # Icon shown per registry-record status in `status`'s active-runs section.
@@ -463,7 +483,12 @@ def _run_status(args) -> int:
         key=lambda record: record.get("updated_at") or "",
         reverse=True,
     )
-    completed = load_runs(args.history_path)[-args.limit :]
+    # Guarded rather than sliced directly: `runs[-0:]` is `runs[0:]`, so a
+    # plain `[-args.limit:]` turns `--limit 0` into "show everything" - the
+    # exact opposite of what was asked - and a negative limit into "drop the
+    # first N", which is meaningless here.
+    limit = max(args.limit, 0)
+    completed = load_runs(args.history_path)[-limit:] if limit else []
 
     if args.json:
         print(json.dumps({"active": active_records, "completed": completed}, indent=2))

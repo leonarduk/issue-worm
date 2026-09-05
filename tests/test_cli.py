@@ -811,6 +811,54 @@ def test_build_records_failed_run_to_history_on_exception(tmp_path, _state_dir):
     assert records[0]["status"] == "failed"
 
 
+def test_build_survives_history_recording_failure(tmp_path, _state_dir, capsys):
+    """An unwritable history file must not fail an otherwise-successful
+    build.
+
+    `record_run` runs in `_run_build`'s `finally`, and an exception raised
+    there *replaces* the value the body was returning - so an OSError from
+    the history append would turn exit 0 into a traceback. History is
+    observational, exactly like the registry, so it is swallowed.
+    """
+    ready = ReviewResult(ready=True, files=["a.py"], done="it works")
+    change = FileChange(path="a.py", mode="FULL", body="print(1)\n")
+    with patch.object(
+        sys, "argv", ["issue-worm", "build", "5", "--repo", "o/r"]
+    ), patch("cli._fetch_issue_body", return_value="body"), patch(
+        "cli.review_issue", return_value=ready
+    ), patch("cli.ensure_base_clone", return_value=str(tmp_path)), patch(
+        "cli.LocalOllamaCoder"
+    ) as mock_coder_cls, patch(
+        "cli.parse_coder_output", return_value=[change]
+    ), patch("cli.apply_file_change"), patch(
+        "cli.record_run", side_effect=OSError("read-only history")
+    ), pytest.raises(SystemExit) as exc:
+        mock_coder_cls.return_value.propose.return_value = "raw coder output"
+        cli.main()
+
+    assert exc.value.code == 0
+    # The failure is silent on stderr - it is not the user's problem.
+    assert "read-only history" not in capsys.readouterr().err
+
+
+def test_build_history_failure_does_not_mask_original_exception(tmp_path, _state_dir):
+    """When the build itself crashes *and* history recording then fails,
+    the caller still sees the real cause, not the bookkeeping error."""
+    ready = ReviewResult(ready=True, files=["a.py"], done="it works")
+    with patch.object(
+        sys, "argv", ["issue-worm", "build", "5", "--repo", "o/r"]
+    ), patch("cli._fetch_issue_body", return_value="body"), patch(
+        "cli.review_issue", return_value=ready
+    ), patch("cli.ensure_base_clone", return_value=str(tmp_path)), patch(
+        "cli.LocalOllamaCoder"
+    ) as mock_coder_cls, patch(
+        "cli.record_run", side_effect=OSError("read-only history")
+    ):
+        mock_coder_cls.return_value.propose.side_effect = RuntimeError("boom")
+        with pytest.raises(RuntimeError, match="boom"):
+            cli.main()
+
+
 def test_history_command_renders_recorded_free_build_run(tmp_path, _state_dir, capsys):
     """End-to-end: a free `build`'s record is readable back through the
     shipped `history` command, with populated (not blank) columns."""
@@ -1117,6 +1165,68 @@ def test_status_limit_flag_caps_completed_runs(tmp_path, _state_dir, capsys):
     # required within the completed section - matching history's own
     # oldest-to-newest tail slicing, see #180's "match history" note).
     assert "task-4" in out and "task-0" not in out
+
+
+def test_status_limit_zero_shows_no_completed_runs(tmp_path, _state_dir, capsys):
+    """`-n 0` means "none", not "all".
+
+    Guards the `runs[-0:] == runs[0:]` trap: sliced naively, a zero limit
+    silently prints the entire history instead of nothing.
+    """
+    history_path = tmp_path / "history.jsonl"
+    lines = [
+        json.dumps(
+            {
+                "task_id": f"task-{i}",
+                "source": "cli",
+                "description": "x",
+                "status": "completed",
+            }
+        )
+        for i in range(5)
+    ]
+    history_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with patch.object(
+        sys,
+        "argv",
+        ["issue-worm", "status", "--history-path", str(history_path), "-n", "0"],
+    ), pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert not any(line.startswith("✓ task-") for line in out.splitlines())
+    assert "No runs recorded yet." in out
+
+
+def test_status_negative_limit_shows_no_completed_runs(tmp_path, _state_dir, capsys):
+    """A negative limit is clamped to zero rather than becoming "drop the
+    first N", which is what a bare `runs[-args.limit:]` would do."""
+    history_path = tmp_path / "history.jsonl"
+    lines = [
+        json.dumps(
+            {
+                "task_id": f"task-{i}",
+                "source": "cli",
+                "description": "x",
+                "status": "completed",
+            }
+        )
+        for i in range(5)
+    ]
+    history_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with patch.object(
+        sys,
+        "argv",
+        ["issue-worm", "status", "--history-path", str(history_path), "-n", "-2"],
+    ), pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert not any(line.startswith("✓ task-") for line in out.splitlines())
 
 
 def test_status_json_emits_parseable_payload_with_both_sections(
