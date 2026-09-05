@@ -1229,6 +1229,85 @@ def test_status_negative_limit_shows_no_completed_runs(tmp_path, _state_dir, cap
     assert not any(line.startswith("✓ task-") for line in out.splitlines())
 
 
+def _write_completed_history(history_path, count=5):
+    """Write `count` completed run records, task-0 .. task-{count-1}."""
+    lines = [
+        json.dumps(
+            {
+                "task_id": f"task-{i}",
+                "source": "cli",
+                "description": "x",
+                "status": "completed",
+            }
+        )
+        for i in range(count)
+    ]
+    history_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_history_limit_zero_lists_no_runs(tmp_path, _state_dir, capsys):
+    """`--limit 0` means "none", not "all".
+
+    The `history` twin of `test_status_limit_zero_shows_no_completed_runs`:
+    sliced naively, `runs[-0:]` is `runs[0:]`, so a zero limit prints the
+    whole history instead of nothing.
+    """
+    history_path = tmp_path / "history.jsonl"
+    _write_completed_history(history_path)
+
+    with patch.object(
+        sys,
+        "argv",
+        ["issue-worm", "history", "--history-path", str(history_path), "--limit", "0"],
+    ), pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert not any(line.startswith("✓ task-") for line in out.splitlines())
+    assert out.strip() == ""
+
+
+def test_history_negative_limit_lists_no_runs(tmp_path, _state_dir, capsys):
+    """A negative limit is clamped to zero rather than becoming "drop the
+    first N", which is what a bare `runs[-args.limit:]` would do."""
+    history_path = tmp_path / "history.jsonl"
+    _write_completed_history(history_path)
+
+    with patch.object(
+        sys,
+        "argv",
+        ["issue-worm", "history", "--history-path", str(history_path), "--limit", "-2"],
+    ), pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert not any(line.startswith("✓ task-") for line in out.splitlines())
+    assert out.strip() == ""
+
+
+def test_history_positive_limit_lists_most_recent_runs(tmp_path, _state_dir, capsys):
+    """The clamp must not disturb the ordinary case: `--limit N` still shows
+    the N most recent runs."""
+    history_path = tmp_path / "history.jsonl"
+    _write_completed_history(history_path)
+
+    with patch.object(
+        sys,
+        "argv",
+        ["issue-worm", "history", "--history-path", str(history_path), "--limit", "2"],
+    ), pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    listed = [line for line in out.splitlines() if line.startswith("✓ task-")]
+    assert len(listed) == 2
+    assert "task-3" in listed[0]
+    assert "task-4" in listed[1]
+
+
 def test_status_json_emits_parseable_payload_with_both_sections(
     tmp_path, _state_dir, capsys
 ):
