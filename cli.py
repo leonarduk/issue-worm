@@ -719,7 +719,12 @@ def main():
             print("No runs recorded yet.")
             sys.exit(0)
 
-        for run in runs[-args.limit :]:
+        # Same guard as `_run_status`: `runs[-0:]` is `runs[0:]`, so a plain
+        # `[-args.limit:]` would turn `--limit 0` into "show everything" and a
+        # negative limit into "drop the first N", neither of which was asked
+        # for.
+        limit = max(args.limit, 0)
+        for run in runs[-limit:] if limit else []:
             print(_format_history_line(run))
         sys.exit(0)
 
