@@ -186,6 +186,8 @@ def _write_run_atomic(path: Path, record: dict) -> None:
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     with tmp_path.open("w", encoding="utf-8") as f:
         json.dump(record, f)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp_path, path)
 
 
