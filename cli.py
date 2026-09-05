@@ -14,12 +14,16 @@ import logging
 import os
 import re
 import sys
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
 
 from config import load_config
 from coder import LocalOllamaCoder
-from history import DEFAULT_HISTORY_PATH, get_run, load_runs
+from history import DEFAULT_HISTORY_PATH, get_run, load_runs, record_run
+from registry import finish, heartbeat, list_runs, register
 from review import review_issue
 from version_checker import PACKAGE_NAME, check_and_prompt, installed_version
 from workspace import (
@@ -37,6 +41,10 @@ GITHUB_API_TIMEOUT = 30
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
+
+# Matches history.py/registry.py's convention. Used for best-effort,
+# observational failures that must not surface to the user or fail a build.
+logger = logging.getLogger(__name__)
 
 # Commands handed to issue-worm-pro when it is installed. `build` belongs
 # here even though this shell implements it too (#372): pro's build is the
@@ -191,6 +199,41 @@ def _fetch_issue_body(repo: str, issue_number: int) -> str | None:
         return None
 
 
+@dataclass
+class _FreeBuildRun:
+    """Minimal free-tier stand-in for issue-worm-pro's `orchestrator.TaskRun`
+    (#183), recorded by `_run_build` via `history.record_run`.
+
+    `TaskRun` lives in issue-worm-pro and this repo cannot depend on pro, so
+    this is a separate dataclass — but `history.record_run` only needs *a*
+    dataclass instance (it calls `dataclasses.asdict` on whatever it's
+    given), and this one deliberately reuses TaskRun's field names
+    (`task_id`, `source`, `description`, `files`, `status`, with `status`
+    one of "completed"/"failed") so a free-recorded record renders exactly
+    like a pro-recorded one everywhere `history.load_runs`'s dicts are
+    consumed — `_format_history_line`, `status`, and issue-worm-pro's
+    monitoring UI. Deliberately carries no `type` key (`history.load_runs`
+    filters out any record that has one, e.g. review-rejection events —
+    #306) and no `datetime` field (only JSON-serialisable values, since
+    `record_run` does `json.dumps(asdict(run))`).
+    """
+
+    task_id: str
+    source: str
+    description: str
+    status: str
+    files: list[str] = field(default_factory=list)
+    # Mirrors the fields issue-worm-pro's TaskRun gained in its own #509, so
+    # a free-recorded run fills the monitoring UI's Started/Duration/
+    # Workspace/Command columns exactly like a pro-recorded one instead of
+    # rendering "-". Optional with None defaults, so history lines written
+    # before this existed still load.
+    started_at: str | None = None
+    finished_at: str | None = None
+    workspace: str | None = None
+    command: str | None = None
+
+
 def _run_build(args, config: dict) -> int:
     """Single-pass, free-tier `build`: heuristic review + local Ollama
     coder, writing changes straight to the working tree. No verifier/
@@ -255,31 +298,214 @@ def _run_build(args, config: dict) -> int:
         print(f"✗ Could not prepare workspace: {exc}", file=sys.stderr)
         return 1
 
-    coder_config = config.get("coder_config")
-    coder = LocalOllamaCoder(
-        endpoint=getattr(coder_config, "ollama_endpoint", None),
-        model=getattr(coder_config, "ollama_model", None),
-    )
-    task = f"FILES: {', '.join(review.files)}\nDONE: {review.done}\n\n{body}"
-    output = coder.propose(repo_path, task, review.files)
-    if not output:
-        print(
-            "✗ The Coder produced no output — is Ollama reachable?",
-            file=sys.stderr,
-        )
-        return 1
+    # task id/workspace are only known once ensure_base_clone succeeds, so
+    # the run is registered here rather than at the top of _run_build -
+    # register/heartbeat/finish are all best-effort (never raise, see
+    # registry.py), so a monitoring-UI-free local run behaves exactly as
+    # before; the try/finally below just makes sure a registered run always
+    # reaches a terminal status, including on Ctrl-C.
+    task_id = f"{args.repo.replace('/', '_')}-{issue_number}"
+    register(task_id, command="build", workspace=repo_path)
+    # Stamped here rather than at record time so the history record spans the
+    # whole build, matching what the registry record already reports. Kept as
+    # an ISO-8601 string, never a datetime: `record_run` does
+    # `json.dumps(asdict(run))`, which a datetime would break.
+    started_at = datetime.now(timezone.utc).isoformat()
+    # Same path the registry record itself points readers at (registry.py's
+    # `register` stamps `history_path` as `<workspace>/.issue-worm/
+    # history.jsonl`) — recording here instead of DEFAULT_HISTORY_PATH's
+    # bare relative path is what lets a run's registry record and its
+    # history record be found together (#183).
+    history_path = str(Path(repo_path).resolve() / DEFAULT_HISTORY_PATH)
 
+    success = False
     try:
-        changes: list[FileChange] = parse_coder_output(output, review.files)
-        for change in changes:
-            apply_file_change(repo_path, change)
-    except (MalformedOutputError, WorkspaceError, OSError) as exc:
-        print(f"✗ {exc}", file=sys.stderr)
-        return 1
+        coder_config = config.get("coder_config")
+        coder = LocalOllamaCoder(
+            endpoint=getattr(coder_config, "ollama_endpoint", None),
+            model=getattr(coder_config, "ollama_model", None),
+        )
+        task = f"FILES: {', '.join(review.files)}\nDONE: {review.done}\n\n{body}"
+        heartbeat(task_id, phase="coder")
+        output = coder.propose(repo_path, task, review.files)
+        if not output:
+            print(
+                "✗ The Coder produced no output — is Ollama reachable?",
+                file=sys.stderr,
+            )
+            return 1
 
-    print(f"✓ Applied changes to {len(changes)} file(s) in {repo_path}:")
-    for change in changes:
-        print(f"  {change.path}")
+        heartbeat(task_id, phase="apply")
+        try:
+            changes: list[FileChange] = parse_coder_output(output, review.files)
+            for change in changes:
+                apply_file_change(repo_path, change)
+        except (MalformedOutputError, WorkspaceError, OSError) as exc:
+            print(f"✗ {exc}", file=sys.stderr)
+            return 1
+
+        print(f"✓ Applied changes to {len(changes)} file(s) in {repo_path}:")
+        for change in changes:
+            print(f"  {change.path}")
+        success = True
+        return 0
+    finally:
+        # Runs unconditionally - normal return, an early return above, or
+        # any exception (KeyboardInterrupt included) - so a registered run
+        # never sits at "running" forever. Exceptions are never caught
+        # here, only observed via `success`, so they still propagate.
+        finish(task_id, "done" if success else "failed")
+        # Free-tier's only history writer (#183): without this, a
+        # free-only install never appends to history.jsonl at all, so the
+        # shipped `history`/`status` commands can structurally never show
+        # a completed run. Recorded on both the success and failure paths
+        # (status "completed"/"failed", matching orchestrator.TaskRun's
+        # vocabulary) so a failed build is visible rather than vanishing.
+        # No double-recording risk: `_run_build` only ever runs when
+        # issue-worm-pro isn't installed/dispatched (main() hands `build`
+        # to pro_cli.main() before this function is even called when pro
+        # is present), and pro's own scheduler records its own run.
+        #
+        # Wrapped because this runs in a `finally`: unlike the registry
+        # calls above, `history.record_run` makes no never-raise promise
+        # (it mkdirs and appends), and an exception raised *inside* a
+        # `finally` replaces whatever the body was returning or raising.
+        # An unwritable history file would otherwise turn a successful
+        # build into an OSError traceback, or mask the real failure on the
+        # error paths - exactly the "never fail a build over a purely
+        # observational feature" rule registry.py is built around.
+        try:
+            record_run(
+                _FreeBuildRun(
+                    task_id=task_id,
+                    source="cli",
+                    description=review.done,
+                    status="completed" if success else "failed",
+                    files=review.files,
+                    started_at=started_at,
+                    finished_at=datetime.now(timezone.utc).isoformat(),
+                    workspace=repo_path,
+                    command="build",
+                ),
+                history_path=history_path,
+            )
+        except Exception:  # noqa: BLE001 - observational; never fail a build
+            logger.debug(
+                "Could not record build run to history at %s",
+                history_path,
+                exc_info=True,
+            )
+
+
+# Icon shown per registry-record status in `status`'s active-runs section.
+# Distinct from `history`'s own completed/failed vocabulary (below) since
+# the registry uses "running"/"done"/"failed"/"stale" (see registry.register,
+# registry.finish, and registry.list_runs's staleness annotation - #181),
+# not "completed".
+_ACTIVE_STATUS_ICONS = {"running": "⏳", "done": "✓", "failed": "✗", "stale": "⚠"}
+
+
+def _format_history_line(run: dict) -> str:
+    """Render one completed run the way `history` always has.
+
+    Factored out so `status` can append the same recent-history lines
+    without inventing a second rendering (issue #180).
+    """
+    icon = "✓" if run.get("status") == "completed" else "✗"
+    return (
+        f"{icon} {run.get('task_id')}  [{run.get('source')}]  "
+        f"{run.get('status')}  {run.get('description')}"
+    )
+
+
+def _format_age(started_at: str | None) -> str:
+    """Elapsed time since ``started_at`` (an ISO-8601 timestamp), e.g. "5s",
+    "2m03s", "1h04m". Returns "?" for a missing or unparsable timestamp
+    rather than raising - registry records are best-effort (registry.py)
+    and `status` must never traceback on one it can't fully make sense of.
+    """
+    if not started_at:
+        return "?"
+    try:
+        started = datetime.fromisoformat(started_at)
+    except ValueError:
+        return "?"
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    seconds = max(int((datetime.now(timezone.utc) - started).total_seconds()), 0)
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m{seconds:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
+def _format_active_run_line(record: dict) -> str:
+    """Render one registry record - status icon, task id, command, phase,
+    age, workspace - matching `_format_history_line`'s style rather than
+    inventing a new one (issue #180)."""
+    icon = _ACTIVE_STATUS_ICONS.get(record.get("status"), "?")
+    phase = record.get("phase") or "-"
+    age = _format_age(record.get("started_at"))
+    return (
+        f"{icon} {record.get('task_id')}  [{record.get('command')}]  "
+        f"{phase}  {age}  {record.get('workspace')}"
+    )
+
+
+def _load_registry_records() -> list[dict]:
+    """Every parseable record in the run registry state dir, via
+    `registry.list_runs()`.
+
+    Read-only and best-effort, like registry.py itself: a missing state
+    dir, an unreadable file, or a malformed/non-object JSON file is
+    skipped rather than raised or repaired - `status` must never write,
+    prune, or fix up registry files (issue #180's read-only constraint),
+    and a missing state dir is normal, not an error (nothing has ever
+    registered a run there yet). A "running" record whose heartbeat has
+    gone quiet comes back with ``status: "stale"`` (issue #181) - that
+    annotation lives only in the dict `list_runs()` returns, never on
+    disk.
+    """
+    return list_runs()
+
+
+def _run_status(args) -> int:
+    """`status`: active runs from the registry, plus the last N completed
+    runs from history - the smallest useful consumer of the registry
+    (issue #180). Both sources are read-only here; an empty/missing
+    registry and an empty/missing history file are both normal.
+    """
+    active_records = sorted(
+        _load_registry_records(),
+        key=lambda record: record.get("updated_at") or "",
+        reverse=True,
+    )
+    # Guarded rather than sliced directly: `runs[-0:]` is `runs[0:]`, so a
+    # plain `[-args.limit:]` turns `--limit 0` into "show everything" - the
+    # exact opposite of what was asked - and a negative limit into "drop the
+    # first N", which is meaningless here.
+    limit = max(args.limit, 0)
+    completed = load_runs(args.history_path)[-limit:] if limit else []
+
+    if args.json:
+        print(json.dumps({"active": active_records, "completed": completed}, indent=2))
+        return 0
+
+    if not active_records:
+        print("No active runs.")
+    else:
+        for record in active_records:
+            print(_format_active_run_line(record))
+
+    if not completed:
+        print("No runs recorded yet.")
+    else:
+        for run in completed:
+            print(_format_history_line(run))
+
     return 0
 
 
@@ -311,6 +537,28 @@ def _build_parser() -> argparse.ArgumentParser:
         "--limit", type=int, default=20, help="Max runs to list, most recent first"
     )
     history_parser.add_argument(
+        "--history-path",
+        default=DEFAULT_HISTORY_PATH,
+        help="Path to the JSONL run history file",
+    )
+
+    status_parser = subparsers.add_parser(
+        "status",
+        help="Show active runs (from the run registry) plus recent history",
+    )
+    status_parser.add_argument(
+        "-n",
+        "--limit",
+        type=int,
+        default=10,
+        help="Max completed runs to show, most recent first",
+    )
+    status_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit active runs and completed runs as one JSON document",
+    )
+    status_parser.add_argument(
         "--history-path",
         default=DEFAULT_HISTORY_PATH,
         help="Path to the JSONL run history file",
@@ -472,12 +720,11 @@ def main():
             sys.exit(0)
 
         for run in runs[-args.limit :]:
-            icon = "✓" if run.get("status") == "completed" else "✗"
-            print(
-                f"{icon} {run.get('task_id')}  [{run.get('source')}]  "
-                f"{run.get('status')}  {run.get('description')}"
-            )
+            print(_format_history_line(run))
         sys.exit(0)
+
+    elif args.command == "status":
+        sys.exit(_run_status(args))
     else:
         parser.print_help()
         sys.exit(1)

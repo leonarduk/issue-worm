@@ -47,6 +47,14 @@ and a real PR opened end to end — see
   the behaviour described here is what you get on the free tier alone.
 - `issue-worm history` — list or inspect past runs recorded by the
   pipeline.
+- `issue-worm status` — show runs currently in progress (from the run
+  registry state dir) plus the last N completed runs (from
+  `issue-worm history`'s own store). `-n/--limit` caps how many completed
+  runs are shown (default 10); `--json` emits the whole payload as one
+  document. Prints `No active runs.` when nothing is running — on a
+  free-tier build, the completed-runs list is often empty too, since only
+  issue-worm-pro's scheduler writes to run history; that's normal, not a
+  bug.
 - `issue-worm triage` / `poll` — parse their flags (so `--help` stays
   accurate) but report themselves unavailable, since the scheduler and
   LLM-driven triage that implement them live in issue-worm-pro.
