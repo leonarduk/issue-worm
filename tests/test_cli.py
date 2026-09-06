@@ -294,6 +294,41 @@ def test_version_flag_prints_name_and_exits_zero(capsys):
     assert "public shell" in out
 
 
+def test_version_flag_skips_the_update_check(monkeypatch, capsys):
+    """#195: `issue-worm --version` must be a quick, offline lookup - it
+    must not run check_and_prompt() (which makes a live GitHub API call
+    outside of tests) before printing the version and exiting."""
+    with patch.object(
+        sys, "argv", ["issue-worm", "--version"]
+    ), patch("cli.check_and_prompt") as mock_check, pytest.raises(
+        SystemExit
+    ) as exc:
+        cli.main()
+
+    mock_check.assert_not_called()
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "issue-worm" in out
+    assert "public shell" in out
+
+
+def test_version_flag_still_wins_when_combined_with_pro_dispatch(monkeypatch, capsys):
+    """An exact top-level `--version` must take the fast path and exit
+    before the pro-command dispatch check even runs, so it never imports
+    or calls into issue-worm-pro."""
+    fake_pro_cli = MagicMock()
+    monkeypatch.setitem(sys.modules, "pro_cli", fake_pro_cli)
+
+    with patch.object(
+        sys, "argv", ["issue-worm", "--version", "triage"]
+    ), pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    fake_pro_cli.main.assert_not_called()
+    assert exc.value.code == 0
+    assert "issue-worm" in capsys.readouterr().out
+
+
 def test_build_without_repo_fails_fast(capsys):
     with patch.object(
         sys, "argv", ["issue-worm", "build", "5"]

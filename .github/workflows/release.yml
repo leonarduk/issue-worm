@@ -1,0 +1,96 @@
+name: Release
+
+# Fixes #193: without this workflow, GitHub releases were cut with no
+# assets attached, so version_checker.py's self-update check always failed
+# with "Unable to check for an issue-worm update: GitHub release vX.Y.Z has
+# no compatible issue_worm-X.Y.Z-py3-none-any.whl asset". Modeled on the
+# working pattern in the sibling repos leonarduk/cicaid and
+# leonarduk/cicaid-pro, minus their wiki-update step (this repo has no
+# wiki quick-start page to keep in sync).
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # needed by setuptools-scm to derive version from git tags
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      # Publish the installable artifacts before the best-effort README
+      # update below. A README-update failure must not leave a published
+      # release without the wheel advertised by the updater.
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ github.ref_name }}" &>/dev/null; then
+            echo "Release already exists; uploading artifacts."
+            # A previous attempt may have uploaded only some assets before failing.
+            # Replace those assets so rerunning the workflow remains safe.
+            gh release upload "${{ github.ref_name }}" dist/* --clobber
+          else
+            gh release create "${{ github.ref_name }}" dist/* \
+              --title "${{ github.ref_name }}" \
+              --generate-notes
+          fi
+
+      - name: Update README to this release's version
+        run: python scripts/bump_readme_version.py "${{ github.ref_name }}"
+
+      - name: Push README update to main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if git diff --quiet README.md; then
+            echo "README.md unchanged; nothing to push."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git commit -m "Update README install command to ${{ github.ref_name }}"
+
+          # Strategy 1: PR-based merge (works with branch protection if
+          # repo settings allow Actions to create PRs).
+          BRANCH="readme-bump-${GITHUB_REF_NAME#v}"
+          git checkout -b "$BRANCH"
+          git push --force origin "$BRANCH"
+
+          if PR_URL=$(gh pr create \
+            --base main \
+            --head "$BRANCH" \
+            --title "Update README install command to ${{ github.ref_name }}" \
+            --body "Automated version bump triggered by release ${{ github.ref_name }}." 2>/dev/null); then
+            echo "Created $PR_URL"
+            gh pr merge "$PR_URL" --merge || \
+              echo "::warning::Could not auto-merge $PR_URL — merge it manually."
+          else
+            # Strategy 2: direct push (fallback when Actions cannot create PRs).
+            echo "::notice::PR creation blocked by repo settings; trying direct push."
+            if git push origin HEAD:main 2>&1; then
+              echo "Pushed README update to main."
+            else
+              echo "::warning::Could not update the README on main."
+              echo "::warning::To fix: enable 'Allow GitHub Actions to create"
+              echo "::warning::pull requests' in repo Settings → Actions → General,"
+              echo "::warning::or manually run: scripts/bump_readme_version.py"
+            fi
+          fi
