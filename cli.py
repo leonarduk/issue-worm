@@ -509,6 +509,14 @@ def _run_status(args) -> int:
     return 0
 
 
+def _version_string() -> str:
+    """The exact text `--version` prints - shared by the fast path in
+    `main()` (#195) and argparse's own `--version` action below, so both
+    always agree."""
+    version = installed_version() or "unknown (source checkout)"
+    return f"{PACKAGE_NAME} {version} (public shell — triage/poll require issue-worm-pro)"
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Build the top-level argument parser.
 
@@ -518,12 +526,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="issue-worm: Local LLM issue-to-PR pipeline (free shell)"
     )
-    version = installed_version() or "unknown (source checkout)"
     parser.add_argument(
         "--version",
         action="version",
-        version=f"{PACKAGE_NAME} {version} (public shell — "
-        "triage/poll require issue-worm-pro)",
+        version=_version_string(),
     )
     subparsers = parser.add_subparsers(dest="command", help="Subcommand to run")
 
@@ -651,6 +657,19 @@ def main():
     # calls the same check_and_prompt against the same PACKAGE_NAME
     # ("issue-worm"), so the update check still runs exactly once either
     # way.
+    # #195: an exact top-level `--version` should be a quick, offline
+    # lookup - not trigger check_and_prompt()'s live GitHub call. Checked
+    # via ``sys.argv[1]`` exactly, same as the pro-dispatch check right
+    # below and for the same reason (see the comment above): a scan for
+    # "--version" anywhere in argv would also swallow a `--version` meant
+    # for a subcommand, e.g. `issue-worm triage --version`. Abbreviations
+    # argparse would normally accept (like `--vers`) are intentionally not
+    # special-cased here - they still fall through to check_and_prompt()
+    # and argparse's own version action below, as before.
+    if sys.argv[1:2] == ["--version"]:
+        print(_version_string())
+        sys.exit(0)
+
     if sys.argv[1:2] and sys.argv[1] in _PRO_COMMANDS:
         pro_cli = _try_import_pro_cli()
         if pro_cli is not None:

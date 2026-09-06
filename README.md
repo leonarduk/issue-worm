@@ -61,9 +61,16 @@ and a real PR opened end to end — see
 
 ## Install
 
+issue-worm isn't published on PyPI. Install the latest release wheel
+directly from GitHub Releases:
+
 ```bash
-pip install issue-worm
+pip install https://github.com/leonarduk/issue-worm/releases/download/v0.2.0/issue_worm-0.2.0-py3-none-any.whl
 ```
+
+`scripts/bump_readme_version.py`, run by
+[the release workflow](.github/workflows/release.yml), keeps this URL in
+sync with the latest tag on every release.
 
 ## Working with private repositories
 
