@@ -5,6 +5,7 @@ import pytest
 
 from config import (
     CoderTarget,
+    ConfigError,
     RoleConfig,
     TargetPool,
     _parse_coder_targets,
@@ -440,52 +441,47 @@ def test_parse_coder_targets_model_with_tag():
     ]
 
 
-def test_parse_coder_targets_missing_port_skipped():
+def test_parse_coder_targets_missing_port_raises():
     """The port is mandatory (disambiguates host from a tagged model
-    name), so a spec without one is dropped rather than misparsed."""
-    targets = _parse_coder_targets("desk:localhost:qwen2.5-coder")
+    name), so a spec without one fails fast rather than being misparsed
+    or silently dropped."""
+    with pytest.raises(ConfigError, match="4 colon-separated fields"):
+        _parse_coder_targets("desk:localhost:qwen2.5-coder")
 
-    assert targets == []
 
-
-def test_parse_coder_targets_malformed_spec_skipped():
+def test_parse_coder_targets_malformed_spec_raises():
     """A spec with too few colons has no way to separate
-    name/host/port/model and is dropped rather than raising."""
-    targets = _parse_coder_targets("just-a-name")
-
-    assert targets == []
-
-
-def test_parse_coder_targets_wrong_field_count_warns(caplog):
-    """A dropped entry must be logged, not silently swallowed - otherwise
-    an empty pool from a typo looks identical to CODER_TARGETS being
-    unset (#193)."""
-    targets = _parse_coder_targets("cloud:api.deepseek.com:deepseek-v4-flash")
-
-    assert targets == []
-    assert "cloud:api.deepseek.com:deepseek-v4-flash" in caplog.text
-    assert "4 colon-separated fields" in caplog.text
+    name/host/port/model - raise rather than silently dropping it."""
+    with pytest.raises(ConfigError, match="4 colon-separated fields"):
+        _parse_coder_targets("just-a-name")
 
 
-def test_parse_coder_targets_non_numeric_port_warns(caplog):
-    """A non-numeric port can never be dialed - drop the entry loudly
-    instead of handing out a target that will only fail at connect time."""
-    targets = _parse_coder_targets("desk:localhost:notaport:qwen2.5-coder")
+def test_parse_coder_targets_wrong_field_count_raises():
+    """A malformed entry must stop startup, not be logged and dropped -
+    an empty pool from a typo silently looked identical to CODER_TARGETS
+    being unset (#193), and that's what let a bad target run for days."""
+    with pytest.raises(ConfigError) as exc_info:
+        _parse_coder_targets("cloud:api.deepseek.com:deepseek-v4-flash")
 
-    assert targets == []
-    assert "port 'notaport' is not numeric" in caplog.text
+    assert "cloud:api.deepseek.com:deepseek-v4-flash" in str(exc_info.value)
+    assert "4 colon-separated fields" in str(exc_info.value)
 
 
-def test_parse_coder_targets_duplicate_name_warns_and_keeps_first(caplog):
+def test_parse_coder_targets_non_numeric_port_raises():
+    """A non-numeric port can never be dialed - raise instead of handing
+    out a target that will only fail at connect time."""
+    with pytest.raises(ConfigError, match="port 'notaport' is not numeric"):
+        _parse_coder_targets("desk:localhost:notaport:qwen2.5-coder")
+
+
+def test_parse_coder_targets_duplicate_name_raises():
     """TargetPool tracks busy/unavailable state by name (config.py), so two
     entries sharing a name would make it treat distinct hosts as one -
-    keep the first and drop the rest with a warning."""
-    targets = _parse_coder_targets(
-        "desk:192.168.1.20:11434:qwen2.5-coder,desk:192.168.1.50:11434:qwen2.5-coder"
-    )
-
-    assert [t.host for t in targets] == ["192.168.1.20:11434"]
-    assert "name 'desk' already used" in caplog.text
+    raise rather than silently keeping only the first."""
+    with pytest.raises(ConfigError, match="name 'desk' already used"):
+        _parse_coder_targets(
+            "desk:192.168.1.20:11434:qwen2.5-coder,desk:192.168.1.50:11434:qwen2.5-coder"
+        )
 
 
 def test_parse_coder_targets_ignores_trailing_comma():

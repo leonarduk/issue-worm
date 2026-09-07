@@ -20,7 +20,7 @@ from pathlib import Path
 
 import requests
 
-from config import load_config
+from config import ConfigError, load_config
 from coder import LocalOllamaCoder
 from history import DEFAULT_HISTORY_PATH, get_run, load_runs, record_run
 from registry import finish, heartbeat, list_runs, register
@@ -680,7 +680,11 @@ def main():
     parser = _build_parser()
     args = parser.parse_args()
 
-    config = load_config()
+    try:
+        config = load_config()
+    except ConfigError as e:
+        print(f"✗ Config error: {e}", file=sys.stderr)
+        sys.exit(1)
     _configure_logging(config)
 
     if args.command == "create":

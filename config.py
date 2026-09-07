@@ -14,6 +14,17 @@ from dotenv import load_dotenv
 logger = logging.getLogger(__name__)
 
 
+class ConfigError(ValueError):
+    """Raised when an environment variable is set but cannot be parsed.
+
+    Deliberately distinct from "unset" (which falls back to a default):
+    a value that's present but malformed must stop startup rather than
+    silently degrade to a default that looks identical to the unset case
+    (#193) - that's what let a typo'd CODER_TARGETS run silently with an
+    empty/placeholder pool for days.
+    """
+
+
 @dataclass
 class CoderTarget:
     """A configured coder backend target."""
@@ -263,15 +274,22 @@ def _parse_coder_targets(targets_str: str) -> list[CoderTarget]:
     only a fixed split point disambiguates the two reliably.
 
     A malformed entry (wrong field count, non-numeric port, or a name
-    reused from an earlier entry) is dropped with a logged warning rather
-    than silently ignored - a pool that ends up empty because of a typo
-    should never look identical to CODER_TARGETS being unset (#193).
+    reused from an earlier entry) raises ConfigError rather than being
+    dropped with a logged warning - a pool that ends up empty because of
+    a typo must never look identical to CODER_TARGETS being unset (#193).
+    Silently dropping the bad entry did exactly that: the scheduler kept
+    running, dispatch kept failing, and nothing surfaced the cause short
+    of finding one WARNING line in the log.
 
     Args:
         targets_str: Comma-separated list of colon-separated target specs.
 
     Returns:
         List of CoderTarget objects.
+
+    Raises:
+        ConfigError: an entry doesn't parse - see message for which one
+            and why.
     """
     targets = []
     if not targets_str:
@@ -284,26 +302,23 @@ def _parse_coder_targets(targets_str: str) -> list[CoderTarget]:
             continue
         parts = spec.split(":", 3)
         if len(parts) != 4:
-            logger.warning(
-                "CODER_TARGETS entry %r ignored: expected "
-                "'name:host:port:model' (4 colon-separated fields), got %d",
-                spec, len(parts),
+            raise ConfigError(
+                f"CODER_TARGETS entry {spec!r} is invalid: expected "
+                f"'name:host:port:model' (4 colon-separated fields), got "
+                f"{len(parts)}"
             )
-            continue
         name, host, port, model = parts
         if not port.isdigit():
-            logger.warning(
-                "CODER_TARGETS entry %r ignored: port %r is not numeric",
-                spec, port,
+            raise ConfigError(
+                f"CODER_TARGETS entry {spec!r} is invalid: port {port!r} "
+                f"is not numeric"
             )
-            continue
         if name in seen:
-            logger.warning(
-                "CODER_TARGETS entry %r ignored: name %r already used by "
-                "entry %r (target names must be unique)",
-                spec, name, seen[name],
+            raise ConfigError(
+                f"CODER_TARGETS entry {spec!r} is invalid: name {name!r} "
+                f"already used by entry {seen[name]!r} (target names must "
+                f"be unique)"
             )
-            continue
         seen[name] = spec
         targets.append(CoderTarget(name=name, host=f"{host}:{port}", model=model))
 
