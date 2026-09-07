@@ -6,11 +6,18 @@
 # The `link-check` job (lychee) isn't included here: it needs a separate
 # binary not guaranteed to be on a coder's box, so it's left to CI proper.
 
+# `--deselect ...test_core_command_reports_unavailable` matters on any box
+# that also has issue-worm-pro installed editable (true for this repo's own
+# dev/CI box, since building issue-worm's own issues happens from exactly
+# that setup): those two parametrized cases assert issue-worm-pro is *not*
+# installed, so on a box where it is, `[triage]` fires a REAL triage pass
+# against the live GitHub repo and `[poll]` hangs forever with zero pytest
+# output. Bare `pytest` here previously caused exactly that, twice, live.
 [[checks]]
 name = "test"
 description = "pytest suite"
 workflow = ".github/workflows/ci.yml"
-commands = ["pytest"]
+commands = ["pytest --deselect tests/test_cli.py::test_core_command_reports_unavailable"]
 
 [[checks]]
 name = "docs-commands"
