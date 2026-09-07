@@ -1,0 +1,19 @@
+# Verifier check list for `cicaid run-ci-checks --all`.
+# Mirrors .github/workflows/ci.yml's `test` and `docs-commands` jobs.
+# Without this file, cicaid falls back to DEFAULT_CHECKS (allotmint's own
+# CI profile), which references scripts this repo doesn't have and fails
+# every build/poll run regardless of the change under test.
+# The `link-check` job (lychee) isn't included here: it needs a separate
+# binary not guaranteed to be on a coder's box, so it's left to CI proper.
+
+[[checks]]
+name = "test"
+description = "pytest suite"
+workflow = ".github/workflows/ci.yml"
+commands = ["pytest"]
+
+[[checks]]
+name = "docs-commands"
+description = "documented commands exist in the CLI"
+workflow = ".github/workflows/ci.yml"
+commands = ["python scripts/check_docs_commands.py"]
