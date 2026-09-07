@@ -1,0 +1,52 @@
+name: issue-worm
+
+# Label-gated dispatch (leonarduk/issue-worm-pro#582): applying the
+# `issue-worm` label to an issue runs the engine on it.
+#
+# The `if:` guard below is LOAD-BEARING, not cosmetic. The action's own
+# commit/push/PR steps run with a PAT (`secrets.WORM_PAT`, not the default
+# `secrets.GITHUB_TOKEN`) so that the opened PR triggers this repo's other
+# workflows - but a PAT-driven label write would *also* re-trigger this
+# `labeled` workflow itself. Nothing here re-applies the `issue-worm`
+# label, so today there is no loop in practice - but the guard is what
+# keeps it that way if a later change (e.g. adopting issue-worm-pro's
+# in-progress/pr-opened/needs-help labels) starts writing labels with the
+# PAT. Do not remove it.
+on:
+  issues:
+    types: [labeled]
+
+concurrency:
+  group: issue-worm-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.event.label.name == 'issue-worm'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Run issue-worm
+        uses: ./
+        with:
+          issue: ${{ github.event.issue.number }}
+          # A fine-grained PAT (or GitHub App token) with `contents: write`
+          # and `pull-requests: write` on this repo - see action.yml's
+          # `github-token` input for why the default GITHUB_TOKEN can't be
+          # used here.
+          github-token: ${{ secrets.WORM_PAT }}
+          # Omitted: this repo dogfoods the free engine only. Set to
+          # ${{ secrets.ISSUE_WORM_LICENSE }} to opt into the pro engine
+          # once leonarduk/issue-worm-pro#584 ships.
+          # license-key: ${{ secrets.ISSUE_WORM_LICENSE }}
+        env:
+          # The free engine's coder always talks to an Ollama-compatible
+          # /api/generate endpoint (coder.py) - there is no local Ollama on
+          # a GitHub-hosted runner, so this must point at one this runner
+          # can reach (a self-hosted Ollama box, or one exposed over the
+          # network). Without it the build step fails at the coder call.
+          CODER_OLLAMA_ENDPOINT: ${{ secrets.CODER_OLLAMA_ENDPOINT }}
+          CODER_OLLAMA_MODEL: ${{ secrets.CODER_OLLAMA_MODEL }}

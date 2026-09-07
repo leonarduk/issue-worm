@@ -72,6 +72,103 @@ pip install https://github.com/leonarduk/issue-worm/releases/download/v0.2.1/iss
 [the release workflow](.github/workflows/release.yml), keeps this URL in
 sync with the latest tag on every release.
 
+## GitHub Action
+
+This repo also ships itself as a **composite action** ([`action.yml`](action.yml))
+that runs the free engine against one issue and opens a PR from the
+result. It deliberately does *not* set `runs-on` — the calling job
+chooses the runner, so the same action works unmodified on GitHub-hosted
+and self-hosted runners:
+
+```yaml
+on:
+  issues:
+    types: [labeled]
+
+concurrency:
+  group: issue-worm-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # Load-bearing, not cosmetic — see .github/workflows/issue-worm.yml
+    # for why: without it, the PAT-driven label writes below would
+    # re-trigger this same workflow in a loop.
+    if: github.event.label.name == 'issue-worm'
+    runs-on: ubuntu-latest   # or: [self-hosted, issue-worm]
+    steps:
+      - uses: leonarduk/issue-worm@v1
+        with:
+          issue: ${{ github.event.issue.number }}
+          github-token: ${{ secrets.WORM_PAT }}
+          # license-key: ${{ secrets.ISSUE_WORM_LICENSE }}   # optional, see below
+        env:
+          CODER_OLLAMA_ENDPOINT: ${{ secrets.CODER_OLLAMA_ENDPOINT }}
+          CODER_OLLAMA_MODEL: ${{ secrets.CODER_OLLAMA_MODEL }}
+```
+
+See [`.github/workflows/issue-worm.yml`](.github/workflows/issue-worm.yml)
+for the working copy this repo runs on itself.
+
+### Inputs
+
+| Input | Required | Description |
+|---|---|---|
+| `issue` | yes | Number of the issue to work. |
+| `github-token` | yes | A PAT or GitHub App token with `contents: write` and `pull-requests: write` on the target repo. The built-in `secrets.GITHUB_TOKEN` is **not** sufficient — a PR opened (or pushed to) with it deliberately does not trigger other workflow runs, so anything gated on the PR (CI, review bots, required checks) would never fire. This token also authenticates the issue-body fetch, the `git push`, and `gh pr create`. |
+| `license-key` | no | Reserved for the pro engine. Currently accepted and logged only — installing the pro wheel from a license key is a separate, unimplemented piece of work ([leonarduk/issue-worm-pro#584](https://github.com/leonarduk/issue-worm-pro/issues/584)). Omit it (the default) to run the free engine, which is everything the action does today. |
+
+### `runs-on` options
+
+- `runs-on: ubuntu-latest` — free GitHub-hosted minutes. The free
+  engine's coder (`coder.py`) always talks to an Ollama-compatible
+  `/api/generate` endpoint, and a GitHub-hosted runner has no local
+  Ollama, so `CODER_OLLAMA_ENDPOINT` must point at one this runner can
+  actually reach over the network (a self-hosted Ollama box you expose,
+  or a hosted Ollama-compatible endpoint). Without it the build step
+  fails when it calls the coder.
+- `runs-on: [self-hosted, issue-worm]` — a self-hosted runner, typically
+  one that also runs Ollama locally (`CODER_OLLAMA_ENDPOINT=http://localhost:11434`,
+  the default `coder.py` already assumes if unset).
+
+Either way the action does not branch on which one you picked — the
+`runs-on:` line in your own job is the only place that decision is made.
+
+### What the action does
+
+1. Checks out the calling repo (`actions/checkout`, credentialed with
+   `github-token`) and sets up Python.
+2. Installs this action's own checkout (`pip install`) — not the
+   `pip install`-from-wheel flow above; the action always runs the code
+   at its pinned ref.
+3. Runs `issue-worm build <issue> --repo <owner/name> --workspace
+   <checkout>`, reusing the already-checked-out, already-credentialed
+   working tree instead of `build`'s normal unauthenticated fresh clone.
+4. If that produced changes, commits them to a deterministic
+   `issue-worm/issue-<N>` branch, force-pushes it (so re-labelling the
+   issue supersedes a previous attempt rather than piling up branches —
+   see [leonarduk/issue-worm-pro#582](https://github.com/leonarduk/issue-worm-pro/issues/582)'s
+   retry UX), and opens a PR with `gh pr create` (or leaves the existing
+   PR for that branch as-is if one is already open).
+
+### Known limitations
+
+- **The free engine only speaks Ollama.** `coder.py`'s `LocalOllamaCoder`
+  always POSTs to `<endpoint>/api/generate` regardless of
+  `CODER_MODEL_SOURCE`; there is no OpenAI-compatible / `REMOTE_LLM_*`
+  code path wired into this repo's `build` command today, only into
+  `config.py`'s (currently unused-by-`build`) `RoleConfig`. "Bring your
+  own OpenAI-compatible endpoint" is not something this action can do
+  yet without an Ollama-compatible endpoint in front of it.
+- **No pro engine yet.** `license-key` is accepted and logged, nothing
+  more — see [leonarduk/issue-worm-pro#584](https://github.com/leonarduk/issue-worm-pro/issues/584).
+- **No in-progress/pr-opened/needs-help label lifecycle.** That belongs
+  to issue-worm-pro's scheduler; this action only opens (or updates) the
+  PR and lets the job's own success/failure be the signal.
+
 ## Working with private repositories
 
 `issue-worm build` — the free-tier one; issue-worm-pro's resolves its own

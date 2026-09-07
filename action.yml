@@ -1,0 +1,124 @@
+name: issue-worm
+description: >-
+  Turn a GitHub issue into a pull request using issue-worm's free, single-pass
+  local-Ollama engine. This is a composite action, not a reusable workflow -
+  it does not set `runs-on`, so the calling job chooses the runner
+  (`ubuntu-latest`, a self-hosted pool, anything) with no branching in here.
+author: leonarduk
+
+inputs:
+  issue:
+    description: >-
+      Number of the issue to work (e.g. ${{ github.event.issue.number }}).
+    required: true
+  github-token:
+    description: >-
+      A PAT or GitHub App installation token with `contents: write` and
+      `pull-requests: write` on the target repo. Required - the built-in
+      `secrets.GITHUB_TOKEN` is NOT enough: pull requests (and pushes)
+      made with the default token deliberately do not trigger other
+      workflow runs, so any CI configured to run on the PR (tests, review
+      bots, required checks) would silently never fire. A PAT or App token
+      does trigger them. This same token also authenticates the `git push`
+      and `gh pr create` steps below and is used to fetch the issue body
+      (higher rate limit; required at all for a private repo).
+    required: true
+  license-key:
+    description: >-
+      Reserved for the issue-worm-pro engine. Currently accepted and
+      logged only - installing the pro wheel from a license key is not
+      implemented yet (leonarduk/issue-worm-pro#584). Omit this input (or
+      leave it empty) to run the free engine, which is everything this
+      action does today.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Report license-key status
+      shell: bash
+      run: |
+        if [ -n "${{ inputs.license-key }}" ]; then
+          echo "::notice::license-key was supplied, but the pro engine install is not implemented yet (issue-worm-pro#584) - running the free engine."
+        else
+          echo "license-key not supplied - running the free engine."
+        fi
+
+    - name: Check out repository
+      uses: actions/checkout@v4
+      with:
+        token: ${{ inputs.github-token }}
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+        cache: pip
+
+    - name: Install issue-worm (free engine)
+      shell: bash
+      # Installed from this action's own checkout (github.action_path), NOT
+      # from the caller's repo at `.` - those are two different checkouts
+      # when this action is consumed as `uses: leonarduk/issue-worm@v1`
+      # from someone else's workflow.
+      run: python -m pip install --upgrade pip && python -m pip install "${{ github.action_path }}"
+
+    - name: Run issue-worm build
+      id: build
+      shell: bash
+      env:
+        # Read by cli.py's _fetch_issue_body for the GitHub REST call
+        # (higher rate limit; required for a private repo).
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        # Non-interactive CI already skips the update-check prompt (stdin/
+        # stdout aren't both ttys), but this makes the intent explicit.
+        ISSUE_WORM_SKIP_UPDATE_CHECK: "1"
+      run: |
+        set -euo pipefail
+        # --workspace reuses this job's own actions/checkout'd working tree
+        # (already on the right repo, already credentialed for push by the
+        # checkout step above) instead of having `build` re-clone the repo
+        # fresh over unauthenticated HTTPS.
+        issue-worm build "${{ inputs.issue }}" \
+          --repo "${{ github.repository }}" \
+          --workspace "${{ github.workspace }}"
+
+    - name: Commit, push, and open the PR
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+        cd "${{ github.workspace }}"
+
+        if [ -z "$(git status --porcelain)" ]; then
+          echo "::error::issue-worm build reported success but left no changes to commit - nothing to open a PR for."
+          exit 1
+        fi
+
+        # Deterministic per-issue branch name so that re-labelling the
+        # issue (issue-worm-pro#582's "remove-and-re-add means try again"
+        # UX) supersedes the previous attempt instead of piling up
+        # branches - hence --force below, always overwriting this branch.
+        branch="issue-worm/issue-${{ inputs.issue }}"
+        git config user.name "issue-worm[bot]"
+        git config user.email "issue-worm[bot]@users.noreply.github.com"
+        git checkout -b "$branch"
+        git add -A
+        git commit -m "issue-worm: apply changes for #${{ inputs.issue }}" -m "Closes #${{ inputs.issue }}"
+        git push --force origin "$branch"
+
+        # A retry (branch already had an open PR) just needed the push
+        # above to update it - creating a second PR for the same head
+        # branch would fail, so only open one if none exists yet.
+        if gh pr view "$branch" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+          echo "PR for $branch already exists - pushed update, nothing more to do."
+        else
+          issue_title="$(gh issue view "${{ inputs.issue }}" --repo "${{ github.repository }}" --json title -q .title)"
+          gh pr create \
+            --repo "${{ github.repository }}" \
+            --head "$branch" \
+            --title "issue-worm: ${issue_title:-issue #${{ inputs.issue }}}" \
+            --body "$(printf 'Automated single-pass change from the free issue-worm engine.\n\nCloses #%s' "${{ inputs.issue }}")"
+        fi
