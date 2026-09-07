@@ -41,10 +41,12 @@ and a real PR opened end to end — see
 - `issue-worm build <issue> --repo owner/name` — a deterministic
   (non-LLM) check that the issue is scoped enough to dispatch (an
   `## Implementation notes` section with `FILES:`/`DONE:`), then a single
-  pass through a local Ollama coder that writes the proposed changes to
-  the working tree. No verifier/retry loop, no scheduler. **With
-  issue-worm-pro installed this command runs pro's pipeline instead**, so
-  the behaviour described here is what you get on the free tier alone.
+  pass through a coder that writes the proposed changes to the working
+  tree — a local Ollama instance by default, or a cloud/remote LLM if
+  configured (see [Coder configuration](#coder-configuration) below). No
+  verifier/retry loop, no scheduler. **With issue-worm-pro installed this
+  command runs pro's pipeline instead**, so the behaviour described here
+  is what you get on the free tier alone.
 - `issue-worm history` — list or inspect past runs recorded by the
   pipeline.
 - `issue-worm status` — show runs currently in progress (from the run
@@ -71,6 +73,28 @@ pip install https://github.com/leonarduk/issue-worm/releases/download/v0.2.1/iss
 `scripts/bump_readme_version.py`, run by
 [the release workflow](.github/workflows/release.yml), keeps this URL in
 sync with the latest tag on every release.
+
+## Coder configuration
+
+`build`'s coder is picked at run time by `CODER_MODEL_SOURCE`, read via
+`config.py` and dispatched by `coder.build_coder` (`coder.py`):
+
+| `CODER_MODEL_SOURCE` | Talks to | Required env vars |
+|---|---|---|
+| `local` (default) | A local/self-hosted Ollama instance's `/api/generate`. | `CODER_TARGETS` (see below); optionally `CODER_OLLAMA_ENDPOINT` / `CODER_OLLAMA_MODEL` to override per role. |
+| `remote` | Any OpenAI-compatible `/v1/chat/completions` endpoint — OpenAI itself, a self-hosted vLLM/SGLang box, or an Ollama instance serving the OpenAI API. | `REMOTE_LLM_ENDPOINT` (no trailing `/v1` — that's appended automatically), `REMOTE_LLM_MODEL`, `REMOTE_LLM_API_KEY`. |
+| `cloud` | DeepSeek's API (`https://api.deepseek.com`), which is itself OpenAI-compatible, so it reuses the same `remote` client with DeepSeek's endpoint/model as the default. | `DEEPSEEK_API_KEY`; optionally `DEEPSEEK_MODEL` (default `deepseek-v4-flash`). |
+| `claude` | Not implemented by this free engine's `build` coder yet. Setting it fails fast with an explanatory error rather than silently falling back to `local`. | — |
+
+An unset `CODER_MODEL_SOURCE` defaults to `local` — today's original
+behaviour, unchanged. Setting `remote` or `cloud` without its required env
+var(s) fails the build immediately with a message naming the missing
+variable, rather than constructing a coder that talks to an endpoint that
+isn't there.
+
+This is what makes `remote`/`cloud` usable on a GitHub-hosted runner,
+which has no local Ollama reachable — see the Action's `runs-on` options
+below.
 
 ## GitHub Action
 
@@ -123,19 +147,24 @@ for the working copy this repo runs on itself.
 
 ### `runs-on` options
 
-- `runs-on: ubuntu-latest` — free GitHub-hosted minutes. The free
-  engine's coder (`coder.py`) always talks to an Ollama-compatible
-  `/api/generate` endpoint, and a GitHub-hosted runner has no local
-  Ollama, so `CODER_OLLAMA_ENDPOINT` must point at one this runner can
+- `runs-on: ubuntu-latest` — free GitHub-hosted minutes. A GitHub-hosted
+  runner has no local Ollama, so `local` (the default `CODER_MODEL_SOURCE`)
+  only works here if `CODER_OLLAMA_ENDPOINT` points at one this runner can
   actually reach over the network (a self-hosted Ollama box you expose,
-  or a hosted Ollama-compatible endpoint). Without it the build step
-  fails when it calls the coder.
+  or a hosted Ollama-compatible endpoint). The more common choice on a
+  hosted runner is to set `CODER_MODEL_SOURCE: remote` or `cloud` instead
+  (see [Coder configuration](#coder-configuration) above) and supply the
+  matching `REMOTE_LLM_*`/`DEEPSEEK_API_KEY` secrets as `env:` — that
+  needs no self-hosted Ollama at all.
 - `runs-on: [self-hosted, issue-worm]` — a self-hosted runner, typically
   one that also runs Ollama locally (`CODER_OLLAMA_ENDPOINT=http://localhost:11434`,
-  the default `coder.py` already assumes if unset).
+  the default `coder.py` already assumes if unset) with `CODER_MODEL_SOURCE`
+  left at its `local` default.
 
 Either way the action does not branch on which one you picked — the
-`runs-on:` line in your own job is the only place that decision is made.
+`runs-on:` line in your own job is the only place that decision is made;
+`CODER_MODEL_SOURCE` and its matching secrets in your own `env:` block are
+what actually select the coder.
 
 ### What the action does
 
@@ -156,13 +185,11 @@ Either way the action does not branch on which one you picked — the
 
 ### Known limitations
 
-- **The free engine only speaks Ollama.** `coder.py`'s `LocalOllamaCoder`
-  always POSTs to `<endpoint>/api/generate` regardless of
-  `CODER_MODEL_SOURCE`; there is no OpenAI-compatible / `REMOTE_LLM_*`
-  code path wired into this repo's `build` command today, only into
-  `config.py`'s (currently unused-by-`build`) `RoleConfig`. "Bring your
-  own OpenAI-compatible endpoint" is not something this action can do
-  yet without an Ollama-compatible endpoint in front of it.
+- **`claude` isn't implemented as a coder source yet.** `local`, `remote`,
+  and `cloud` (DeepSeek) all work — see
+  [Coder configuration](#coder-configuration) above — but
+  `CODER_MODEL_SOURCE=claude` fails the build with an explanatory error
+  rather than running anything.
 - **No pro engine yet.** `license-key` is accepted and logged, nothing
   more — see [leonarduk/issue-worm-pro#584](https://github.com/leonarduk/issue-worm-pro/issues/584).
 - **No in-progress/pr-opened/needs-help label lifecycle.** That belongs

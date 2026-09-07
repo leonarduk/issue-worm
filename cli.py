@@ -21,7 +21,7 @@ from pathlib import Path
 import requests
 
 from config import ConfigError, load_config
-from coder import LocalOllamaCoder
+from coder import CoderConfigError, build_coder
 from history import DEFAULT_HISTORY_PATH, get_run, load_runs, record_run
 from registry import finish, heartbeat, list_runs, register
 from review import review_issue
@@ -321,10 +321,11 @@ def _run_build(args, config: dict) -> int:
     success = False
     try:
         coder_config = config.get("coder_config")
-        coder = LocalOllamaCoder(
-            endpoint=getattr(coder_config, "ollama_endpoint", None),
-            model=getattr(coder_config, "ollama_model", None),
-        )
+        try:
+            coder = build_coder(coder_config)
+        except CoderConfigError as exc:
+            print(f"✗ {exc}", file=sys.stderr)
+            return 1
         task = f"FILES: {', '.join(review.files)}\nDONE: {review.done}\n\n{body}"
         heartbeat(task_id, phase="coder")
         output = coder.propose(repo_path, task, review.files)

@@ -469,13 +469,13 @@ def test_build_dry_run_stops_before_coder(capsys):
         sys, "argv", ["issue-worm", "build", "5", "--repo", "o/r", "--dry-run"]
     ), patch("cli._fetch_issue_body", return_value="body"), patch(
         "cli.review_issue", return_value=ready
-    ), patch("cli.LocalOllamaCoder") as mock_coder_cls, pytest.raises(
+    ), patch("cli.build_coder") as mock_build_coder, pytest.raises(
         SystemExit
     ) as exc:
         cli.main()
 
     assert exc.value.code == 0
-    mock_coder_cls.assert_not_called()
+    mock_build_coder.assert_not_called()
     out = capsys.readouterr().out
     assert "a.py" in out
     assert "it works" in out
@@ -489,9 +489,9 @@ def test_build_reports_empty_coder_output(tmp_path, capsys):
     ), patch("cli._fetch_issue_body", return_value="body"), patch(
         "cli.review_issue", return_value=ready
     ), patch("cli.ensure_base_clone", return_value=str(tmp_path)), patch(
-        "cli.LocalOllamaCoder"
-    ) as mock_coder_cls, pytest.raises(SystemExit) as exc:
-        mock_coder_cls.return_value.propose.return_value = ""
+        "cli.build_coder"
+    ) as mock_build_coder, pytest.raises(SystemExit) as exc:
+        mock_build_coder.return_value.propose.return_value = ""
         cli.main()
 
     assert exc.value.code == 1
@@ -507,13 +507,13 @@ def test_build_applies_changes_end_to_end(tmp_path, capsys):
     ), patch("cli._fetch_issue_body", return_value="body"), patch(
         "cli.review_issue", return_value=ready
     ), patch("cli.ensure_base_clone", return_value=str(tmp_path)), patch(
-        "cli.LocalOllamaCoder"
-    ) as mock_coder_cls, patch(
+        "cli.build_coder"
+    ) as mock_build_coder, patch(
         "cli.parse_coder_output", return_value=[change]
     ), patch("cli.apply_file_change") as mock_apply, pytest.raises(
         SystemExit
     ) as exc:
-        mock_coder_cls.return_value.propose.return_value = "raw coder output"
+        mock_build_coder.return_value.propose.return_value = "raw coder output"
         cli.main()
 
     assert exc.value.code == 0
@@ -536,11 +536,11 @@ def test_build_workspace_flag_overrides_default(tmp_path, monkeypatch):
     ), patch(
         "cli.ensure_base_clone", return_value=custom
     ) as mock_clone, patch(
-        "cli.LocalOllamaCoder"
-    ) as mock_coder_cls, patch(
+        "cli.build_coder"
+    ) as mock_build_coder, patch(
         "cli.parse_coder_output", return_value=[]
     ), pytest.raises(SystemExit):
-        mock_coder_cls.return_value.propose.return_value = "raw coder output"
+        mock_build_coder.return_value.propose.return_value = "raw coder output"
         cli.main()
 
     mock_clone.assert_called_once_with(custom, "o/r")
@@ -560,11 +560,11 @@ def test_build_workspace_flag_beats_env_var(tmp_path, monkeypatch):
     ), patch(
         "cli.ensure_base_clone", return_value=from_flag
     ) as mock_clone, patch(
-        "cli.LocalOllamaCoder"
-    ) as mock_coder_cls, patch(
+        "cli.build_coder"
+    ) as mock_build_coder, patch(
         "cli.parse_coder_output", return_value=[]
     ), pytest.raises(SystemExit):
-        mock_coder_cls.return_value.propose.return_value = "raw coder output"
+        mock_build_coder.return_value.propose.return_value = "raw coder output"
         cli.main()
 
     mock_clone.assert_called_once_with(from_flag, "o/r")
@@ -582,11 +582,11 @@ def test_build_env_var_used_when_no_workspace_flag(tmp_path, monkeypatch):
     ), patch(
         "cli.ensure_base_clone", return_value=from_env
     ) as mock_clone, patch(
-        "cli.LocalOllamaCoder"
-    ) as mock_coder_cls, patch(
+        "cli.build_coder"
+    ) as mock_build_coder, patch(
         "cli.parse_coder_output", return_value=[]
     ), pytest.raises(SystemExit):
-        mock_coder_cls.return_value.propose.return_value = "raw coder output"
+        mock_build_coder.return_value.propose.return_value = "raw coder output"
         cli.main()
 
     mock_clone.assert_called_once_with(from_env, "o/r")
@@ -605,11 +605,11 @@ def test_build_default_workspace_used_when_neither_flag_nor_env_set(
     ), patch(
         "cli.ensure_base_clone", return_value=str(tmp_path)
     ) as mock_clone, patch(
-        "cli.LocalOllamaCoder"
-    ) as mock_coder_cls, patch(
+        "cli.build_coder"
+    ) as mock_build_coder, patch(
         "cli.parse_coder_output", return_value=[]
     ), pytest.raises(SystemExit):
-        mock_coder_cls.return_value.propose.return_value = "raw coder output"
+        mock_build_coder.return_value.propose.return_value = "raw coder output"
         cli.main()
 
     mock_clone.assert_called_once_with(
@@ -625,11 +625,11 @@ def test_build_reports_malformed_coder_output(tmp_path, capsys):
     ), patch("cli._fetch_issue_body", return_value="body"), patch(
         "cli.review_issue", return_value=ready
     ), patch("cli.ensure_base_clone", return_value=str(tmp_path)), patch(
-        "cli.LocalOllamaCoder"
-    ) as mock_coder_cls, patch(
+        "cli.build_coder"
+    ) as mock_build_coder, patch(
         "cli.parse_coder_output", side_effect=MalformedOutputError("bad output")
     ), pytest.raises(SystemExit) as exc:
-        mock_coder_cls.return_value.propose.return_value = "raw coder output"
+        mock_build_coder.return_value.propose.return_value = "raw coder output"
         cli.main()
 
     assert exc.value.code == 1
@@ -645,13 +645,13 @@ def test_build_reports_apply_failure_without_crashing(tmp_path, capsys):
     ), patch("cli._fetch_issue_body", return_value="body"), patch(
         "cli.review_issue", return_value=ready
     ), patch("cli.ensure_base_clone", return_value=str(tmp_path)), patch(
-        "cli.LocalOllamaCoder"
-    ) as mock_coder_cls, patch(
+        "cli.build_coder"
+    ) as mock_build_coder, patch(
         "cli.parse_coder_output", return_value=[change]
     ), patch(
         "cli.apply_file_change", side_effect=WorkspaceError("git apply failed")
     ), pytest.raises(SystemExit) as exc:
-        mock_coder_cls.return_value.propose.return_value = "raw coder output"
+        mock_build_coder.return_value.propose.return_value = "raw coder output"
         cli.main()
 
     assert exc.value.code == 1
@@ -689,11 +689,11 @@ def test_build_registers_running_record_mid_run(tmp_path, _state_dir):
     ), patch("cli._fetch_issue_body", return_value="body"), patch(
         "cli.review_issue", return_value=ready
     ), patch("cli.ensure_base_clone", return_value=str(tmp_path)), patch(
-        "cli.LocalOllamaCoder"
-    ) as mock_coder_cls, patch(
+        "cli.build_coder"
+    ) as mock_build_coder, patch(
         "cli.parse_coder_output", return_value=[change]
     ), patch("cli.apply_file_change"), pytest.raises(SystemExit) as exc:
-        mock_coder_cls.return_value.propose.side_effect = _propose
+        mock_build_coder.return_value.propose.side_effect = _propose
         cli.main()
 
     assert exc.value.code == 0
@@ -711,11 +711,11 @@ def test_build_terminal_record_is_done_on_success(tmp_path, _state_dir):
     ), patch("cli._fetch_issue_body", return_value="body"), patch(
         "cli.review_issue", return_value=ready
     ), patch("cli.ensure_base_clone", return_value=str(tmp_path)), patch(
-        "cli.LocalOllamaCoder"
-    ) as mock_coder_cls, patch(
+        "cli.build_coder"
+    ) as mock_build_coder, patch(
         "cli.parse_coder_output", return_value=[change]
     ), patch("cli.apply_file_change"), pytest.raises(SystemExit) as exc:
-        mock_coder_cls.return_value.propose.return_value = "raw coder output"
+        mock_build_coder.return_value.propose.return_value = "raw coder output"
         cli.main()
 
     assert exc.value.code == 0
@@ -733,9 +733,9 @@ def test_build_terminal_record_is_failed_when_coder_produces_no_output(
     ), patch("cli._fetch_issue_body", return_value="body"), patch(
         "cli.review_issue", return_value=ready
     ), patch("cli.ensure_base_clone", return_value=str(tmp_path)), patch(
-        "cli.LocalOllamaCoder"
-    ) as mock_coder_cls, pytest.raises(SystemExit) as exc:
-        mock_coder_cls.return_value.propose.return_value = ""
+        "cli.build_coder"
+    ) as mock_build_coder, pytest.raises(SystemExit) as exc:
+        mock_build_coder.return_value.propose.return_value = ""
         cli.main()
 
     assert exc.value.code == 1
@@ -756,9 +756,9 @@ def test_build_terminal_record_is_failed_and_reraises_on_exception(
     ), patch("cli._fetch_issue_body", return_value="body"), patch(
         "cli.review_issue", return_value=ready
     ), patch("cli.ensure_base_clone", return_value=str(tmp_path)), patch(
-        "cli.LocalOllamaCoder"
-    ) as mock_coder_cls:
-        mock_coder_cls.return_value.propose.side_effect = RuntimeError("boom")
+        "cli.build_coder"
+    ) as mock_build_coder:
+        mock_build_coder.return_value.propose.side_effect = RuntimeError("boom")
         with pytest.raises(RuntimeError, match="boom"):
             cli.main()
 
@@ -775,9 +775,9 @@ def test_build_terminal_record_is_failed_on_keyboard_interrupt(tmp_path, _state_
     ), patch("cli._fetch_issue_body", return_value="body"), patch(
         "cli.review_issue", return_value=ready
     ), patch("cli.ensure_base_clone", return_value=str(tmp_path)), patch(
-        "cli.LocalOllamaCoder"
-    ) as mock_coder_cls:
-        mock_coder_cls.return_value.propose.side_effect = KeyboardInterrupt
+        "cli.build_coder"
+    ) as mock_build_coder:
+        mock_build_coder.return_value.propose.side_effect = KeyboardInterrupt
         with pytest.raises(KeyboardInterrupt):
             cli.main()
 
@@ -828,11 +828,11 @@ def test_build_records_completed_run_to_history(tmp_path, _state_dir):
     ), patch("cli._fetch_issue_body", return_value="body"), patch(
         "cli.review_issue", return_value=ready
     ), patch("cli.ensure_base_clone", return_value=str(tmp_path)), patch(
-        "cli.LocalOllamaCoder"
-    ) as mock_coder_cls, patch(
+        "cli.build_coder"
+    ) as mock_build_coder, patch(
         "cli.parse_coder_output", return_value=[change]
     ), patch("cli.apply_file_change"), pytest.raises(SystemExit) as exc:
-        mock_coder_cls.return_value.propose.return_value = "raw coder output"
+        mock_build_coder.return_value.propose.return_value = "raw coder output"
         cli.main()
 
     assert exc.value.code == 0
@@ -872,9 +872,9 @@ def test_build_records_failed_run_to_history(tmp_path, _state_dir):
     ), patch("cli._fetch_issue_body", return_value="body"), patch(
         "cli.review_issue", return_value=ready
     ), patch("cli.ensure_base_clone", return_value=str(tmp_path)), patch(
-        "cli.LocalOllamaCoder"
-    ) as mock_coder_cls, pytest.raises(SystemExit) as exc:
-        mock_coder_cls.return_value.propose.return_value = ""
+        "cli.build_coder"
+    ) as mock_build_coder, pytest.raises(SystemExit) as exc:
+        mock_build_coder.return_value.propose.return_value = ""
         cli.main()
 
     assert exc.value.code == 1
@@ -895,9 +895,9 @@ def test_build_records_failed_run_to_history_on_exception(tmp_path, _state_dir):
     ), patch("cli._fetch_issue_body", return_value="body"), patch(
         "cli.review_issue", return_value=ready
     ), patch("cli.ensure_base_clone", return_value=str(tmp_path)), patch(
-        "cli.LocalOllamaCoder"
-    ) as mock_coder_cls:
-        mock_coder_cls.return_value.propose.side_effect = RuntimeError("boom")
+        "cli.build_coder"
+    ) as mock_build_coder:
+        mock_build_coder.return_value.propose.side_effect = RuntimeError("boom")
         with pytest.raises(RuntimeError, match="boom"):
             cli.main()
 
@@ -923,13 +923,13 @@ def test_build_survives_history_recording_failure(tmp_path, _state_dir, capsys):
     ), patch("cli._fetch_issue_body", return_value="body"), patch(
         "cli.review_issue", return_value=ready
     ), patch("cli.ensure_base_clone", return_value=str(tmp_path)), patch(
-        "cli.LocalOllamaCoder"
-    ) as mock_coder_cls, patch(
+        "cli.build_coder"
+    ) as mock_build_coder, patch(
         "cli.parse_coder_output", return_value=[change]
     ), patch("cli.apply_file_change"), patch(
         "cli.record_run", side_effect=OSError("read-only history")
     ), pytest.raises(SystemExit) as exc:
-        mock_coder_cls.return_value.propose.return_value = "raw coder output"
+        mock_build_coder.return_value.propose.return_value = "raw coder output"
         cli.main()
 
     assert exc.value.code == 0
@@ -947,11 +947,11 @@ def test_build_history_failure_does_not_mask_original_exception(tmp_path, _state
     ), patch("cli._fetch_issue_body", return_value="body"), patch(
         "cli.review_issue", return_value=ready
     ), patch("cli.ensure_base_clone", return_value=str(tmp_path)), patch(
-        "cli.LocalOllamaCoder"
-    ) as mock_coder_cls, patch(
+        "cli.build_coder"
+    ) as mock_build_coder, patch(
         "cli.record_run", side_effect=OSError("read-only history")
     ):
-        mock_coder_cls.return_value.propose.side_effect = RuntimeError("boom")
+        mock_build_coder.return_value.propose.side_effect = RuntimeError("boom")
         with pytest.raises(RuntimeError, match="boom"):
             cli.main()
 
@@ -967,11 +967,11 @@ def test_history_command_renders_recorded_free_build_run(tmp_path, _state_dir, c
     ), patch("cli._fetch_issue_body", return_value="body"), patch(
         "cli.review_issue", return_value=ready
     ), patch("cli.ensure_base_clone", return_value=str(tmp_path)), patch(
-        "cli.LocalOllamaCoder"
-    ) as mock_coder_cls, patch(
+        "cli.build_coder"
+    ) as mock_build_coder, patch(
         "cli.parse_coder_output", return_value=[change]
     ), patch("cli.apply_file_change"), pytest.raises(SystemExit):
-        mock_coder_cls.return_value.propose.return_value = "raw coder output"
+        mock_build_coder.return_value.propose.return_value = "raw coder output"
         cli.main()
     capsys.readouterr()  # discard build's own stdout
 
@@ -1001,11 +1001,11 @@ def test_status_command_renders_recorded_free_build_run(tmp_path, _state_dir, ca
     ), patch("cli._fetch_issue_body", return_value="body"), patch(
         "cli.review_issue", return_value=ready
     ), patch("cli.ensure_base_clone", return_value=str(tmp_path)), patch(
-        "cli.LocalOllamaCoder"
-    ) as mock_coder_cls, patch(
+        "cli.build_coder"
+    ) as mock_build_coder, patch(
         "cli.parse_coder_output", return_value=[change]
     ), patch("cli.apply_file_change"), pytest.raises(SystemExit):
-        mock_coder_cls.return_value.propose.return_value = "raw coder output"
+        mock_build_coder.return_value.propose.return_value = "raw coder output"
         cli.main()
     capsys.readouterr()  # discard build's own stdout
 

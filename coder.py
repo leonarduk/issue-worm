@@ -1,17 +1,37 @@
-"""Local-Ollama coder for the free-tier `build` flow.
+"""Coders for the free-tier `build` flow.
 
 `issue-worm-pro`'s `NativeCoder` (`agents/coder.py`) calls
 `cicaid_bridge.fetch_review`, which lives in the private `cicaid-pro`
-package. This shell has no such bridge, so `LocalOllamaCoder` talks
-straight to a local Ollama HTTP endpoint's `/api/generate` and emits the
-same `=== FILE: ... === / === MODE: ... === / === END FILE ===` format
+package. This shell has no such bridge, so its coders talk straight to
+an HTTP endpoint and emit the same
+`=== FILE: ... === / === MODE: ... === / === END FILE ===` format
 `workspace.parse_coder_output` already parses.
+
+Two coders live here, both satisfying the same informal Coder protocol
+(a constructor that accepts optional `endpoint`/`model`, and a
+`propose(workspace_dir, task, files) -> str` that never raises — any
+failure is logged and reported back as `""`):
+
+- `LocalOllamaCoder` — talks to a local/self-hosted Ollama's
+  `/api/generate` (`CODER_MODEL_SOURCE=local`).
+- `RemoteOpenAICoder` — talks to any OpenAI-compatible
+  `/v1/chat/completions` endpoint (`CODER_MODEL_SOURCE=remote`, or
+  `=cloud` for the DeepSeek default — see `build_coder`).
+
+`build_coder` is the factory that picks between them (and the
+not-yet-implemented `claude` source) based on a role's `model_source`,
+reading `REMOTE_LLM_ENDPOINT` / `REMOTE_LLM_MODEL` / `REMOTE_LLM_API_KEY`
+or `DEEPSEEK_API_KEY` / `DEEPSEEK_MODEL` from the environment — see
+`.env-example-openai` / `.env-example-deepseek` in issue-worm-pro for the
+env vars these are meant to match.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path, PurePosixPath
+from typing import Protocol
 
 import requests
 
@@ -22,6 +42,12 @@ logger = logging.getLogger(__name__)
 DEFAULT_OLLAMA_ENDPOINT = "http://localhost:11434"
 DEFAULT_OLLAMA_MODEL = "qwen2.5-coder"
 REQUEST_TIMEOUT_SECONDS = 300
+
+# DeepSeek's API is itself OpenAI-compatible (see .env-example-deepseek in
+# issue-worm-pro), so CODER_MODEL_SOURCE=cloud reuses RemoteOpenAICoder with
+# these as its provider default rather than needing a separate coder class.
+DEFAULT_DEEPSEEK_ENDPOINT = "https://api.deepseek.com"
+DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
 
 
 class LocalOllamaCoder:
@@ -52,6 +78,160 @@ class LocalOllamaCoder:
                 exc_info=True,
             )
             return ""
+
+
+class RemoteOpenAICoder:
+    """Proposes file changes via an OpenAI-compatible `/v1/chat/completions`
+    endpoint — any provider that speaks that shape (OpenAI itself, a
+    self-hosted vLLM/SGLang/Ollama-serving-OpenAI-API host, or DeepSeek,
+    whose API is OpenAI-compatible — see `build_coder`'s `cloud` branch).
+    """
+
+    def __init__(
+        self,
+        endpoint: str | None = None,
+        model: str | None = None,
+        api_key: str | None = None,
+    ):
+        # No fallback default endpoint/model here (unlike LocalOllamaCoder):
+        # there is no sensible generic default for an arbitrary OpenAI-
+        # compatible provider, so build_coder is what supplies one
+        # (required REMOTE_LLM_ENDPOINT for `remote`, DeepSeek's fixed
+        # endpoint for `cloud`) before ever constructing this class.
+        self.endpoint = (endpoint or "").rstrip("/")
+        self.model = model or ""
+        self.api_key = api_key
+
+    def propose(self, workspace_dir: str, task: str, files: list[str]) -> str:
+        """Return raw Coder-formatted output, or "" on any failure — never
+        raises out of this method (matches the Coder protocol).
+        """
+        prompt = _build_prompt(workspace_dir, task, files)
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        try:
+            response = requests.post(
+                f"{self.endpoint}/v1/chat/completions",
+                json={
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": False,
+                },
+                headers=headers,
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+            choices = response.json().get("choices") or []
+            if not choices:
+                return ""
+            return choices[0].get("message", {}).get("content") or ""
+        except (requests.RequestException, ValueError, KeyError, IndexError, TypeError):
+            logger.warning(
+                "Remote LLM request to %s (model %s) failed",
+                self.endpoint,
+                self.model,
+                exc_info=True,
+            )
+            return ""
+
+
+class Coder(Protocol):
+    """Informal protocol both coder classes satisfy — see module docstring."""
+
+    def propose(self, workspace_dir: str, task: str, files: list[str]) -> str: ...
+
+
+class CoderConfigError(ValueError):
+    """A role's model_source is unknown, or is missing config it needs.
+
+    Distinct from a `propose()`-time failure (network error, bad
+    response): this is a startup-time configuration problem — the build
+    can never succeed with it, so it must stop the run with an actionable
+    message rather than construct a coder that will only ever talk to an
+    endpoint that isn't there (issue-worm-pro#590).
+    """
+
+
+def build_coder(role_config) -> Coder:
+    """Construct the right Coder for a role's configured model_source.
+
+    Args:
+        role_config: a `config.RoleConfig` (or anything with the same
+            `model_source` / `ollama_endpoint` / `ollama_model` attributes).
+
+    Returns:
+        A Coder ready to call `.propose(...)`.
+
+    Raises:
+        CoderConfigError: `model_source` is unknown, or is `remote`/`cloud`
+            without the environment variables it needs (see
+            `.env-example-openai` / `.env-example-deepseek` in
+            issue-worm-pro) — or is `claude`, not implemented here yet.
+    """
+    model_source = getattr(role_config, "model_source", "local")
+
+    if model_source == "local":
+        # Unchanged from before this factory existed — local's exact
+        # behaviour is compatibility-critical (issue-worm-pro#590).
+        return LocalOllamaCoder(
+            endpoint=getattr(role_config, "ollama_endpoint", None),
+            model=getattr(role_config, "ollama_model", None),
+        )
+
+    if model_source == "remote":
+        # REMOTE_LLM_* are global, not role-prefixed (like config.py's
+        # MCP_* vars) — a generic OpenAI-compatible endpoint isn't a
+        # per-role concept the way an Ollama host pool is.
+        endpoint = os.getenv("REMOTE_LLM_ENDPOINT")
+        if not endpoint:
+            raise CoderConfigError(
+                "CODER_MODEL_SOURCE=remote requires REMOTE_LLM_ENDPOINT to "
+                "be set (e.g. https://api.openai.com) — see "
+                "issue-worm-pro's .env-example-openai."
+            )
+        api_key = os.getenv("REMOTE_LLM_API_KEY")
+        if not api_key:
+            raise CoderConfigError(
+                "CODER_MODEL_SOURCE=remote requires REMOTE_LLM_API_KEY to "
+                "be set — see issue-worm-pro's .env-example-openai."
+            )
+        model = os.getenv("REMOTE_LLM_MODEL")
+        if not model:
+            raise CoderConfigError(
+                "CODER_MODEL_SOURCE=remote requires REMOTE_LLM_MODEL to be "
+                "set — see issue-worm-pro's .env-example-openai."
+            )
+        return RemoteOpenAICoder(endpoint=endpoint, model=model, api_key=api_key)
+
+    if model_source == "cloud":
+        # DeepSeek is the only `cloud` provider implemented today (its API
+        # is itself OpenAI-compatible, so it reuses RemoteOpenAICoder with
+        # a provider default endpoint/model instead of a bespoke class —
+        # see the module docstring and issue-worm-pro#590's report).
+        api_key = os.getenv("DEEPSEEK_API_KEY")
+        if not api_key:
+            raise CoderConfigError(
+                "CODER_MODEL_SOURCE=cloud requires DEEPSEEK_API_KEY to be "
+                "set — see issue-worm-pro's .env-example-deepseek. (cloud "
+                "currently only supports DeepSeek.)"
+            )
+        model = os.getenv("DEEPSEEK_MODEL") or DEFAULT_DEEPSEEK_MODEL
+        return RemoteOpenAICoder(
+            endpoint=DEFAULT_DEEPSEEK_ENDPOINT, model=model, api_key=api_key
+        )
+
+    if model_source == "claude":
+        raise CoderConfigError(
+            "CODER_MODEL_SOURCE=claude is not implemented by the free "
+            "engine's build coder (issue-worm-pro#590) — use 'local', "
+            "'remote', or 'cloud', or run this issue through issue-worm-pro."
+        )
+
+    raise CoderConfigError(
+        f"CODER_MODEL_SOURCE={model_source!r} is not a supported coder "
+        "target; expected one of 'local', 'remote', 'cloud', or 'claude'."
+    )
 
 
 def _build_prompt(workspace_dir: str, task: str, files: list[str]) -> str:
