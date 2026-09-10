@@ -321,7 +321,7 @@ def test_no_command_prints_help_and_exits_nonzero(capsys):
 def test_version_flag_prints_name_and_exits_zero(monkeypatch, capsys):
     """With pro not installed - forced here so this test doesn't depend on
     whether the machine running it happens to have issue-worm-pro too."""
-    monkeypatch.setattr(cli, "_try_import_pro_cli", lambda: None)
+    monkeypatch.setattr(cli, "metadata_version", MagicMock(side_effect=cli.PackageNotFoundError))
 
     with patch.object(
         sys, "argv", ["issue-worm", "--version"]
@@ -338,7 +338,7 @@ def test_version_flag_skips_the_update_check(monkeypatch, capsys):
     """#195: `issue-worm --version` must be a quick, offline lookup - it
     must not run check_and_prompt() (which makes a live GitHub API call
     outside of tests) before printing the version and exiting."""
-    monkeypatch.setattr(cli, "_try_import_pro_cli", lambda: None)
+    monkeypatch.setattr(cli, "metadata_version", MagicMock(side_effect=cli.PackageNotFoundError))
 
     with patch.object(
         sys, "argv", ["issue-worm", "--version"]
@@ -355,11 +355,13 @@ def test_version_flag_skips_the_update_check(monkeypatch, capsys):
 
 
 def test_version_string_reports_pro_version_when_pro_installed(monkeypatch):
-    """When issue-worm-pro is importable, --version must name its actual
-    installed version instead of always claiming pro is missing (the
-    previous behavior, which misled users who had it installed)."""
-    fake_pro_cli = MagicMock()
-    monkeypatch.setitem(sys.modules, "pro_cli", fake_pro_cli)
+    """When issue-worm-pro is a registered distribution, --version must
+    name its actual installed version instead of always claiming pro is
+    missing (the previous behavior, which misled users who had it
+    installed). Deliberately does NOT touch pro_cli/sys.modules - pro's
+    version is read via importlib.metadata alone, without importing it
+    (see _version_string's docstring: #195 must stay a cheap, offline
+    lookup)."""
     monkeypatch.setattr(cli, "metadata_version", lambda name: "1.2.3")
 
     out = cli._version_string()
@@ -368,21 +370,17 @@ def test_version_string_reports_pro_version_when_pro_installed(monkeypatch):
     assert "public shell" not in out
 
 
-def test_version_string_falls_back_when_pro_is_a_source_checkout(monkeypatch):
-    """pro_cli can import fine from a source checkout added to sys.path
-    without being a registered distribution - that must not crash
-    --version, just report it as unversioned rather than "missing"."""
-    fake_pro_cli = MagicMock()
-    monkeypatch.setitem(sys.modules, "pro_cli", fake_pro_cli)
-
-    def _raise(name):
-        raise cli.PackageNotFoundError(name)
-
-    monkeypatch.setattr(cli, "metadata_version", _raise)
+def test_version_string_does_not_import_pro_cli(monkeypatch):
+    """--version must detect pro via importlib.metadata alone (#195's
+    'quick, offline lookup' contract) - never via an actual `import
+    pro_cli`, which would pull in its whole dependency graph just to
+    answer a version check."""
+    monkeypatch.setitem(sys.modules, "pro_cli", None)  # import pro_cli -> ImportError if attempted
+    monkeypatch.setattr(cli, "metadata_version", lambda name: "1.2.3")
 
     out = cli._version_string()
 
-    assert "issue-worm-pro unknown (source checkout)" in out
+    assert "issue-worm-pro 1.2.3" in out
 
 
 def test_version_flag_still_wins_when_combined_with_pro_dispatch(monkeypatch, capsys):

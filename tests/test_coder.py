@@ -88,6 +88,21 @@ def test_propose_notes_missing_file(tmp_path):
     assert "does not exist yet" in prompt
 
 
+def test_propose_returns_empty_string_when_build_prompt_raises(tmp_path):
+    """propose() must never raise (the Coder protocol's contract) even
+    when _build_prompt itself blows up, not just when the HTTP call
+    does."""
+    coder = LocalOllamaCoder()
+
+    with patch("coder._build_prompt", side_effect=RuntimeError("boom")), patch(
+        "coder.requests.post"
+    ) as mock_post:
+        result = coder.propose(str(tmp_path), "task", ["a.py"])
+
+    assert result == ""
+    mock_post.assert_not_called()
+
+
 def test_propose_returns_empty_string_on_request_exception(tmp_path):
     coder = LocalOllamaCoder()
 
@@ -206,6 +221,21 @@ def test_remote_propose_omits_auth_header_without_api_key(tmp_path):
         coder.propose(str(tmp_path), "task", ["a.py"])
 
     assert "Authorization" not in mock_post.call_args[1]["headers"]
+
+
+def test_remote_propose_returns_empty_string_when_build_prompt_raises(tmp_path):
+    """propose() must never raise (the Coder protocol's contract) even
+    when _build_prompt itself blows up, not just when the HTTP call
+    does."""
+    coder = RemoteOpenAICoder(endpoint="https://api.openai.com", model="gpt-5")
+
+    with patch("coder._build_prompt", side_effect=RuntimeError("boom")), patch(
+        "coder.requests.post"
+    ) as mock_post:
+        result = coder.propose(str(tmp_path), "task", ["a.py"])
+
+    assert result == ""
+    mock_post.assert_not_called()
 
 
 def test_remote_propose_returns_empty_string_on_request_exception(tmp_path):

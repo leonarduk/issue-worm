@@ -518,20 +518,18 @@ def _version_string() -> str:
     always agree.
 
     Reports issue-worm-pro's own installed version alongside this shell's
-    when pro is present (#detected via the same `_try_import_pro_cli`
-    probe `main` uses for dispatch), rather than always claiming pro is
-    missing - that used to mislead users who *had* installed it.
+    when pro is present, rather than always claiming pro is missing (that
+    used to mislead users who *had* installed it) - via
+    `importlib.metadata` alone, deliberately NOT `_try_import_pro_cli`:
+    #195 makes `--version` a quick, offline lookup, and actually importing
+    `pro_cli` would pull in its whole dependency graph (agents.triage,
+    scheduler, usage_metering, ...) just to answer a version check.
     """
     version = installed_version() or "unknown (source checkout)"
-    if _try_import_pro_cli() is None:
-        return f"{PACKAGE_NAME} {version} (public shell — triage/poll require issue-worm-pro)"
-
     try:
         pro_version = metadata_version("issue-worm-pro")
     except PackageNotFoundError:
-        # pro_cli imports fine but isn't a registered distribution -
-        # a source checkout added to sys.path rather than pip-installed.
-        pro_version = "unknown (source checkout)"
+        return f"{PACKAGE_NAME} {version} (public shell — triage/poll require issue-worm-pro)"
     return f"{PACKAGE_NAME} {version} + issue-worm-pro {pro_version} (triage/poll/full build enabled)"
 
 

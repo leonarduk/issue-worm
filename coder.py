@@ -72,7 +72,11 @@ class LocalOllamaCoder:
         """Return raw Coder-formatted output, or "" on any failure — never
         raises out of this method (matches the Coder protocol).
         """
-        prompt = _build_prompt(workspace_dir, task, files)
+        try:
+            prompt = _build_prompt(workspace_dir, task, files)
+        except Exception:  # noqa: BLE001 - _build_prompt is local/pure; any failure here is "cannot propose", not a bug to propagate
+            logger.warning("Failed to build prompt for %s", workspace_dir, exc_info=True)
+            return ""
         try:
             response = requests.post(
                 f"{self.endpoint}/api/generate",
@@ -119,7 +123,11 @@ class RemoteOpenAICoder:
         """Return raw Coder-formatted output, or "" on any failure — never
         raises out of this method (matches the Coder protocol).
         """
-        prompt = _build_prompt(workspace_dir, task, files)
+        try:
+            prompt = _build_prompt(workspace_dir, task, files)
+        except Exception:  # noqa: BLE001 - _build_prompt is local/pure; any failure here is "cannot propose", not a bug to propagate
+            logger.warning("Failed to build prompt for %s", workspace_dir, exc_info=True)
+            return ""
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
