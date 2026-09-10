@@ -41,11 +41,16 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_OLLAMA_ENDPOINT = "http://localhost:11434"
 DEFAULT_OLLAMA_MODEL = "qwen2.5-coder"
+# Overridable per invocation via CODER_REQUEST_TIMEOUT_SECONDS (read lazily
+# in build_coder, like every other env-sourced setting here) - this is only
+# the fallback for direct construction (tests, or a Coder built by hand).
 REQUEST_TIMEOUT_SECONDS = 300
 
 # DeepSeek's API is itself OpenAI-compatible (see .env-example-deepseek in
 # issue-worm-pro), so CODER_MODEL_SOURCE=cloud reuses RemoteOpenAICoder with
 # these as its provider default rather than needing a separate coder class.
+# Both are overridable via DEEPSEEK_ENDPOINT / DEEPSEEK_MODEL (build_coder's
+# `cloud` branch) - these are only the fallback when unset.
 DEFAULT_DEEPSEEK_ENDPOINT = "https://api.deepseek.com"
 DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
 
@@ -53,9 +58,15 @@ DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
 class LocalOllamaCoder:
     """Proposes file changes for one issue via a local Ollama instance."""
 
-    def __init__(self, endpoint: str | None = None, model: str | None = None):
+    def __init__(
+        self,
+        endpoint: str | None = None,
+        model: str | None = None,
+        timeout: int = REQUEST_TIMEOUT_SECONDS,
+    ):
         self.endpoint = (endpoint or DEFAULT_OLLAMA_ENDPOINT).rstrip("/")
         self.model = model or DEFAULT_OLLAMA_MODEL
+        self.timeout = timeout
 
     def propose(self, workspace_dir: str, task: str, files: list[str]) -> str:
         """Return raw Coder-formatted output, or "" on any failure — never
@@ -66,7 +77,7 @@ class LocalOllamaCoder:
             response = requests.post(
                 f"{self.endpoint}/api/generate",
                 json={"model": self.model, "prompt": prompt, "stream": False},
-                timeout=REQUEST_TIMEOUT_SECONDS,
+                timeout=self.timeout,
             )
             response.raise_for_status()
             return response.json().get("response") or ""
@@ -92,6 +103,7 @@ class RemoteOpenAICoder:
         endpoint: str | None = None,
         model: str | None = None,
         api_key: str | None = None,
+        timeout: int = REQUEST_TIMEOUT_SECONDS,
     ):
         # No fallback default endpoint/model here (unlike LocalOllamaCoder):
         # there is no sensible generic default for an arbitrary OpenAI-
@@ -101,6 +113,7 @@ class RemoteOpenAICoder:
         self.endpoint = (endpoint or "").rstrip("/")
         self.model = model or ""
         self.api_key = api_key
+        self.timeout = timeout
 
     def propose(self, workspace_dir: str, task: str, files: list[str]) -> str:
         """Return raw Coder-formatted output, or "" on any failure — never
@@ -119,7 +132,7 @@ class RemoteOpenAICoder:
                     "stream": False,
                 },
                 headers=headers,
-                timeout=REQUEST_TIMEOUT_SECONDS,
+                timeout=self.timeout,
             )
             response.raise_for_status()
             choices = response.json().get("choices") or []
@@ -170,13 +183,18 @@ def build_coder(role_config) -> Coder:
             issue-worm-pro) — or is `claude`, not implemented here yet.
     """
     model_source = getattr(role_config, "model_source", "local")
+    # Global, not role-prefixed - one HTTP timeout for whichever coder this
+    # factory returns, same as REMOTE_LLM_*/DEEPSEEK_* below.
+    timeout = _env_int("CODER_REQUEST_TIMEOUT_SECONDS", REQUEST_TIMEOUT_SECONDS)
 
     if model_source == "local":
-        # Unchanged from before this factory existed — local's exact
-        # behaviour is compatibility-critical (issue-worm-pro#590).
+        # Endpoint/model here are unchanged from before this factory
+        # existed — local's exact behaviour is compatibility-critical
+        # (issue-worm-pro#590).
         return LocalOllamaCoder(
             endpoint=getattr(role_config, "ollama_endpoint", None),
             model=getattr(role_config, "ollama_model", None),
+            timeout=timeout,
         )
 
     if model_source == "remote":
@@ -202,7 +220,7 @@ def build_coder(role_config) -> Coder:
                 "CODER_MODEL_SOURCE=remote requires REMOTE_LLM_MODEL to be "
                 "set — see issue-worm-pro's .env-example-openai."
             )
-        return RemoteOpenAICoder(endpoint=endpoint, model=model, api_key=api_key)
+        return RemoteOpenAICoder(endpoint=endpoint, model=model, api_key=api_key, timeout=timeout)
 
     if model_source == "cloud":
         # DeepSeek is the only `cloud` provider implemented today (its API
@@ -216,9 +234,10 @@ def build_coder(role_config) -> Coder:
                 "set — see issue-worm-pro's .env-example-deepseek. (cloud "
                 "currently only supports DeepSeek.)"
             )
+        endpoint = os.getenv("DEEPSEEK_ENDPOINT") or DEFAULT_DEEPSEEK_ENDPOINT
         model = os.getenv("DEEPSEEK_MODEL") or DEFAULT_DEEPSEEK_MODEL
         return RemoteOpenAICoder(
-            endpoint=DEFAULT_DEEPSEEK_ENDPOINT, model=model, api_key=api_key
+            endpoint=endpoint, model=model, api_key=api_key, timeout=timeout
         )
 
     if model_source == "claude":
@@ -232,6 +251,23 @@ def build_coder(role_config) -> Coder:
         f"CODER_MODEL_SOURCE={model_source!r} is not a supported coder "
         "target; expected one of 'local', 'remote', 'cloud', or 'claude'."
     )
+
+
+def _env_int(name: str, default: int) -> int:
+    """Parse an int env var, falling back to ``default`` on invalid values.
+
+    Mirrors config.py's own `_env_int` - duplicated rather than imported
+    since coder.py otherwise has no dependency on config.py beyond the
+    `RoleConfig`-shaped duck type `build_coder` already documents.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("%s=%r is not an integer; using %s", name, raw, default)
+        return default
 
 
 def _build_prompt(workspace_dir: str, task: str, files: list[str]) -> str:

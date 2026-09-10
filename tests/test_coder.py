@@ -10,6 +10,7 @@ from coder import (
     DEFAULT_DEEPSEEK_MODEL,
     DEFAULT_OLLAMA_ENDPOINT,
     DEFAULT_OLLAMA_MODEL,
+    REQUEST_TIMEOUT_SECONDS,
     CoderConfigError,
     LocalOllamaCoder,
     RemoteOpenAICoder,
@@ -303,6 +304,46 @@ def test_build_coder_cloud_missing_api_key_raises(monkeypatch):
 
     with pytest.raises(CoderConfigError, match="DEEPSEEK_API_KEY"):
         build_coder(RoleConfig(model_source="cloud"))
+
+
+def test_build_coder_cloud_reads_deepseek_endpoint_env_var(monkeypatch):
+    """DEEPSEEK_ENDPOINT overrides the default the same way DEEPSEEK_MODEL
+    already does - a self-hosted or regional DeepSeek-compatible endpoint
+    shouldn't require a code change to use."""
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.setenv("DEEPSEEK_ENDPOINT", "https://deepseek.internal.example")
+
+    coder = build_coder(RoleConfig(model_source="cloud"))
+
+    assert coder.endpoint == "https://deepseek.internal.example"
+
+
+@pytest.mark.parametrize("model_source", ["local", "cloud"])
+def test_build_coder_uses_default_timeout_when_unset(model_source, monkeypatch):
+    monkeypatch.delenv("CODER_REQUEST_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+
+    coder = build_coder(RoleConfig(model_source=model_source))
+
+    assert coder.timeout == REQUEST_TIMEOUT_SECONDS
+
+
+@pytest.mark.parametrize("model_source", ["local", "cloud"])
+def test_build_coder_reads_request_timeout_env_var(model_source, monkeypatch):
+    monkeypatch.setenv("CODER_REQUEST_TIMEOUT_SECONDS", "45")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+
+    coder = build_coder(RoleConfig(model_source=model_source))
+
+    assert coder.timeout == 45
+
+
+def test_build_coder_invalid_timeout_env_var_falls_back_to_default(monkeypatch):
+    monkeypatch.setenv("CODER_REQUEST_TIMEOUT_SECONDS", "not-a-number")
+
+    coder = build_coder(RoleConfig(model_source="local"))
+
+    assert coder.timeout == REQUEST_TIMEOUT_SECONDS
 
 
 def test_build_coder_claude_raises_not_implemented():
