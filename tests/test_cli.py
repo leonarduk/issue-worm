@@ -21,7 +21,17 @@ from workspace import FileChange, MalformedOutputError, WorkspaceError
 
 
 @pytest.mark.parametrize("command", ["triage", "poll"])
-def test_core_command_reports_unavailable(command, capsys):
+def test_core_command_reports_unavailable(command, monkeypatch, capsys):
+    """Force `pro_cli` absent regardless of what's actually installed in
+    this environment (#192) - mirroring how
+    test_core_command_dispatches_to_pro_cli_when_installed forces it
+    *present* via the same sys.modules patch. Without this, a dev machine
+    with issue-worm-pro installed editable alongside this repo would have
+    cli.main() dispatch to the real pro_cli instead of exercising the
+    "not installed" path this test means to cover - firing a live triage
+    pass or an unterminating poll loop."""
+    monkeypatch.setitem(sys.modules, "pro_cli", None)
+
     with patch.object(sys, "argv", ["issue-worm", command]), pytest.raises(
         SystemExit
     ) as exc:
