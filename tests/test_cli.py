@@ -20,6 +20,31 @@ from review import ReviewResult
 from workspace import FileChange, MalformedOutputError, WorkspaceError
 
 
+@pytest.fixture
+def _pro_cli_absent(monkeypatch):
+    """Force `import pro_cli` to fail for the duration of a test (#219).
+
+    `cli.main()` probes for a real, importable `issue-worm-pro` *before*
+    any of this shell's own free-tier logic runs, and dispatches to it
+    when present (#352). On a dev machine with both `issue-worm` and
+    `issue-worm-pro` installed editable side by side, `pro_cli` genuinely
+    is importable - so without this fixture, the `build`/`history`/
+    `status` tests below that exercise `cli.main()` end-to-end (patching
+    `cli.review_issue`, `cli.ensure_base_clone`, `cli.LocalOllamaCoder`,
+    etc.) would silently dispatch to the real `pro_cli.main()` instead,
+    and none of those patched internals would ever run.
+
+    `monkeypatch.setitem(sys.modules, "pro_cli", None)` makes `import
+    pro_cli` raise `ModuleNotFoundError` (name="pro_cli"), exactly like a
+    genuinely-absent module - matching how
+    `test_core_command_dispatches_to_pro_cli_when_installed` already
+    forces it *present* the same way. Applied via
+    `@pytest.mark.usefixtures("_pro_cli_absent")` rather than repeating
+    the monkeypatch call in every test body below.
+    """
+    monkeypatch.setitem(sys.modules, "pro_cli", None)
+
+
 @pytest.mark.parametrize("command", ["triage", "poll"])
 def test_core_command_reports_unavailable(command, monkeypatch, capsys):
     """Force `pro_cli` absent regardless of what's actually installed in
@@ -339,6 +364,7 @@ def test_version_flag_still_wins_when_combined_with_pro_dispatch(monkeypatch, ca
     assert "issue-worm" in capsys.readouterr().out
 
 
+@pytest.mark.usefixtures("_pro_cli_absent")
 def test_build_without_repo_fails_fast(capsys):
     with patch.object(
         sys, "argv", ["issue-worm", "build", "5"]
@@ -349,6 +375,7 @@ def test_build_without_repo_fails_fast(capsys):
     assert "--repo" in capsys.readouterr().err
 
 
+@pytest.mark.usefixtures("_pro_cli_absent")
 def test_build_without_issue_fails_fast(capsys):
     with patch.object(
         sys, "argv", ["issue-worm", "build", "--repo", "o/r"]
@@ -363,6 +390,7 @@ def test_build_without_issue_fails_fast(capsys):
     "bad_repo",
     ["no-slash", "too/many/slashes", "owner/", "/name", "owner/name\n"],
 )
+@pytest.mark.usefixtures("_pro_cli_absent")
 def test_build_rejects_malformed_repo(bad_repo, capsys):
     with patch.object(
         sys, "argv", ["issue-worm", "build", "5", "--repo", bad_repo]
@@ -373,6 +401,7 @@ def test_build_rejects_malformed_repo(bad_repo, capsys):
     assert "Invalid --repo" in capsys.readouterr().err
 
 
+@pytest.mark.usefixtures("_pro_cli_absent")
 def test_build_accepts_well_formed_repo(capsys):
     # Valid --repo should get past validation and fail later, at the
     # (mocked) fetch step, not at the format check.
@@ -387,6 +416,7 @@ def test_build_accepts_well_formed_repo(capsys):
     assert "Invalid --repo" not in capsys.readouterr().err
 
 
+@pytest.mark.usefixtures("_pro_cli_absent")
 def test_build_multiple_issues_warns_and_uses_first(capsys):
     ready = ReviewResult(ready=True, files=["a.py"], done="it works")
     with patch.object(
@@ -403,6 +433,7 @@ def test_build_multiple_issues_warns_and_uses_first(capsys):
     assert "[2, 3]" in err
 
 
+@pytest.mark.usefixtures("_pro_cli_absent")
 def test_build_reports_fetch_failure(capsys):
     # _fetch_issue_body prints its own specific reason before returning
     # None; _run_build must not print a second, redundant message.
@@ -417,6 +448,7 @@ def test_build_reports_fetch_failure(capsys):
     assert capsys.readouterr().err == ""
 
 
+@pytest.mark.usefixtures("_pro_cli_absent")
 def test_build_reports_not_ready_issue(capsys):
     not_ready = ReviewResult(ready=False, message="needs FILES/DONE")
     with patch.object(
@@ -430,6 +462,7 @@ def test_build_reports_not_ready_issue(capsys):
     assert "needs FILES/DONE" in capsys.readouterr().err
 
 
+@pytest.mark.usefixtures("_pro_cli_absent")
 def test_build_dry_run_stops_before_coder(capsys):
     ready = ReviewResult(ready=True, files=["a.py"], done="it works")
     with patch.object(
@@ -448,6 +481,7 @@ def test_build_dry_run_stops_before_coder(capsys):
     assert "it works" in out
 
 
+@pytest.mark.usefixtures("_pro_cli_absent")
 def test_build_reports_empty_coder_output(tmp_path, capsys):
     ready = ReviewResult(ready=True, files=["a.py"], done="it works")
     with patch.object(
@@ -464,6 +498,7 @@ def test_build_reports_empty_coder_output(tmp_path, capsys):
     assert "no output" in capsys.readouterr().err
 
 
+@pytest.mark.usefixtures("_pro_cli_absent")
 def test_build_applies_changes_end_to_end(tmp_path, capsys):
     ready = ReviewResult(ready=True, files=["a.py"], done="it works")
     change = FileChange(path="a.py", mode="FULL", body="print(1)\n")
@@ -487,6 +522,7 @@ def test_build_applies_changes_end_to_end(tmp_path, capsys):
     assert "a.py" in out
 
 
+@pytest.mark.usefixtures("_pro_cli_absent")
 def test_build_workspace_flag_overrides_default(tmp_path, monkeypatch):
     monkeypatch.delenv("WORKSPACE_ROOT", raising=False)
     ready = ReviewResult(ready=True, files=["a.py"], done="it works")
@@ -510,6 +546,7 @@ def test_build_workspace_flag_overrides_default(tmp_path, monkeypatch):
     mock_clone.assert_called_once_with(custom, "o/r")
 
 
+@pytest.mark.usefixtures("_pro_cli_absent")
 def test_build_workspace_flag_beats_env_var(tmp_path, monkeypatch):
     monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path / "from-env"))
     ready = ReviewResult(ready=True, files=["a.py"], done="it works")
@@ -533,6 +570,7 @@ def test_build_workspace_flag_beats_env_var(tmp_path, monkeypatch):
     mock_clone.assert_called_once_with(from_flag, "o/r")
 
 
+@pytest.mark.usefixtures("_pro_cli_absent")
 def test_build_env_var_used_when_no_workspace_flag(tmp_path, monkeypatch):
     from_env = str(tmp_path / "from-env")
     monkeypatch.setenv("WORKSPACE_ROOT", from_env)
@@ -554,6 +592,7 @@ def test_build_env_var_used_when_no_workspace_flag(tmp_path, monkeypatch):
     mock_clone.assert_called_once_with(from_env, "o/r")
 
 
+@pytest.mark.usefixtures("_pro_cli_absent")
 def test_build_default_workspace_used_when_neither_flag_nor_env_set(
     tmp_path, monkeypatch
 ):
@@ -578,6 +617,7 @@ def test_build_default_workspace_used_when_neither_flag_nor_env_set(
     )
 
 
+@pytest.mark.usefixtures("_pro_cli_absent")
 def test_build_reports_malformed_coder_output(tmp_path, capsys):
     ready = ReviewResult(ready=True, files=["a.py"], done="it works")
     with patch.object(
@@ -596,6 +636,7 @@ def test_build_reports_malformed_coder_output(tmp_path, capsys):
     assert "bad output" in capsys.readouterr().err
 
 
+@pytest.mark.usefixtures("_pro_cli_absent")
 def test_build_reports_apply_failure_without_crashing(tmp_path, capsys):
     ready = ReviewResult(ready=True, files=["a.py"], done="it works")
     change = FileChange(path="a.py", mode="FULL", body="print(1)\n")
@@ -632,6 +673,7 @@ def _read_registry_record(state_dir, task_id):
     return json.loads((state_dir / f"{task_id}.json").read_text(encoding="utf-8"))
 
 
+@pytest.mark.usefixtures("_pro_cli_absent")
 def test_build_registers_running_record_mid_run(tmp_path, _state_dir):
     """A `running` record must exist for the task while the coder runs."""
     ready = ReviewResult(ready=True, files=["a.py"], done="it works")
@@ -660,6 +702,7 @@ def test_build_registers_running_record_mid_run(tmp_path, _state_dir):
     assert seen["record"]["phase"] == "coder"
 
 
+@pytest.mark.usefixtures("_pro_cli_absent")
 def test_build_terminal_record_is_done_on_success(tmp_path, _state_dir):
     ready = ReviewResult(ready=True, files=["a.py"], done="it works")
     change = FileChange(path="a.py", mode="FULL", body="print(1)\n")
@@ -680,6 +723,7 @@ def test_build_terminal_record_is_done_on_success(tmp_path, _state_dir):
     assert record["status"] == "done"
 
 
+@pytest.mark.usefixtures("_pro_cli_absent")
 def test_build_terminal_record_is_failed_when_coder_produces_no_output(
     tmp_path, _state_dir
 ):
@@ -699,6 +743,7 @@ def test_build_terminal_record_is_failed_when_coder_produces_no_output(
     assert record["status"] == "failed"
 
 
+@pytest.mark.usefixtures("_pro_cli_absent")
 def test_build_terminal_record_is_failed_and_reraises_on_exception(
     tmp_path, _state_dir
 ):
@@ -721,6 +766,7 @@ def test_build_terminal_record_is_failed_and_reraises_on_exception(
     assert record["status"] == "failed"
 
 
+@pytest.mark.usefixtures("_pro_cli_absent")
 def test_build_terminal_record_is_failed_on_keyboard_interrupt(tmp_path, _state_dir):
     """Ctrl-C mid-build must not leave the record stuck at `running`."""
     ready = ReviewResult(ready=True, files=["a.py"], done="it works")
@@ -739,6 +785,7 @@ def test_build_terminal_record_is_failed_on_keyboard_interrupt(tmp_path, _state_
     assert record["status"] == "failed"
 
 
+@pytest.mark.usefixtures("_pro_cli_absent")
 def test_build_dry_run_never_registers(tmp_path, _state_dir):
     """No workspace is ever prepared for --dry-run, so there is nothing to
     register - the state dir must stay untouched."""
@@ -769,6 +816,7 @@ def _read_history_records(repo_path):
     return [json.loads(line) for line in lines]
 
 
+@pytest.mark.usefixtures("_pro_cli_absent")
 def test_build_records_completed_run_to_history(tmp_path, _state_dir):
     """A successful free build appends exactly one parseable record, with
     the fields `_format_history_line` renders populated (not blank), and
@@ -814,6 +862,7 @@ def test_build_records_completed_run_to_history(tmp_path, _state_dir):
     assert registry_record["task_id"] == record["task_id"]
 
 
+@pytest.mark.usefixtures("_pro_cli_absent")
 def test_build_records_failed_run_to_history(tmp_path, _state_dir):
     """A failed build (empty Coder output) is recorded with a failed
     status rather than silently vanishing from history."""
@@ -835,6 +884,7 @@ def test_build_records_failed_run_to_history(tmp_path, _state_dir):
     assert records[0]["task_id"] == "o_r-5"
 
 
+@pytest.mark.usefixtures("_pro_cli_absent")
 def test_build_records_failed_run_to_history_on_exception(tmp_path, _state_dir):
     """A crash mid-build (e.g. the Coder erroring) is still recorded as
     failed, and the original exception still propagates - matching the
@@ -856,6 +906,7 @@ def test_build_records_failed_run_to_history_on_exception(tmp_path, _state_dir):
     assert records[0]["status"] == "failed"
 
 
+@pytest.mark.usefixtures("_pro_cli_absent")
 def test_build_survives_history_recording_failure(tmp_path, _state_dir, capsys):
     """An unwritable history file must not fail an otherwise-successful
     build.
@@ -886,6 +937,7 @@ def test_build_survives_history_recording_failure(tmp_path, _state_dir, capsys):
     assert "read-only history" not in capsys.readouterr().err
 
 
+@pytest.mark.usefixtures("_pro_cli_absent")
 def test_build_history_failure_does_not_mask_original_exception(tmp_path, _state_dir):
     """When the build itself crashes *and* history recording then fails,
     the caller still sees the real cause, not the bookkeeping error."""
@@ -904,6 +956,7 @@ def test_build_history_failure_does_not_mask_original_exception(tmp_path, _state
             cli.main()
 
 
+@pytest.mark.usefixtures("_pro_cli_absent")
 def test_history_command_renders_recorded_free_build_run(tmp_path, _state_dir, capsys):
     """End-to-end: a free `build`'s record is readable back through the
     shipped `history` command, with populated (not blank) columns."""
@@ -936,6 +989,7 @@ def test_history_command_renders_recorded_free_build_run(tmp_path, _state_dir, c
     assert "it works" in out
 
 
+@pytest.mark.usefixtures("_pro_cli_absent")
 def test_status_command_renders_recorded_free_build_run(tmp_path, _state_dir, capsys):
     """End-to-end: a free `build`'s record shows up in `status`'s recent-
     history section too, not just active runs (#181's asymmetry this issue
