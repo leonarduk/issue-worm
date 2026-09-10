@@ -36,6 +36,15 @@ def test_defaults_used_when_not_configured():
     assert coder.model == DEFAULT_OLLAMA_MODEL
 
 
+def test_local_propose_passes_timeout_to_requests_post(tmp_path):
+    coder = LocalOllamaCoder(endpoint="http://example.invalid", model="test-model", timeout=45)
+
+    with patch("coder.requests.post", return_value=_mock_response({"response": "x"})) as mock_post:
+        coder.propose(str(tmp_path), "task", ["a.py"])
+
+    assert mock_post.call_args[1]["timeout"] == 45
+
+
 def test_endpoint_trailing_slash_is_stripped():
     coder = LocalOllamaCoder(endpoint="http://localhost:11434/")
 
@@ -173,6 +182,19 @@ def test_remote_propose_posts_openai_chat_completions_shape(tmp_path):
     assert "do the thing" in payload["messages"][0]["content"]
     headers = mock_post.call_args[1]["headers"]
     assert headers["Authorization"] == "Bearer sk-test"
+
+
+def test_remote_propose_passes_timeout_to_requests_post(tmp_path):
+    coder = RemoteOpenAICoder(
+        endpoint="https://api.openai.com", model="gpt-5", api_key="sk-test", timeout=45
+    )
+
+    with patch(
+        "coder.requests.post", return_value=_mock_chat_response("x")
+    ) as mock_post:
+        coder.propose(str(tmp_path), "task", ["a.py"])
+
+    assert mock_post.call_args[1]["timeout"] == 45
 
 
 def test_remote_propose_omits_auth_header_without_api_key(tmp_path):
@@ -318,20 +340,30 @@ def test_build_coder_cloud_reads_deepseek_endpoint_env_var(monkeypatch):
     assert coder.endpoint == "https://deepseek.internal.example"
 
 
-@pytest.mark.parametrize("model_source", ["local", "cloud"])
+def _set_env_for_model_source(monkeypatch, model_source: str) -> None:
+    """Set whatever env vars build_coder requires for `model_source` to
+    succeed, so the timeout tests below can be parametrized across all
+    three env-backed sources symmetrically."""
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.setenv("REMOTE_LLM_ENDPOINT", "https://api.openai.com")
+    monkeypatch.setenv("REMOTE_LLM_MODEL", "gpt-5")
+    monkeypatch.setenv("REMOTE_LLM_API_KEY", "sk-test")
+
+
+@pytest.mark.parametrize("model_source", ["local", "remote", "cloud"])
 def test_build_coder_uses_default_timeout_when_unset(model_source, monkeypatch):
     monkeypatch.delenv("CODER_REQUEST_TIMEOUT_SECONDS", raising=False)
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    _set_env_for_model_source(monkeypatch, model_source)
 
     coder = build_coder(RoleConfig(model_source=model_source))
 
     assert coder.timeout == REQUEST_TIMEOUT_SECONDS
 
 
-@pytest.mark.parametrize("model_source", ["local", "cloud"])
+@pytest.mark.parametrize("model_source", ["local", "remote", "cloud"])
 def test_build_coder_reads_request_timeout_env_var(model_source, monkeypatch):
     monkeypatch.setenv("CODER_REQUEST_TIMEOUT_SECONDS", "45")
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    _set_env_for_model_source(monkeypatch, model_source)
 
     coder = build_coder(RoleConfig(model_source=model_source))
 

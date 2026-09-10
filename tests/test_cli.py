@@ -16,6 +16,7 @@ import requests
 
 import cli
 import registry
+from coder import CoderConfigError
 from review import ReviewResult
 from workspace import FileChange, MalformedOutputError, WorkspaceError
 
@@ -922,6 +923,28 @@ def test_build_records_failed_run_to_history(tmp_path, _state_dir):
 
 
 @pytest.mark.usefixtures("_pro_cli_absent")
+def test_build_records_failed_run_when_build_coder_raises_config_error(tmp_path, _state_dir, capsys):
+    """build_coder's CoderConfigError (e.g. CODER_MODEL_SOURCE=cloud with no
+    DEEPSEEK_API_KEY) must still hit the same finally-block bookkeeping as
+    any other build failure - a startup-time config problem shouldn't be
+    the one failure mode that vanishes from history (#590)."""
+    ready = ReviewResult(ready=True, files=["a.py"], done="it works")
+    with patch.object(
+        sys, "argv", ["issue-worm", "build", "5", "--repo", "o/r"]
+    ), patch("cli._fetch_issue_body", return_value="body"), patch(
+        "cli.review_issue", return_value=ready
+    ), patch("cli.ensure_base_clone", return_value=str(tmp_path)), patch(
+        "cli.build_coder", side_effect=CoderConfigError("DEEPSEEK_API_KEY is required")
+    ), pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 1
+    assert "DEEPSEEK_API_KEY is required" in capsys.readouterr().err
+    records = _read_history_records(tmp_path)
+    assert len(records) == 1
+    assert records[0]["status"] == "failed"
+
+
 def test_build_records_failed_run_to_history_on_exception(tmp_path, _state_dir):
     """A crash mid-build (e.g. the Coder erroring) is still recorded as
     failed, and the original exception still propagates - matching the
