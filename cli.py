@@ -16,6 +16,8 @@ import re
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as metadata_version
 from pathlib import Path
 
 import requests
@@ -513,9 +515,24 @@ def _run_status(args) -> int:
 def _version_string() -> str:
     """The exact text `--version` prints - shared by the fast path in
     `main()` (#195) and argparse's own `--version` action below, so both
-    always agree."""
+    always agree.
+
+    Reports issue-worm-pro's own installed version alongside this shell's
+    when pro is present (#detected via the same `_try_import_pro_cli`
+    probe `main` uses for dispatch), rather than always claiming pro is
+    missing - that used to mislead users who *had* installed it.
+    """
     version = installed_version() or "unknown (source checkout)"
-    return f"{PACKAGE_NAME} {version} (public shell — triage/poll require issue-worm-pro)"
+    if _try_import_pro_cli() is None:
+        return f"{PACKAGE_NAME} {version} (public shell — triage/poll require issue-worm-pro)"
+
+    try:
+        pro_version = metadata_version("issue-worm-pro")
+    except PackageNotFoundError:
+        # pro_cli imports fine but isn't a registered distribution -
+        # a source checkout added to sys.path rather than pip-installed.
+        pro_version = "unknown (source checkout)"
+    return f"{PACKAGE_NAME} {version} + issue-worm-pro {pro_version} (triage/poll/full build enabled)"
 
 
 def _build_parser() -> argparse.ArgumentParser:

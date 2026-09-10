@@ -317,7 +317,11 @@ def test_no_command_prints_help_and_exits_nonzero(capsys):
     assert exc.value.code == 1
 
 
-def test_version_flag_prints_name_and_exits_zero(capsys):
+def test_version_flag_prints_name_and_exits_zero(monkeypatch, capsys):
+    """With pro not installed - forced here so this test doesn't depend on
+    whether the machine running it happens to have issue-worm-pro too."""
+    monkeypatch.setattr(cli, "_try_import_pro_cli", lambda: None)
+
     with patch.object(
         sys, "argv", ["issue-worm", "--version"]
     ), pytest.raises(SystemExit) as exc:
@@ -333,6 +337,8 @@ def test_version_flag_skips_the_update_check(monkeypatch, capsys):
     """#195: `issue-worm --version` must be a quick, offline lookup - it
     must not run check_and_prompt() (which makes a live GitHub API call
     outside of tests) before printing the version and exiting."""
+    monkeypatch.setattr(cli, "_try_import_pro_cli", lambda: None)
+
     with patch.object(
         sys, "argv", ["issue-worm", "--version"]
     ), patch("cli.check_and_prompt") as mock_check, pytest.raises(
@@ -345,6 +351,37 @@ def test_version_flag_skips_the_update_check(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "issue-worm" in out
     assert "public shell" in out
+
+
+def test_version_string_reports_pro_version_when_pro_installed(monkeypatch):
+    """When issue-worm-pro is importable, --version must name its actual
+    installed version instead of always claiming pro is missing (the
+    previous behavior, which misled users who had it installed)."""
+    fake_pro_cli = MagicMock()
+    monkeypatch.setitem(sys.modules, "pro_cli", fake_pro_cli)
+    monkeypatch.setattr(cli, "metadata_version", lambda name: "1.2.3")
+
+    out = cli._version_string()
+
+    assert "issue-worm-pro 1.2.3" in out
+    assert "public shell" not in out
+
+
+def test_version_string_falls_back_when_pro_is_a_source_checkout(monkeypatch):
+    """pro_cli can import fine from a source checkout added to sys.path
+    without being a registered distribution - that must not crash
+    --version, just report it as unversioned rather than "missing"."""
+    fake_pro_cli = MagicMock()
+    monkeypatch.setitem(sys.modules, "pro_cli", fake_pro_cli)
+
+    def _raise(name):
+        raise cli.PackageNotFoundError(name)
+
+    monkeypatch.setattr(cli, "metadata_version", _raise)
+
+    out = cli._version_string()
+
+    assert "issue-worm-pro unknown (source checkout)" in out
 
 
 def test_version_flag_still_wins_when_combined_with_pro_dispatch(monkeypatch, capsys):
