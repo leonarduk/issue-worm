@@ -945,6 +945,7 @@ def test_build_records_failed_run_when_build_coder_raises_config_error(tmp_path,
     assert records[0]["status"] == "failed"
 
 
+@pytest.mark.usefixtures("_pro_cli_absent")
 def test_build_records_failed_run_to_history_on_exception(tmp_path, _state_dir):
     """A crash mid-build (e.g. the Coder erroring) is still recorded as
     failed, and the original exception still propagates - matching the
