@@ -144,6 +144,13 @@ runs:
         # everything, then the reset below unstages just .issue-worm) and
         # a dogfooding repo (already gitignored: -A skips it, and the
         # reset is then a harmless no-op) with the same two commands.
+        # `git reset -- .issue-worm` also no-ops cleanly (exit 0) when the
+        # path doesn't exist at all - verified locally, since `set -e`
+        # above would otherwise abort the step on a nonexistent pathspec.
+        # If a consumer has `.issue-worm` *tracked* (committed by an older
+        # version of this action, before it was gitignored), this reset
+        # will unstage its changes along with everything else here - a
+        # deliberate tradeoff, since untracking it is the point.
         git add -A .
         git reset -- .issue-worm
         git commit -m "issue-worm: apply changes for #${{ inputs.issue }}" -m "Closes #${{ inputs.issue }}"
