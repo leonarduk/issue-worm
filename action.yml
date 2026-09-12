@@ -121,6 +121,12 @@ runs:
         # UX) supersedes the previous attempt instead of piling up
         # branches - hence --force below, always overwriting this branch.
         branch="issue-worm/issue-${{ inputs.issue }}"
+        # Captured before checkout -b so the PR-body diff below has an
+        # explicit base to compare against, rather than assuming HEAD~1
+        # (DeepSeek flagged HEAD~1 as fragile on review of #278 - it happens
+        # to work today since this step makes exactly one commit, but that's
+        # an implicit invariant a future change could silently break).
+        base_commit="$(git rev-parse HEAD)"
         git config user.name "issue-worm[bot]"
         git config user.email "issue-worm[bot]@users.noreply.github.com"
         git checkout -b "$branch"
@@ -167,14 +173,26 @@ runs:
           # The action itself has no LLM-generated summary to draw on (that's
           # the Coder's job, and its output is already applied as file
           # edits, not prose) - so build the body from what's mechanically
-          # available: which files changed (this branch is always exactly
-          # one commit ahead of the base, so HEAD~1 is always the right
-          # diff base) and the issue it closes, rather than shipping the
-          # old placeholder text that told the reader nothing the title and
-          # "Closes #N" trailer didn't already say (issue-worm-pro#764).
-          changed_files="$(git diff --name-only HEAD~1 | sed 's/^/- /')"
-          pr_body="$(printf 'Automated single-pass change from the free issue-worm engine for #%s.\n\n**Files changed:**\n%s\n\nCloses #%s' \
-            "${{ inputs.issue }}" "$changed_files" "${{ inputs.issue }}")"
+          # available: which files changed against $base_commit (captured
+          # above, before this branch existed) and the issue it closes,
+          # rather than shipping the old placeholder text that told the
+          # reader nothing the title and "Closes #N" trailer didn't already
+          # say (issue-worm-pro#764). `|| true` so a diff failure degrades
+          # to an empty section instead of aborting under `set -e` and
+          # leaving no PR at all - the one outcome worse than a bare body.
+          changed_files="$(git diff --name-only "$base_commit" | sed 's/^/- /' || true)"
+          # Branches on $() directly rather than composing through an
+          # intermediate "files section" variable: command substitution
+          # strips ALL trailing newlines, so a $(printf ...) meant to hold
+          # "list\n\n" silently collapses to "list" with no separator,
+          # running the last filename straight into "Closes #N" on one line.
+          if [ -n "$changed_files" ]; then
+            pr_body="$(printf 'Automated single-pass change from the free issue-worm engine for #%s.\n\n**Files changed:**\n%s\n\nCloses #%s' \
+              "${{ inputs.issue }}" "$changed_files" "${{ inputs.issue }}")"
+          else
+            pr_body="$(printf 'Automated single-pass change from the free issue-worm engine for #%s.\n\nCloses #%s' \
+              "${{ inputs.issue }}" "${{ inputs.issue }}")"
+          fi
           gh pr create \
             --repo "${{ github.repository }}" \
             --head "$branch" \
