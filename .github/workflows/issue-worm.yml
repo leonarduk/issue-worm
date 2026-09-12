@@ -43,10 +43,11 @@ jobs:
           # once leonarduk/issue-worm-pro#584 ships.
           # license-key: ${{ secrets.ISSUE_WORM_LICENSE }}
         env:
-          # The free engine's coder always talks to an Ollama-compatible
-          # /api/generate endpoint (coder.py) - there is no local Ollama on
-          # a GitHub-hosted runner, so this must point at one this runner
-          # can reach (a self-hosted Ollama box, or one exposed over the
-          # network). Without it the build step fails at the coder call.
-          CODER_OLLAMA_ENDPOINT: ${{ secrets.CODER_OLLAMA_ENDPOINT }}
-          CODER_OLLAMA_MODEL: ${{ secrets.CODER_OLLAMA_MODEL }}
+          # cloud -> DeepSeek, via the OpenAI-compatible coder (#590).
+          # `local` (the default) needs a reachable Ollama endpoint, which
+          # a GitHub-hosted runner has no route to - this repo dogfoods on
+          # ubuntu-latest, so it needs a coder that works with no network
+          # access to anything of ours. DEEPSEEK_API_KEY is already a repo
+          # secret here (used by .github/workflows/deepseek-pr-review.yml).
+          CODER_MODEL_SOURCE: cloud
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
