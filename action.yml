@@ -180,7 +180,10 @@ runs:
           # say (issue-worm-pro#764). `|| true` so a diff failure degrades
           # to an empty section instead of aborting under `set -e` and
           # leaving no PR at all - the one outcome worse than a bare body.
-          changed_files="$(git diff --name-only "$base_commit" | sed 's/^/- /' || true)"
+          # Diffs against HEAD, not the working tree: a tracked .issue-worm
+          # is still modified on disk after the `git reset` above unstaged
+          # it, so a working-tree diff would list files never committed.
+          changed_files="$(git diff --name-only "$base_commit" HEAD | sed 's/^/- /' || true)"
           # Branches on $() directly rather than composing through an
           # intermediate "files section" variable: command substitution
           # strips ALL trailing newlines, so a $(printf ...) meant to hold
