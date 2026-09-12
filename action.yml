@@ -125,16 +125,27 @@ runs:
         git config user.email "issue-worm[bot]@users.noreply.github.com"
         git checkout -b "$branch"
         # Excludes .issue-worm/ (this run's own bookkeeping - history.jsonl,
-        # the in-flight registry) via pathspec rather than `git add -A`
-        # unconditionally: it's meaningful only for this one ephemeral job,
-        # not the consumer's source tree, and a repo that has never used
-        # issue-worm before has no reason to already gitignore it. Both of
-        # this action's own two home repos do gitignore it, which is
-        # exactly why this went unnoticed until a genuinely unrelated
-        # third-party repo (leonarduk/cicaid#36) surfaced it: every commit
-        # from every future first-time adopter would otherwise carry an
-        # ever-growing, meaningless JSONL file into their history.
-        git add -A -- . ':!.issue-worm'
+        # the in-flight registry): it's meaningful only for this one
+        # ephemeral job, not the consumer's source tree, and a repo that
+        # has never used issue-worm before has no reason to already
+        # gitignore it - every commit from a first-time adopter would
+        # otherwise carry an ever-growing, meaningless JSONL file into
+        # their history (leonarduk/cicaid#36).
+        #
+        # Plain `git add -A .` plus an explicit `git reset -- .issue-worm`
+        # afterward, NOT `git add -A -- . ':!.issue-worm'` (issue #270):
+        # that pathspec-negation form dies with "The following paths are
+        # ignored by one of your .gitignore files" and exit 1 whenever
+        # .issue-worm *is* already gitignored - which is true for this
+        # action's own two home repos (issue-worm, issue-worm-pro) that
+        # dogfood it on themselves. `git add -A .` never errors on ignored
+        # paths regardless of whether they're gitignored yet, so it
+        # handles both a fresh consumer repo (nothing gitignored: adds
+        # everything, then the reset below unstages just .issue-worm) and
+        # a dogfooding repo (already gitignored: -A skips it, and the
+        # reset is then a harmless no-op) with the same two commands.
+        git add -A .
+        git reset -- .issue-worm
         git commit -m "issue-worm: apply changes for #${{ inputs.issue }}" -m "Closes #${{ inputs.issue }}"
         git push --force origin "$branch"
 
