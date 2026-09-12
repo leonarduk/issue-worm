@@ -22,6 +22,12 @@ permissions:
   contents: write
   pull-requests: write
 
+# Serialise releases: two cut close together would otherwise race on the
+# force-push of the floating v1 tag in the last step.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
@@ -38,6 +44,18 @@ jobs:
         run: |
           python -m pip install --upgrade pip build
           python -m build
+
+      # Fail loudly, before anything is published, if setuptools-scm derived
+      # the version from anything but this tag - e.g. the floating v1 tag,
+      # should a future setuptools-scm stop honouring pyproject.toml's
+      # describe_command.
+      - name: Check the wheel version matches the tag
+        run: |
+          expected="dist/issue_worm-${GITHUB_REF_NAME#v}-py3-none-any.whl"
+          if [ ! -f "$expected" ]; then
+            echo "::error::Expected $expected but built: $(ls dist)"
+            exit 1
+          fi
 
       # Publish the installable artifacts before the best-effort README
       # update below. A README-update failure must not leave a published
@@ -115,7 +133,10 @@ jobs:
         run: |
           # A patch release cut on an older line (v0.2.9 after v0.3.0 is
           # out) must not drag v1 backwards - only the newest release moves it.
-          newest="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n 1)"
+          # Full vX.Y.Z only: a git glob would also admit v0.3.0-rc1, which
+          # v:refname sorts above v0.3.0 by default, so releasing v0.3.0
+          # would wrongly leave v1 behind.
+          newest="$(git tag --list 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)"
           if [ "$newest" != "$GITHUB_REF_NAME" ]; then
             echo "::notice::$GITHUB_REF_NAME is not the newest release ($newest); leaving $ACTION_MAJOR_TAG where it is."
             exit 0

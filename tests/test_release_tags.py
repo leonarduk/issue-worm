@@ -57,7 +57,10 @@ def _github_filter_matches(pattern: str, ref: str) -> bool:
     # GitHub's filter syntax, for the subset release.yml uses or has used:
     # literal characters, [0-9] ranges, "+" (one or more of the preceding
     # character) and "*" (any run of characters except "/"). A filter must
-    # match the whole ref name.
+    # match the whole ref name. Anything else fails here rather than being
+    # silently mis-modelled.
+    unmodelled = re.sub(r"\[0-9\]|[A-Za-z0-9.+*]", "", pattern)
+    assert not unmodelled, f"extend _github_filter_matches to model {unmodelled!r}"
     regex = (
         re.escape(pattern)
         .replace(r"\[0\-9\]", "[0-9]")
@@ -75,26 +78,31 @@ def test_release_trigger_ignores_floating_major_tag():
     assert any(_github_filter_matches(f, "v0.2.3") for f in filters)
 
 
-def test_version_is_derived_from_semver_tag_not_floating_tag(tmp_path):
+@pytest.mark.parametrize("annotated", [True, False], ids=["annotated-v1", "lightweight-v1"])
+def test_version_is_derived_from_semver_tag_not_floating_tag(tmp_path, annotated):
     _git(tmp_path, "init", "-q")
     _commit(tmp_path, "a")
     _git(tmp_path, "tag", "v0.2.3")
-    # Annotated: the case where git describe's default --match picks v1.
-    _git(tmp_path, "tag", "-a", "v1", "-m", "v1")
+    # Annotated is the case where git describe's default --match picks v1.
+    _git(tmp_path, "tag", *(["-a", "v1", "-m", "v1"] if annotated else ["v1"]))
 
     assert _git(tmp_path, *_describe_command()[1:]).startswith("v0.2.3-0-g")
 
 
-def test_newest_release_guard_ignores_floating_tag(tmp_path):
+def test_newest_release_guard_only_considers_full_semver_tags(tmp_path):
     step = RELEASE_YML.read_text(encoding="utf-8")
-    listing = re.search(r"git tag --list '([^']+)' --sort=-v:refname", step)
-    assert listing, "release.yml's newest-release guard changed shape"
+    guard = re.search(r"git tag --list '([^']+)' --sort=-v:refname \| grep -E '([^']+)'", step)
+    assert guard, "release.yml's newest-release guard changed shape"
+    glob, pattern = guard.groups()
 
     _git(tmp_path, "init", "-q")
-    for tag in ("v0.2.3", "v0.3.0", "v0.2.9"):
+    # v1 is the floating tag itself; v0.3.0-rc1 and v0.3.0.1 both sort above
+    # v0.3.0 under v:refname but aren't releases, so none of them may stop
+    # v1 moving to v0.3.0.
+    for tag in ("v0.2.3", "v0.3.0-rc1", "v0.3.0", "v0.3.0.1", "v0.2.9"):
         _commit(tmp_path, tag)
         _git(tmp_path, "tag", tag)
     _git(tmp_path, "tag", "v1")
 
-    newest = _git(tmp_path, "tag", "--list", listing.group(1), "--sort=-v:refname").splitlines()[0]
-    assert newest == "v0.3.0"
+    listed = _git(tmp_path, "tag", "--list", glob, "--sort=-v:refname").splitlines()
+    assert next(t for t in listed if re.fullmatch(pattern, t)) == "v0.3.0"
