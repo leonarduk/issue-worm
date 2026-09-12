@@ -391,6 +391,7 @@ class _RollbackGuard:
         self._armed = True
 
     def disarm(self) -> None:
+        """Mark the guard disarmed so __exit__ won't roll back the workspace; the caller has confirmed the changes should be kept."""
         self._armed = False
 
     def __enter__(self) -> "_RollbackGuard":
