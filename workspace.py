@@ -53,7 +53,7 @@ import shutil
 import subprocess
 import tempfile
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 logger = logging.getLogger(__name__)
@@ -104,10 +104,26 @@ _FILE_SECTION_RE = re.compile(
     r"(?:\r?\n)=== END FILE ===[ \t]*(?:\r?\n|$)",
     re.DOTALL,
 )
+# The same section grammar split into its two anchors, for the tolerant
+# pass in parse_coder_output: a section that the Coder never closed with an
+# `=== END FILE ===` line is ended at the next FILE header or at EOF
+# instead. Across 169 recorded Coder attempts (2026-09-12 analysis), 31 were
+# rejected outright for a missing terminator and 20 of those were under
+# 15 KB - the model had written the whole file/diff and then trailed off
+# into prose, not hit a token cap. Rejecting the entire response for a
+# missing sign-off line threw away work that was otherwise applicable.
+_FILE_HEADER_RE = re.compile(
+    r"^=== FILE: (?P<path>.+?) ===[ \t]*\r?\n"
+    r"=== MODE: (?P<mode>FULL|DIFF) ===[ \t]*\r?\n",
+    re.MULTILINE,
+)
+# Whole-line only, for the same #254 reason as above.
+_FILE_END_RE = re.compile(r"^=== END FILE ===[ \t]*$", re.MULTILINE)
 
 # A unified diff's own syntax always starts with one of these; used to find
 # where a MODE: DIFF section's diff body starts amid surrounding prose.
 _DIFF_START_RE = re.compile(r"^(diff --git |--- )", re.MULTILINE)
+_HUNK_START_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@", re.MULTILINE)
 _DIFF_LINE_PREFIXES = ("diff --git", "index ", "---", "+++", "@@", " ", "+", "-", "\\")
 # Modalities may wrap a section's body in a Markdown fenced code block
 # (```diff / ```python / bare ``` / ...) in addition to the mandated
@@ -156,6 +172,12 @@ class FileChange:
     path: str
     mode: str  # MODE_FULL | MODE_DIFF
     body: str
+    # How the section was recovered when the Coder's output was not
+    # strictly to spec (None when it was): "implicit-terminator" for a
+    # section with no `=== END FILE ===` line, ended at the next FILE
+    # header or EOF instead. Surfaced so callers can count how often the
+    # recovery, rather than the Coder, made the attempt applicable.
+    recovery: str | None = None
 
 
 @dataclass
@@ -165,6 +187,12 @@ class WorkspaceResult:
     test_output: str = ""
     diff_output: str = ""
     error: str | None = None
+    # One entry per recovery step that was needed to parse or apply this
+    # attempt (see FileChange.recovery and apply_file_change's ladder), in
+    # the form "<path>: <what>". Empty when the Coder's output parsed and
+    # applied strictly. Not a failure signal - the attempt still has to
+    # pass CI - but the record of how much slack it took.
+    recovery: list[str] = field(default_factory=list)
 
 
 # Subprocess timeout bounds (#45): local git operations are fast, but a
@@ -458,17 +486,31 @@ def _strip_edge_fences(text: str) -> str:
     return "\n".join(lines)
 
 
-def _extract_diff(body: str) -> str | None:
+def _extract_diff(body: str, path: str | None = None) -> str | None:
     """Pull the unified-diff hunk out of a MODE: DIFF section's body.
 
     NativeCoder's prompt asks for "a unified diff ... with a brief
     explanation" (agents/coder.py), so the body can have prose before
     and/or after the actual diff. Finds where diff syntax starts, then
-    stops at the first line that no longer looks diff-shaped.
+    stops at the first line that no longer looks diff-shaped. ``path`` is
+    the section's declared file, used to synthesise the ``---``/``+++``
+    header when the Coder sent bare hunks.
     """
     match = _DIFF_START_RE.search(body)
     if not match:
-        return None
+        # No `diff --git` / `---` header at all. A Coder that was told the
+        # file's path in the FILE marker often answers with bare hunks
+        # (`@@ -n,m +n,m @@` onward, usually inside a ```diff fence): the
+        # header is redundant with the marker, so synthesise it for the
+        # declared path rather than reject the section (2026-09-12: every
+        # attempt on a 123 KB file failed this way twice before a retry
+        # happened to include the header).
+        hunk = _HUNK_START_RE.search(body)
+        if not hunk or not path:
+            return None
+        body = f"--- a/{path}\n+++ b/{path}\n" + body[hunk.start():]
+        match = _DIFF_START_RE.search(body)
+        assert match is not None
 
     lines = body[match.start():].splitlines()
     end = len(lines)
@@ -490,6 +532,55 @@ def _extract_diff(body: str) -> str | None:
     return diff_text.rstrip("\n") + "\n"
 
 
+def _split_sections(output: str) -> list[tuple[str, str, str, str | None]]:
+    """Split a Coder response into (path, mode, body, recovery) sections.
+
+    A section runs from its FILE/MODE header to its `=== END FILE ===` line
+    (recovery None). One with no terminator before the next header, or
+    before EOF, is ended there instead and tagged with a recovery note -
+    the Coder's sign-off line is a parsing convenience, not part of the
+    change, and its absence alone should not discard an otherwise
+    complete file or diff (see _FILE_HEADER_RE). Text before the first
+    header is ignored, as before.
+    """
+    headers = list(_FILE_HEADER_RE.finditer(output))
+    sections: list[tuple[str, str, str, str | None]] = []
+    for index, header in enumerate(headers):
+        region_end = headers[index + 1].start() if index + 1 < len(headers) else len(output)
+        region = output[header.end():region_end]
+        end_marker = _FILE_END_RE.search(region)
+        if end_marker:
+            body = region[: end_marker.start()]
+            recovery = None
+        else:
+            body = region
+            recovery = (
+                "implicit-terminator: ended at next FILE header"
+                if index + 1 < len(headers)
+                else "implicit-terminator: ended at end of output"
+            )
+        sections.append((header.group("path"), header.group("mode"), body, recovery))
+    return sections
+
+
+def _drop_prose_after_closing_fence(body: str) -> str:
+    """For a fenced full-file body, drop anything after the closing fence.
+
+    Only applies when the body *opens* with a fence line: then the first
+    later fence line closes the file content and whatever follows is the
+    model's commentary. An unfenced body is returned unchanged - there is
+    no reliable way to tell trailing prose from trailing code, and the
+    Verifier is the backstop for that.
+    """
+    lines = body.splitlines()
+    if not lines or not _FENCE_RE.match(lines[0]):
+        return body
+    for index in range(1, len(lines)):
+        if _FENCE_RE.match(lines[index]):
+            return "\n".join(lines[: index + 1])
+    return body
+
+
 def parse_coder_output(output: str, declared_files: list[str]) -> list[FileChange]:
     """Split a Coder response into per-file changes, rejecting anything
     that isn't safe to hand to git apply / a direct file write.
@@ -501,8 +592,8 @@ def parse_coder_output(output: str, declared_files: list[str]) -> list[FileChang
     if not output or not output.strip():
         raise MalformedOutputError("coder output is empty")
 
-    matches = list(_FILE_SECTION_RE.finditer(output))
-    if not matches:
+    sections = _split_sections(output)
+    if not sections:
         raise MalformedOutputError(
             "no '=== FILE: ... === / === MODE: ... === / === END FILE ===' "
             "sections found in coder output"
@@ -516,10 +607,10 @@ def parse_coder_output(output: str, declared_files: list[str]) -> list[FileChang
     changes: list[FileChange] = []
     seen_paths: set[str] = set()
 
-    for match in matches:
-        path = match.group("path").strip()
-        mode = match.group("mode").strip()
-        body = match.group("body").strip("\n")
+    for path, mode, body, recovery in sections:
+        path = path.strip()
+        mode = mode.strip()
+        body = body.strip("\n")
 
         normalized = sanitize_file_path(path)
         if normalized is None:
@@ -539,13 +630,23 @@ def parse_coder_output(output: str, declared_files: list[str]) -> list[FileChang
         seen_paths.add(path)
 
         if mode == MODE_DIFF:
-            diff_text = _extract_diff(body)
+            diff_text = _extract_diff(body, path)
             if diff_text is None:
                 raise MalformedOutputError(
                     f"MODE: DIFF section for {path!r} contains no parseable unified diff"
                 )
+            if not _DIFF_START_RE.search(body):
+                recovery = (
+                    f"{recovery}; synthesised diff header" if recovery else "synthesised diff header"
+                )
             body = diff_text
         else:
+            if recovery is not None:
+                # An unterminated FULL section may carry the model's
+                # sign-off prose after the file content. When the content
+                # was fenced, the closing fence marks where the file ends
+                # and everything after it is commentary, not code.
+                body = _drop_prose_after_closing_fence(body)
             # A full-file rewrite wrapped in a Markdown fence (```python /
             # bare ``` / ...) is not part of the file's real content, and
             # there's no verifier here (free-tier build, #401) to catch the
@@ -554,7 +655,14 @@ def parse_coder_output(output: str, declared_files: list[str]) -> list[FileChang
             # for its own fencing (issue #248).
             body = _strip_edge_fences(body)
 
-        changes.append(FileChange(path=path, mode=mode, body=body))
+        if recovery is not None:
+            logger.warning(
+                "parse_coder_output: FILE section for %r has no "
+                "'=== END FILE ===' line; %s",
+                path,
+                recovery,
+            )
+        changes.append(FileChange(path=path, mode=mode, body=body, recovery=recovery))
 
     missing = declared - seen_paths
     if missing:
@@ -570,13 +678,74 @@ def parse_coder_output(output: str, declared_files: list[str]) -> list[FileChang
     return changes
 
 
-def apply_file_change(repo_path: str, change: FileChange) -> None:
+# How a MODE: DIFF body is handed to `git apply`, strictest first. The
+# recorded failure data (2026-09-12: 41 of 169 Coder attempts rejected with
+# "patch does not apply", every one a context mismatch, none a corrupt
+# patch) says an LLM's diff usually has the right +/- lines and slightly
+# wrong context: whitespace drift, a blank line more or less, a line number
+# that moved. Re-applying the same 30 failed sections against their real
+# base commit: 8 applied strictly, 26 with one line of context, 28 with
+# none. Each rung below is tried with `--check` first so nothing lands
+# partially; the rung that applied is reported so callers can see how
+# much slack the attempt needed. `-C0` is last and is the risky rung: with
+# no context a pure-addition hunk lands where its header says, so the CI
+# checks that follow are the only thing standing between it and a
+# misplaced insertion. `--3way` is deliberately absent: it needs the
+# `index` blob ids an LLM diff never carries.
+def _every_hunk_has_a_preimage(diff_text: str) -> bool:
+    """True when each `@@` hunk in ``diff_text`` removes at least one line.
+
+    Such a hunk carries a preimage git must match before applying, even
+    with zero context; a pure-addition hunk carries none and would be
+    placed by line number alone (see apply_file_change's -C0 rung).
+    """
+    hunks = re.split(r"(?m)^@@ .*$", diff_text)[1:]
+    if not hunks:
+        return False
+    return all(
+        any(line.startswith("-") and not line.startswith("---") for line in hunk.splitlines())
+        for hunk in hunks
+    )
+
+
+_APPLY_LADDER: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("strict", ("--recount",)),
+    ("ignore-whitespace", ("--recount", "--ignore-whitespace")),
+    ("context-1", ("--recount", "-C1")),
+    ("context-1-ignore-whitespace", ("--recount", "-C1", "--ignore-whitespace")),
+)
+# The zero-context rung is OFF by default. It trades a loud failure (the
+# patch does not apply: obvious, costs one retry) for a quiet one (the
+# patch applies in the wrong place, tests stay green, a reviewer gets a
+# wrong PR) - the wrong trade for an unattended tool. It rescued 4 of 30
+# recorded failures that -C1 did not, and one of those placements was a
+# live unmergeable PR. Opt in per process with ISSUE_WORM_APPLY_CONTEXT0=1;
+# even then it is skipped for hunks that only add lines (no preimage).
+_CONTEXT0_RUNG: tuple[str, tuple[str, ...]] = ("context-0", ("--recount", "-C0"))
+APPLY_CONTEXT0_ENV = "ISSUE_WORM_APPLY_CONTEXT0"
+
+
+def _apply_ladder() -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """The rungs to try, with the opt-in zero-context rung appended only
+    when :data:`APPLY_CONTEXT0_ENV` is set to a truthy value."""
+    if os.environ.get(APPLY_CONTEXT0_ENV, "").strip().lower() in ("1", "true", "yes", "on"):
+        return _APPLY_LADDER + (_CONTEXT0_RUNG,)
+    return _APPLY_LADDER
+
+
+def apply_file_change(repo_path: str, change: FileChange) -> str | None:
     """Apply one parsed file change: a direct write for MODE_FULL, or
     `git apply` (pre-checked with --check) for MODE_DIFF.
 
-    Raises MalformedOutputError if a diff doesn't apply cleanly against the
+    For a diff, the rungs of :data:`_APPLY_LADDER` are tried in order and
+    the first whose `--check` passes is applied. Returns None for a
+    full-file write or a strictly-applied diff, else the name of the rung
+    that was needed ("ignore-whitespace", "context-1", ...).
+
+    Raises MalformedOutputError if no rung applies cleanly against the
     current tree - checked before the real apply so a bad patch can't
-    partially land.
+    partially land. The error carries the STRICT rung's git message, which
+    names the first mismatching hunk and is the most useful to a reader.
     """
     if change.mode == MODE_FULL:
         target = Path(repo_path) / change.path
@@ -585,17 +754,40 @@ def apply_file_change(repo_path: str, change: FileChange) -> None:
         if content and not content.endswith("\n"):
             content += "\n"
         target.write_text(content, encoding="utf-8")
-        return
+        return None
 
-    check_result = _run_git(
-        repo_path, "apply", "--check", "--recount", "-",
-        check=False, input_text=change.body,
-    )
-    if check_result.returncode != 0:
-        raise MalformedOutputError(
-            f"diff for {change.path!r} does not apply: {check_result.stderr.strip()}"
+    strict_error: str | None = None
+    for rung, flags in _apply_ladder():
+        if rung == "context-0" and not _every_hunk_has_a_preimage(change.body):
+            # With no context, a hunk that only ADDS lines is anchored by
+            # nothing but its line number, so git will happily put it
+            # wherever the (often wrong) header says. Seen live: an
+            # `import os` meant for the top of a test module landed as its
+            # last line, CI green, diff unmergeable. A hunk that removes or
+            # replaces lines still has a preimage that must match, so -C0
+            # stays available for those.
+            continue
+        check_result = _run_git(
+            repo_path, "apply", "--check", *flags, "-",
+            check=False, input_text=change.body,
         )
-    _run_git(repo_path, "apply", "--recount", "-", input_text=change.body)
+        if check_result.returncode != 0:
+            if strict_error is None:
+                strict_error = check_result.stderr.strip()
+            continue
+        _run_git(repo_path, "apply", *flags, "-", input_text=change.body)
+        if rung != "strict":
+            logger.warning(
+                "apply_file_change: diff for %r applied only with %s (%s)",
+                change.path,
+                rung,
+                " ".join(flags),
+            )
+            return rung
+        return None
+    raise MalformedOutputError(
+        f"diff for {change.path!r} does not apply: {strict_error}"
+    )
 
 
 def get_working_diff(repo_path: str, declared_files: list[str] | None = None) -> str:
@@ -1229,11 +1421,20 @@ def run_revision_attempt(
         except MalformedOutputError as exc:
             return WorkspaceResult(success=False, error=f"{MALFORMED_OUTPUT_ERROR_PREFIX} {exc}")
 
+        recovery = [
+            f"{change.path}: {change.recovery}" for change in changes if change.recovery
+        ]
         try:
             for change in changes:
-                apply_file_change(repo_path, change)
+                rung = apply_file_change(repo_path, change)
+                if rung is not None:
+                    recovery.append(f"{change.path}: applied with {rung}")
         except MalformedOutputError as exc:
-            return WorkspaceResult(success=False, error=f"{APPLY_FAILED_ERROR_PREFIX} {exc}")
+            return WorkspaceResult(
+                success=False,
+                error=f"{APPLY_FAILED_ERROR_PREFIX} {exc}",
+                recovery=recovery,
+            )
 
         # Stage the sanitized paths parse_coder_output actually applied,
         # not the raw declared_files - Triage's FILES: entries are often
@@ -1248,7 +1449,13 @@ def run_revision_attempt(
                 test_output=test_output,
                 diff_output=diff_output,
                 error="CI checks failed",
+                recovery=recovery,
             )
 
         guard.disarm()
-        return WorkspaceResult(success=True, test_output=test_output, diff_output=diff_output)
+        return WorkspaceResult(
+            success=True,
+            test_output=test_output,
+            diff_output=diff_output,
+            recovery=recovery,
+        )

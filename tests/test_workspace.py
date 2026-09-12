@@ -24,6 +24,9 @@ from workspace import (
     _redact_url,
     _repo_identity,
     _run_git,
+    _APPLY_LADDER,
+    APPLY_CONTEXT0_ENV,
+    _apply_ladder,
     CI_GIT_IDENTITY_NAME,
     apply_file_change,
     ci_check_env,
@@ -890,6 +893,267 @@ def test_run_revision_attempt_forwards_extra_env_to_ci_checks(repo):
 
     assert result.success is True
     assert m_ci.call_args.kwargs["extra_env"] == extra
+
+
+# --- coder output recovery: implicit terminators and the apply ladder -------
+#
+# 2026-09-12 analysis of 169 recorded Coder attempts: 31 rejected for a
+# missing `=== END FILE ===` line (20 of them under 15 KB - trailing prose,
+# not truncation) and 41 rejected by `git apply` for context mismatches
+# (26 of 30 applied with one context line, 28 with none). Both are
+# mechanical and recoverable without re-prompting.
+
+
+def test_parse_accepts_a_final_section_with_no_end_marker():
+    output = (
+        "=== FILE: a.py ===\n=== MODE: FULL ===\n"
+        "value = 2\n"
+    )
+    changes = parse_coder_output(output, ["a.py"])
+
+    assert [c.path for c in changes] == ["a.py"]
+    assert changes[0].body == "value = 2"
+    assert changes[0].recovery == "implicit-terminator: ended at end of output"
+
+
+def test_parse_ends_an_unterminated_section_at_the_next_file_header():
+    output = (
+        "=== FILE: a.py ===\n=== MODE: FULL ===\n"
+        "value = 2\n"
+        "=== FILE: b.py ===\n=== MODE: FULL ===\n"
+        "other = 3\n=== END FILE ===\n"
+    )
+    changes = parse_coder_output(output, ["a.py", "b.py"])
+
+    assert changes[0].body == "value = 2"
+    assert changes[0].recovery == "implicit-terminator: ended at next FILE header"
+    assert changes[1].body == "other = 3"
+    assert changes[1].recovery is None
+
+
+def test_parse_unterminated_diff_section_drops_trailing_prose():
+    """The diff extractor already stops at the first non-diff line, so a
+    DIFF section that trails off into explanation still yields just the diff."""
+    output = (
+        "=== FILE: a.py ===\n=== MODE: DIFF ===\n"
+        "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-value = 1\n+value = 2\n"
+        "\nThis change bumps the value. No other behaviour changes.\n"
+    )
+    changes = parse_coder_output(output, ["a.py"])
+
+    assert changes[0].body == "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-value = 1\n+value = 2\n"
+    assert changes[0].recovery is not None
+
+
+def test_parse_unterminated_fenced_full_section_drops_prose_after_closing_fence():
+    output = (
+        "=== FILE: a.py ===\n=== MODE: FULL ===\n"
+        "```python\nvalue = 2\n```\n"
+        "The file now sets value to 2.\n"
+    )
+    changes = parse_coder_output(output, ["a.py"])
+
+    assert changes[0].body == "value = 2"
+
+
+def test_parse_unterminated_unfenced_full_section_is_taken_verbatim():
+    """No fence means no reliable boundary between code and commentary: the
+    body is kept whole and the Verifier is the backstop."""
+    output = (
+        "=== FILE: a.py ===\n=== MODE: FULL ===\n"
+        "value = 2\n\nThe file now sets value to 2.\n"
+    )
+    changes = parse_coder_output(output, ["a.py"])
+
+    assert changes[0].body == "value = 2\n\nThe file now sets value to 2."
+
+
+def test_parse_strict_end_marker_still_bounds_the_section():
+    """A terminated section still ends exactly at its END FILE line, and a
+    mid-line lookalike inside the content is still not a terminator (#254)."""
+    output = (
+        "=== FILE: a.py ===\n=== MODE: FULL ===\n"
+        "text = 'contains === END FILE === mid-line'\n"
+        "=== END FILE ===\n"
+        "Trailing commentary that must not be part of the file.\n"
+    )
+    changes = parse_coder_output(output, ["a.py"])
+
+    assert changes[0].body == "text = 'contains === END FILE === mid-line'"
+    assert changes[0].recovery is None
+
+
+def test_parse_still_rejects_output_with_no_file_header():
+    with pytest.raises(MalformedOutputError, match="no '=== FILE"):
+        parse_coder_output("Here is the change you asked for:\n\nvalue = 2\n", ["a.py"])
+
+
+def test_parse_diff_section_with_bare_hunks_gets_a_synthesised_header():
+    """A ```diff-fenced body that starts at `@@` (no ---/+++ header) is a
+    valid patch once the header for the declared path is added."""
+    output = (
+        "=== FILE: a.py ===\n=== MODE: DIFF ===\n"
+        "```diff\n@@ -1 +1 @@\n-value = 1\n+value = 2\n```\n"
+        "**Explanation:** bumps the value.\n=== END FILE ===\n"
+    )
+    changes = parse_coder_output(output, ["a.py"])
+
+    assert changes[0].body == "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-value = 1\n+value = 2\n"
+    assert changes[0].recovery == "synthesised diff header"
+
+
+def test_parse_diff_section_with_no_hunks_is_still_rejected():
+    output = (
+        "=== FILE: a.py ===\n=== MODE: DIFF ===\n"
+        "Just change value to 2.\n=== END FILE ===\n"
+    )
+    with pytest.raises(MalformedOutputError, match="no parseable unified diff"):
+        parse_coder_output(output, ["a.py"])
+
+
+def _diff_for_a(before_context: str, after_context: str) -> str:
+    return (
+        "--- a/a.py\n+++ b/a.py\n"
+        "@@ -1,3 +1,3 @@\n"
+        f" {before_context}\n-value = 1\n+value = 2\n {after_context}\n"
+    )
+
+
+@pytest.fixture
+def repo_with_context(repo):
+    (Path(repo) / "a.py").write_text("# header\nvalue = 1\n# footer\n")
+    _run_git(repo, "add", "a.py")
+    _run_git(repo, "commit", "-q", "-m", "context")
+    return repo
+
+
+def test_apply_strict_diff_reports_no_recovery(repo_with_context):
+    change = FileChange("a.py", "DIFF", _diff_for_a("# header", "# footer"))
+
+    assert apply_file_change(repo_with_context, change) is None
+    assert (Path(repo_with_context) / "a.py").read_text() == "# header\nvalue = 2\n# footer\n"
+
+
+def test_apply_diff_with_whitespace_drift_in_context_uses_ignore_whitespace(repo_with_context):
+    # Internal whitespace drift is what --ignore-whitespace tolerates
+    # (leading/trailing drift on a context line is not; those fall through
+    # to the reduced-context rungs).
+    change = FileChange("a.py", "DIFF", _diff_for_a("#  header", "#  footer"))
+
+    assert apply_file_change(repo_with_context, change) == "ignore-whitespace"
+    assert (Path(repo_with_context) / "a.py").read_text() == "# header\nvalue = 2\n# footer\n"
+
+
+def test_apply_diff_with_wrong_context_lines_fails_by_default(repo_with_context, monkeypatch):
+    """Both context lines wrong: -C1 cannot anchor it and the zero-context
+    rung is off by default, so the attempt fails loudly (one retry) rather
+    than landing wherever the hunk header says."""
+    monkeypatch.delenv(APPLY_CONTEXT0_ENV, raising=False)
+    change = FileChange("a.py", "DIFF", _diff_for_a("# not the header", "# not the footer"))
+
+    with pytest.raises(MalformedOutputError, match="does not apply"):
+        apply_file_change(repo_with_context, change)
+    assert (Path(repo_with_context) / "a.py").read_text() == "# header\nvalue = 1\n# footer\n"
+
+
+def test_apply_diff_with_wrong_context_lines_uses_context_0_only_when_opted_in(
+    repo_with_context, monkeypatch
+):
+    monkeypatch.setenv(APPLY_CONTEXT0_ENV, "1")
+    change = FileChange("a.py", "DIFF", _diff_for_a("# not the header", "# not the footer"))
+
+    rung = apply_file_change(repo_with_context, change)
+
+    assert rung == "context-0"
+    assert (Path(repo_with_context) / "a.py").read_text() == "# header\nvalue = 2\n# footer\n"
+
+
+def test_apply_diff_whose_removed_lines_do_not_exist_still_fails_with_the_strict_error(
+    repo_with_context,
+):
+    body = (
+        "--- a/a.py\n+++ b/a.py\n"
+        "@@ -1,3 +1,3 @@\n"
+        " # header\n-value = 999\n+value = 2\n # footer\n"
+    )
+    with pytest.raises(MalformedOutputError, match="does not apply"):
+        apply_file_change(repo_with_context, FileChange("a.py", "DIFF", body))
+    assert (Path(repo_with_context) / "a.py").read_text() == "# header\nvalue = 1\n# footer\n"
+
+
+def test_apply_pure_addition_hunk_with_wrong_context_is_not_applied_blind(repo_with_context, monkeypatch):
+    """A hunk that only adds lines has no preimage: with -C0 git would put
+    it wherever its header says. Seen live (leonarduk/issue-worm-pro#512):
+    an `import os` meant for a module's imports landed as its last line,
+    CI green, diff unmergeable. Such a hunk must fail rather than land
+    somewhere arbitrary; the retry loop is cheaper than a wrong PR."""
+    body = (
+        "--- a/a.py\n+++ b/a.py\n"
+        "@@ -1,2 +1,3 @@\n"
+        " # not the header\n+import os\n # not value\n"
+    )
+    # Even with the zero-context rung opted in, a pure-addition hunk never
+    # gets it: there is no preimage to anchor the placement.
+    monkeypatch.setenv(APPLY_CONTEXT0_ENV, "1")
+    with pytest.raises(MalformedOutputError, match="does not apply"):
+        apply_file_change(repo_with_context, FileChange("a.py", "DIFF", body))
+    assert (Path(repo_with_context) / "a.py").read_text() == "# header\nvalue = 1\n# footer\n"
+
+
+def test_apply_replacement_hunk_with_wrong_context_still_reaches_context_0(
+    repo_with_context, monkeypatch
+):
+    """When opted in, the -C0 rung is available for a hunk that removes
+    something: the removed lines are a preimage git must find, so the
+    placement is anchored."""
+    monkeypatch.setenv(APPLY_CONTEXT0_ENV, "1")
+    change = FileChange("a.py", "DIFF", _diff_for_a("# not the header", "# not the footer"))
+
+    assert apply_file_change(repo_with_context, change) == "context-0"
+    assert (Path(repo_with_context) / "a.py").read_text() == "# header\nvalue = 2\n# footer\n"
+
+
+def test_apply_ladder_is_ordered_strictest_first_and_context_0_is_opt_in(monkeypatch):
+    assert [rung for rung, _ in _APPLY_LADDER][0] == "strict"
+    assert "context-0" not in [rung for rung, _ in _APPLY_LADDER]
+    assert all("--3way" not in flags for _, flags in _APPLY_LADDER)
+
+    monkeypatch.delenv(APPLY_CONTEXT0_ENV, raising=False)
+    assert _apply_ladder() == _APPLY_LADDER
+    monkeypatch.setenv(APPLY_CONTEXT0_ENV, "1")
+    assert [rung for rung, _ in _apply_ladder()][-1] == "context-0"
+    monkeypatch.setenv(APPLY_CONTEXT0_ENV, "0")
+    assert _apply_ladder() == _APPLY_LADDER
+
+
+def test_run_revision_attempt_reports_recovery_steps(repo_with_context):
+    start = get_current_commit(repo_with_context)
+    output = (
+        "=== FILE: a.py ===\n=== MODE: DIFF ===\n"
+        + _diff_for_a("#  header", "# footer")
+    )
+    with patch("workspace.run_ci_checks", return_value=(True, "ok")):
+        result = run_revision_attempt(repo_with_context, output, ["a.py"], start_commit=start)
+
+    assert result.success is True
+    assert result.recovery == [
+        "a.py: implicit-terminator: ended at end of output",
+        "a.py: applied with ignore-whitespace",
+    ]
+
+
+def test_run_revision_attempt_recovery_is_empty_for_strict_output(repo_with_context):
+    start = get_current_commit(repo_with_context)
+    output = (
+        "=== FILE: a.py ===\n=== MODE: DIFF ===\n"
+        + _diff_for_a("# header", "# footer")
+        + "=== END FILE ===\n"
+    )
+    with patch("workspace.run_ci_checks", return_value=(True, "ok")):
+        result = run_revision_attempt(repo_with_context, output, ["a.py"], start_commit=start)
+
+    assert result.success is True
+    assert result.recovery == []
 
 
 # --- base clone (per-issue workspaces, #160) -------------------------------
