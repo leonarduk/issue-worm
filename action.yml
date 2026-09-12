@@ -216,17 +216,37 @@ runs:
           # is still modified on disk after the `git reset` above unstaged
           # it, so a working-tree diff would list files never committed.
           changed_files="$(git diff --name-only "$base_commit" HEAD | sed 's/^/- /' || true)"
+          # `review_issue` (review.py) already required a `DONE:` line under
+          # `## Implementation notes` before the build was allowed to run at
+          # all, so it's usually present here too - but that check was
+          # against cli.py's in-memory body, which may include a self-heal
+          # draft (`_self_heal_scope`) that failed to persist back to the
+          # actual GitHub issue for lack of `issues: write` (see the
+          # github-token input's description above). Re-fetching the issue
+          # body fresh and grep'ing it, rather than trusting it's there, means
+          # that gap just yields an empty $done_line and the older no-goal
+          # body below - not a broken PR. When it is there, this gives the PR
+          # body a one-line summary of intent without an LLM call, straight
+          # from what the issue author (human or persisted self-heal) wrote.
+          # `-m1` takes the first match only, matching review.py's "first
+          # well-formed section wins" behaviour.
+          issue_body="$(gh issue view "${{ inputs.issue }}" --repo "${{ github.repository }}" --json body -q .body)"
+          done_line="$(printf '%s\n' "$issue_body" | grep -m1 -i '^DONE:' | sed -E 's/^[Dd][Oo][Nn][Ee]:[[:space:]]*//')"
+          goal_section=""
+          if [ -n "$done_line" ]; then
+            goal_section="$(printf '\n\n**Goal:** %s' "$done_line")"
+          fi
           # Branches on $() directly rather than composing through an
           # intermediate "files section" variable: command substitution
           # strips ALL trailing newlines, so a $(printf ...) meant to hold
           # "list\n\n" silently collapses to "list" with no separator,
           # running the last filename straight into "Closes #N" on one line.
           if [ -n "$changed_files" ]; then
-            pr_body="$(printf 'Automated single-pass change from the free issue-worm engine for #%s.\n\n**Files changed:**\n%s\n\nCloses #%s' \
-              "${{ inputs.issue }}" "$changed_files" "${{ inputs.issue }}")"
+            pr_body="$(printf 'Automated single-pass change from the free issue-worm engine for #%s.%s\n\n**Files changed:**\n%s\n\nCloses #%s' \
+              "${{ inputs.issue }}" "$goal_section" "$changed_files" "${{ inputs.issue }}")"
           else
-            pr_body="$(printf 'Automated single-pass change from the free issue-worm engine for #%s.\n\nCloses #%s' \
-              "${{ inputs.issue }}" "${{ inputs.issue }}")"
+            pr_body="$(printf 'Automated single-pass change from the free issue-worm engine for #%s.%s\n\nCloses #%s' \
+              "${{ inputs.issue }}" "$goal_section" "${{ inputs.issue }}")"
           fi
           gh pr create \
             --repo "${{ github.repository }}" \
