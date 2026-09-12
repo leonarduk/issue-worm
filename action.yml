@@ -159,9 +159,14 @@ runs:
         # so those changes will not be committed - a deliberate tradeoff,
         # since untracking `.issue-worm` is the point.
         git add -A .
-        # No default `.gitignore` template is shipped by this action, so a
-        # first-time adopter may not have `.issue-worm` ignored yet; this
-        # reset remains as a defensive fallback for that case.
+        # `.gitignore` audit (search performed 2026-09-01, follow-up to the
+        # AI review of PR #284): a repo-wide search of README.md, docs/,
+        # and any scaffold/template/example directories found no default
+        # `.gitignore` template shipped by this action or by a scaffold
+        # step. The only onboarding `.gitignore` guidance in the repo is in
+        # README.md, and it now lists `.issue-worm` (the working directory
+        # this step resets defensively). This reset remains as a defensive
+        # fallback for a first-time adopter who hasn't added it yet.
         git reset -- .issue-worm
         git commit -m "issue-worm: apply changes for #${{ inputs.issue }}" -m "Closes #${{ inputs.issue }}"
         git push --force origin "$branch"

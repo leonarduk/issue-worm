@@ -190,6 +190,16 @@ what actually select the coder.
    retry UX), and opens a PR with `gh pr create` (or leaves the existing
    PR for that branch as-is if one is already open).
 
+The action never commits its own per-run bookkeeping: it stages
+everything with `git add -A .` and then unstages `.issue-worm/` (this
+run's `history.jsonl` and the in-flight registry) before committing, so
+that directory never lands in your history whether or not you already
+ignore it. If you run issue-worm in-repo and want it out of `git status`
+too, add it to your `.gitignore`:
+
+- `.issue-worm/` — issue-worm's per-run bookkeeping directory (the action
+  resets it defensively, so it is safe to ignore).
+
 ### Known limitations
 
 - **`claude` isn't implemented as a coder source yet.** `local`, `remote`,
