@@ -118,7 +118,17 @@ runs:
         git config user.name "issue-worm[bot]"
         git config user.email "issue-worm[bot]@users.noreply.github.com"
         git checkout -b "$branch"
-        git add -A
+        # Excludes .issue-worm/ (this run's own bookkeeping - history.jsonl,
+        # the in-flight registry) via pathspec rather than `git add -A`
+        # unconditionally: it's meaningful only for this one ephemeral job,
+        # not the consumer's source tree, and a repo that has never used
+        # issue-worm before has no reason to already gitignore it. Both of
+        # this action's own two home repos do gitignore it, which is
+        # exactly why this went unnoticed until a genuinely unrelated
+        # third-party repo (leonarduk/cicaid#36) surfaced it: every commit
+        # from every future first-time adopter would otherwise carry an
+        # ever-growing, meaningless JSONL file into their history.
+        git add -A -- . ':!.issue-worm'
         git commit -m "issue-worm: apply changes for #${{ inputs.issue }}" -m "Closes #${{ inputs.issue }}"
         git push --force origin "$branch"
 
