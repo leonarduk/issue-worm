@@ -186,3 +186,24 @@ def test_draft_implementation_notes_survives_coder_exception():
             raise RuntimeError("network exploded")
 
     assert draft_implementation_notes("task", [], _RaisingCoder()) is None
+
+
+def test_draft_implementation_notes_heals_past_a_malformed_existing_section():
+    """A body whose own `## Implementation notes` is malformed (e.g. FILES:
+    present but DONE: missing) must still end up ready once the coder's
+    section is appended - `review_issue` already picks the first *ready*
+    section from `_SECTION_RE.finditer` (see
+    test_second_well_formed_section_is_found_after_an_empty_first_one), so
+    the appended section winning over the malformed original is existing
+    behaviour, not something `draft_implementation_notes` has to special-
+    case. This test pins that the self-heal path actually benefits from it.
+    """
+    body = "## Implementation notes\nFILES: a.py\n"  # DONE: missing
+    coder = _StubCoder("## Implementation notes\nFILES: a.py\nDONE: it works\n")
+
+    section = draft_implementation_notes(body, ["a.py"], coder)
+
+    assert section is not None
+    merged = review_issue(f"{body}\n\n{section}")
+    assert merged.ready is True
+    assert merged.done == "it works"

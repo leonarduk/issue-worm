@@ -532,6 +532,25 @@ def test_build_self_heals_missing_scope_and_proceeds(capsys):
 
 
 @pytest.mark.usefixtures("_pro_cli_absent")
+def test_build_skips_self_heal_when_already_ready(capsys):
+    """`_self_heal_scope` must only run when the gate actually rejected the
+    issue - a future refactor that called it unconditionally would waste a
+    Coder call (and a GitHub API round trip) on every already-ready build.
+    """
+    ready = ReviewResult(ready=True, files=["a.py"], done="it works")
+    with patch.object(
+        sys, "argv", ["issue-worm", "build", "5", "--repo", "o/r", "--dry-run"]
+    ), patch("cli._fetch_issue_body", return_value="body"), patch(
+        "cli.review_issue", return_value=ready
+    ), patch("cli._self_heal_scope") as mock_heal, pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+    mock_heal.assert_not_called()
+    assert "it works" in capsys.readouterr().out
+
+
+@pytest.mark.usefixtures("_pro_cli_absent")
 def test_self_heal_scope_returns_none_when_coder_unconfigured():
     with patch("cli.build_coder", side_effect=CoderConfigError("boom")):
         result = cli._self_heal_scope("o/r", 5, "plain body", {})
