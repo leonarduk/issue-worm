@@ -1074,7 +1074,10 @@ def ci_check_env(
     - ``HOME`` (and ``USERPROFILE`` on Windows) pointing at ``home``, a
       throwaway directory the caller owns, so nothing under the user's real
       home - ``~/.gitconfig``, ``~/.issue-worm``, gh/ssh config - is visible,
-      and ``TMPDIR``/``TEMP``/``TMP`` pointing there too;
+      and ``TMPDIR``/``TEMP``/``TMP`` pointing there too (a deliberate
+      semantic change from the target's own environment: a test suite that
+      relies on its temp dir sharing a filesystem/volume with the repo, or
+      being a tmpfs, sees a plain throwaway directory instead);
     - ``PYTHONPATH`` = ``repo_path`` and nothing else, so the checkout under
       test shadows any installed copy of the same modules;
     - ``PYTHONIOENCODING=utf-8`` so the child's output decodes the way
@@ -1082,10 +1085,14 @@ def ci_check_env(
     - a fixed git author/committer identity, because a target's tests that
       commit in temporary repos would otherwise fail without ``~/.gitconfig``;
     - ``extra_env`` last, so a caller's explicit delta (the Scheduler's
-      per-target endpoint/model vars, #159) wins over all of the above.
+      per-target endpoint/model vars, #159) wins over all of the above -
+      including ``PYTHONPATH``, if a caller's delta sets it. That is
+      intentional (the caller's delta always wins), not an oversight.
 
     ``extra_env`` is a delta, not a base environment: passing
     ``os.environ`` here reintroduces exactly the leak this exists to stop.
+    A ``None`` value in ``extra_env`` is dropped rather than coerced to the
+    string ``"None"``.
     """
     passthrough = (
         _CI_ENV_PASSTHROUGH_WINDOWS if os.name == "nt" else _CI_ENV_PASSTHROUGH_POSIX
@@ -1109,8 +1116,23 @@ def ci_check_env(
     env["GIT_COMMITTER_NAME"] = CI_GIT_IDENTITY_NAME
     env["GIT_COMMITTER_EMAIL"] = CI_GIT_IDENTITY_EMAIL
     if extra_env:
-        env.update({str(k): str(v) for k, v in extra_env.items()})
+        env.update({str(k): str(v) for k, v in extra_env.items() if v is not None})
     return env
+
+
+def _reject_base_environment_kwarg(func_name: str, kwargs: dict) -> None:
+    """`env=` (a full environment) is gone on purpose - a caller still
+    spreading ``os.environ`` into it must fail loudly, not leak silently."""
+    if "env" in kwargs:
+        raise TypeError(
+            f"{func_name}() no longer accepts env= (a full base environment); "
+            "pass extra_env= (a delta on top of the allowlist) instead - see "
+            "ci_check_env()."
+        )
+    if kwargs:
+        raise TypeError(
+            f"{func_name}() got unexpected keyword arguments: {sorted(kwargs)}"
+        )
 
 
 def run_ci_checks(
@@ -1118,6 +1140,7 @@ def run_ci_checks(
     command: list[str] | None = None,
     extra_env: dict[str, str] | None = None,
     timeout: float | None = None,
+    **kwargs,
 ) -> tuple[bool, str]:
     """Run the configured CI-check command (default: `cicaid run-ci-checks
     --all`, which reads .cicaid-checks.toml - see design.md's "Relationship
@@ -1141,9 +1164,12 @@ def run_ci_checks(
     its timeout is different - it raises :class:`WorkspaceError` so the
     stall is not mistaken for a test failure.
     """
+    _reject_base_environment_kwarg("run_ci_checks", kwargs)
     command = list(command) if command else list(DEFAULT_CI_COMMAND)
     effective_timeout = DEFAULT_CI_TIMEOUT if timeout is None else timeout
-    with tempfile.TemporaryDirectory(prefix="issue-worm-ci-home-") as home:
+    with tempfile.TemporaryDirectory(
+        prefix="issue-worm-ci-home-", ignore_cleanup_errors=True
+    ) as home:
         env = _non_interactive_env(ci_check_env(repo_path, extra_env, home=home))
         try:
             result = subprocess.run(
@@ -1172,6 +1198,7 @@ def run_revision_attempt(
     start_commit: str | None = None,
     ci_command: list[str] | None = None,
     extra_env: dict[str, str] | None = None,
+    **kwargs,
 ) -> WorkspaceResult:
     """Apply one bounded revision attempt and run CI checks, rolling back
     to `start_commit` on any failure or interruption.
@@ -1190,6 +1217,7 @@ def run_revision_attempt(
     that leaves the workspace in an unknown state, which is worse than
     the failure being reported and must not be swallowed.
     """
+    _reject_base_environment_kwarg("run_revision_attempt", kwargs)
     if start_commit is None:
         start_commit = get_current_commit(repo_path)
 

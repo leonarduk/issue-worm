@@ -811,8 +811,31 @@ def test_run_ci_checks_passes_extra_env_to_subprocess(repo, monkeypatch):
 def test_run_ci_checks_rejects_a_base_environment_keyword(repo):
     """`env=` (a full environment) is gone on purpose: a caller still
     spreading os.environ into it must fail loudly, not leak silently."""
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError, match="extra_env"):
         run_ci_checks(repo, ["echo", "hi"], env={"PATH": "x"})  # type: ignore[call-arg]
+
+
+def test_run_revision_attempt_rejects_a_base_environment_keyword(repo):
+    with pytest.raises(TypeError, match="extra_env"):
+        run_revision_attempt(
+            repo, "", [], env={"PATH": "x"}  # type: ignore[call-arg]
+        )
+
+
+def test_ci_check_env_extra_env_none_value_is_dropped_not_stringified(repo, tmp_path):
+    """A caller passing an unset optional as None must not leak the literal
+    string "None" into the child's environment."""
+    env = ci_check_env(repo, {"OLLAMA_ENDPOINT": None}, home=str(tmp_path))
+
+    assert "OLLAMA_ENDPOINT" not in env
+
+
+def test_ci_check_env_extra_env_can_override_pythonpath(repo, tmp_path):
+    """extra_env is applied last and wins over everything above it,
+    including PYTHONPATH - documented behavior, not an oversight."""
+    env = ci_check_env(repo, {"PYTHONPATH": "/elsewhere"}, home=str(tmp_path))
+
+    assert env["PYTHONPATH"] == "/elsewhere"
 
 
 def test_run_ci_checks_subprocess_does_not_see_parent_environment(repo, monkeypatch):
