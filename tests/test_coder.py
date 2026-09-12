@@ -416,3 +416,51 @@ def test_build_coder_claude_raises_not_implemented():
 def test_build_coder_unknown_model_source_raises():
     with pytest.raises(CoderConfigError, match="not-a-real-source"):
         build_coder(RoleConfig(model_source="not-a-real-source"))
+
+
+def test_local_complete_returns_response_text():
+    coder = LocalOllamaCoder(endpoint="http://example.invalid", model="test-model")
+
+    with patch(
+        "coder.requests.post", return_value=_mock_response({"response": "drafted text"})
+    ) as mock_post:
+        result = coder.complete("draft me a section")
+
+    assert result == "drafted text"
+    called_url = mock_post.call_args[0][0]
+    assert called_url == "http://example.invalid/api/generate"
+    payload = mock_post.call_args[1]["json"]
+    assert payload["prompt"] == "draft me a section"
+
+
+def test_local_complete_returns_empty_string_on_request_exception():
+    coder = LocalOllamaCoder(endpoint="http://example.invalid")
+
+    with patch("coder.requests.post", side_effect=requests.ConnectionError("down")):
+        result = coder.complete("draft me a section")
+
+    assert result == ""
+
+
+def test_remote_complete_returns_message_content():
+    coder = RemoteOpenAICoder(
+        endpoint="http://example.invalid", model="test-model", api_key="key"
+    )
+
+    with patch(
+        "coder.requests.post", return_value=_mock_chat_response("drafted text")
+    ) as mock_post:
+        result = coder.complete("draft me a section")
+
+    assert result == "drafted text"
+    payload = mock_post.call_args[1]["json"]
+    assert payload["messages"] == [{"role": "user", "content": "draft me a section"}]
+
+
+def test_remote_complete_returns_empty_string_on_request_exception():
+    coder = RemoteOpenAICoder(endpoint="http://example.invalid", model="test-model")
+
+    with patch("coder.requests.post", side_effect=requests.ConnectionError("down")):
+        result = coder.complete("draft me a section")
+
+    assert result == ""

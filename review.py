@@ -1,9 +1,13 @@
 """Non-AI review: is an issue body scoped enough to dispatch to the
 free-tier Coder?
 
-No LLM call, no GitHub comment/label side effects — this free shell has no
-scheduler or label lifecycle, so `review_issue` is a pure text check that
-hands its verdict back to the caller (`cli.py`'s `build` command).
+`review_issue` itself makes no LLM call and has no GitHub comment/label
+side effects — this free shell has no scheduler or label lifecycle, so it
+stays a pure text check that hands its verdict back to the caller
+(`cli.py`'s `build` command). When that verdict is "not ready", the
+caller may choose to self-heal via `draft_implementation_notes` below,
+which *does* call an LLM (the same Coder the build step would use) to
+draft the missing section — see that function's docstring.
 """
 
 from __future__ import annotations
@@ -75,3 +79,56 @@ def _parse_section(section: str) -> ReviewResult:
 
 def _split_files(raw: str) -> list[str]:
     return [f.strip() for f in raw.split(",") if f.strip()]
+
+
+_SCOPE_DRAFT_PROMPT = (
+    "An automated dispatcher will only act on an issue that declares "
+    "exactly which files to touch and what a passing result looks like. "
+    "The issue below is missing that. Read the issue and the list of the "
+    "repo's existing top-level files, then reply with ONLY this section - "
+    "no preamble, no explanation, nothing after it:\n\n"
+    "## Implementation notes\n"
+    "FILES: path/one.py, path/two.py\n"
+    "DONE: one factual sentence describing what a passing result looks "
+    "like\n\n"
+    "FILES must name real paths - either files already listed below, or "
+    "new ones the issue is clearly asking to create. DONE must describe a "
+    "self-checkable outcome, not restate the issue title.\n\n"
+    "Existing top-level files in the repo:\n{files}\n\n"
+    "Issue:\n{body}\n"
+)
+
+
+def draft_implementation_notes(
+    issue_body: str, repo_files: list[str], coder
+) -> str | None:
+    """Ask `coder` to draft the `## Implementation notes` section an issue
+    is missing, so a dispatcher can self-heal instead of just bouncing the
+    issue back to a human with `NOT_READY_MESSAGE` (issue-worm-pro#753's
+    review thread: "this should be self healing"). This is the one place
+    in this module that makes an LLM call - deliberately kept out of
+    `review_issue` itself (see the module docstring), and only worth
+    reaching for once `review_issue` has already said `ready=False`.
+
+    Returns the drafted section text verbatim (starting with the
+    `## Implementation notes` heading), or None if the coder produced
+    nothing, or produced something `review_issue` still won't accept -
+    callers should fall back to the original `NOT_READY_MESSAGE` in either
+    case rather than trust an unparseable or empty draft.
+    """
+    if coder is None or not issue_body or not issue_body.strip():
+        return None
+    prompt = _SCOPE_DRAFT_PROMPT.format(
+        files="\n".join(repo_files) if repo_files else "(none found)",
+        body=issue_body,
+    )
+    try:
+        response = coder.complete(prompt)
+    except Exception:  # noqa: BLE001 - a coder failure here must not fail the build; just skip healing
+        return None
+    if not response or not response.strip():
+        return None
+    section = response.strip()
+    if not review_issue(f"{issue_body}\n\n{section}").ready:
+        return None
+    return section
