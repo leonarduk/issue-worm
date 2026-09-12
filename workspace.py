@@ -712,8 +712,24 @@ _APPLY_LADDER: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("ignore-whitespace", ("--recount", "--ignore-whitespace")),
     ("context-1", ("--recount", "-C1")),
     ("context-1-ignore-whitespace", ("--recount", "-C1", "--ignore-whitespace")),
-    ("context-0", ("--recount", "-C0")),
 )
+# The zero-context rung is OFF by default. It trades a loud failure (the
+# patch does not apply: obvious, costs one retry) for a quiet one (the
+# patch applies in the wrong place, tests stay green, a reviewer gets a
+# wrong PR) - the wrong trade for an unattended tool. It rescued 4 of 30
+# recorded failures that -C1 did not, and one of those placements was a
+# live unmergeable PR. Opt in per process with ISSUE_WORM_APPLY_CONTEXT0=1;
+# even then it is skipped for hunks that only add lines (no preimage).
+_CONTEXT0_RUNG: tuple[str, tuple[str, ...]] = ("context-0", ("--recount", "-C0"))
+APPLY_CONTEXT0_ENV = "ISSUE_WORM_APPLY_CONTEXT0"
+
+
+def _apply_ladder() -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """The rungs to try, with the opt-in zero-context rung appended only
+    when :data:`APPLY_CONTEXT0_ENV` is set to a truthy value."""
+    if os.environ.get(APPLY_CONTEXT0_ENV, "").strip().lower() in ("1", "true", "yes", "on"):
+        return _APPLY_LADDER + (_CONTEXT0_RUNG,)
+    return _APPLY_LADDER
 
 
 def apply_file_change(repo_path: str, change: FileChange) -> str | None:
@@ -740,7 +756,7 @@ def apply_file_change(repo_path: str, change: FileChange) -> str | None:
         return None
 
     strict_error: str | None = None
-    for rung, flags in _APPLY_LADDER:
+    for rung, flags in _apply_ladder():
         if rung == "context-0" and not _every_hunk_has_a_preimage(change.body):
             # With no context, a hunk that only ADDS lines is anchored by
             # nothing but its line number, so git will happily put it

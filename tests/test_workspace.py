@@ -25,6 +25,8 @@ from workspace import (
     _repo_identity,
     _run_git,
     _APPLY_LADDER,
+    APPLY_CONTEXT0_ENV,
+    _apply_ladder,
     apply_file_change,
     ensure_base_clone,
     ensure_gitignored,
@@ -926,7 +928,22 @@ def test_apply_diff_with_whitespace_drift_in_context_uses_ignore_whitespace(repo
     assert (Path(repo_with_context) / "a.py").read_text() == "# header\nvalue = 2\n# footer\n"
 
 
-def test_apply_diff_with_wrong_context_lines_uses_reduced_context(repo_with_context):
+def test_apply_diff_with_wrong_context_lines_fails_by_default(repo_with_context, monkeypatch):
+    """Both context lines wrong: -C1 cannot anchor it and the zero-context
+    rung is off by default, so the attempt fails loudly (one retry) rather
+    than landing wherever the hunk header says."""
+    monkeypatch.delenv(APPLY_CONTEXT0_ENV, raising=False)
+    change = FileChange("a.py", "DIFF", _diff_for_a("# not the header", "# not the footer"))
+
+    with pytest.raises(MalformedOutputError, match="does not apply"):
+        apply_file_change(repo_with_context, change)
+    assert (Path(repo_with_context) / "a.py").read_text() == "# header\nvalue = 1\n# footer\n"
+
+
+def test_apply_diff_with_wrong_context_lines_uses_context_0_only_when_opted_in(
+    repo_with_context, monkeypatch
+):
+    monkeypatch.setenv(APPLY_CONTEXT0_ENV, "1")
     change = FileChange("a.py", "DIFF", _diff_for_a("# not the header", "# not the footer"))
 
     rung = apply_file_change(repo_with_context, change)
@@ -948,7 +965,7 @@ def test_apply_diff_whose_removed_lines_do_not_exist_still_fails_with_the_strict
     assert (Path(repo_with_context) / "a.py").read_text() == "# header\nvalue = 1\n# footer\n"
 
 
-def test_apply_pure_addition_hunk_with_wrong_context_is_not_applied_blind(repo_with_context):
+def test_apply_pure_addition_hunk_with_wrong_context_is_not_applied_blind(repo_with_context, monkeypatch):
     """A hunk that only adds lines has no preimage: with -C0 git would put
     it wherever its header says. Seen live (leonarduk/issue-worm-pro#512):
     an `import os` meant for a module's imports landed as its last line,
@@ -959,24 +976,38 @@ def test_apply_pure_addition_hunk_with_wrong_context_is_not_applied_blind(repo_w
         "@@ -1,2 +1,3 @@\n"
         " # not the header\n+import os\n # not value\n"
     )
+    # Even with the zero-context rung opted in, a pure-addition hunk never
+    # gets it: there is no preimage to anchor the placement.
+    monkeypatch.setenv(APPLY_CONTEXT0_ENV, "1")
     with pytest.raises(MalformedOutputError, match="does not apply"):
         apply_file_change(repo_with_context, FileChange("a.py", "DIFF", body))
     assert (Path(repo_with_context) / "a.py").read_text() == "# header\nvalue = 1\n# footer\n"
 
 
-def test_apply_replacement_hunk_with_wrong_context_still_reaches_context_0(repo_with_context):
-    """The -C0 rung stays available when every hunk removes something: the
-    removed lines are a preimage git must find, so placement is anchored."""
+def test_apply_replacement_hunk_with_wrong_context_still_reaches_context_0(
+    repo_with_context, monkeypatch
+):
+    """When opted in, the -C0 rung is available for a hunk that removes
+    something: the removed lines are a preimage git must find, so the
+    placement is anchored."""
+    monkeypatch.setenv(APPLY_CONTEXT0_ENV, "1")
     change = FileChange("a.py", "DIFF", _diff_for_a("# not the header", "# not the footer"))
 
     assert apply_file_change(repo_with_context, change) == "context-0"
     assert (Path(repo_with_context) / "a.py").read_text() == "# header\nvalue = 2\n# footer\n"
 
 
-def test_apply_ladder_is_ordered_strictest_first():
+def test_apply_ladder_is_ordered_strictest_first_and_context_0_is_opt_in(monkeypatch):
     assert [rung for rung, _ in _APPLY_LADDER][0] == "strict"
-    assert [rung for rung, _ in _APPLY_LADDER][-1] == "context-0"
+    assert "context-0" not in [rung for rung, _ in _APPLY_LADDER]
     assert all("--3way" not in flags for _, flags in _APPLY_LADDER)
+
+    monkeypatch.delenv(APPLY_CONTEXT0_ENV, raising=False)
+    assert _apply_ladder() == _APPLY_LADDER
+    monkeypatch.setenv(APPLY_CONTEXT0_ENV, "1")
+    assert [rung for rung, _ in _apply_ladder()][-1] == "context-0"
+    monkeypatch.setenv(APPLY_CONTEXT0_ENV, "0")
+    assert _apply_ladder() == _APPLY_LADDER
 
 
 def test_run_revision_attempt_reports_recovery_steps(repo_with_context):
