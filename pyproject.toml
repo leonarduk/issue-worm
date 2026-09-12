@@ -1,5 +1,8 @@
 [build-system]
-requires = ["setuptools>=68", "setuptools-scm>=8"]
+# setuptools-scm>=10 for the [tool.setuptools_scm.scm.git] describe_command
+# key below - the older top-level git_describe_command spelling is
+# deprecated in 10.x, and 10.x is the version verified to honour this one.
+requires = ["setuptools>=68", "setuptools-scm>=10"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -43,6 +46,13 @@ py-modules = ["cli", "coder", "config", "history", "registry", "review", "versio
 
 [tool.setuptools_scm]
 fallback_version = "0.1.0"
+
+# Derive the version from full vX.Y.Z tags only. release.yml also keeps the
+# floating action tag v1 on the newest release commit, and git describe's
+# default --match '*[0-9]*' accepts that too - with v1 annotated,
+# setuptools-scm picked it and built issue_worm-1 (verified on 10.2.1).
+[tool.setuptools_scm.scm.git]
+describe_command = ["git", "describe", "--dirty", "--tags", "--long", "--abbrev=40", "--match", "v[0-9]*.[0-9]*.[0-9]*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

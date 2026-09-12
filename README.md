@@ -137,6 +137,13 @@ jobs:
 See [`.github/workflows/issue-worm.yml`](.github/workflows/issue-worm.yml)
 for the working copy this repo runs on itself.
 
+`@v1` is a floating tag: [the release workflow](.github/workflows/release.yml)
+moves it to each new `vX.Y.Z` release, so you pick up fixes without editing
+your workflow. It's the action's interface version, separate from the 0.x
+package version, and only changes (to `v2`) for a breaking change to the
+inputs below. For a reproducible pin, use a release tag (`@v0.2.3`) or a
+full commit SHA instead.
+
 ### Inputs
 
 | Input | Required | Description |
