@@ -226,7 +226,7 @@ def _list_repo_top_level_files(repo: str) -> list[str]:
 
 def _try_persist_implementation_notes(
     repo: str, issue_number: int, section: str
-) -> None:
+) -> bool:
     """Best-effort: append the auto-drafted section to the real issue body
     on GitHub, so a human reading the issue (or the next run) sees the
     same scope this run used instead of it existing only in this
@@ -234,10 +234,14 @@ def _try_persist_implementation_notes(
     without `issues: write` (this action only documents needing
     `issues: read`, see action.yml) is an expected, non-fatal case here,
     not a reason to abandon a build that already has what it needs.
+
+    Returns whether the issue body was actually updated, so the caller can
+    tell the user the truth (`_self_heal_scope`'s banner) instead of
+    claiming a persist that a missing scope silently turned into a no-op.
     """
     token = os.getenv("GITHUB_TOKEN")
     if not token:
-        return
+        return False
     headers = {
         "Accept": "application/vnd.github+json",
         "Authorization": f"Bearer {token}",
@@ -254,6 +258,7 @@ def _try_persist_implementation_notes(
             timeout=GITHUB_API_TIMEOUT,
         )
         response.raise_for_status()
+        return True
     except (requests.RequestException, ValueError, KeyError):
         logger.debug(
             "Could not persist auto-drafted Implementation notes to %s#%s",
@@ -261,6 +266,7 @@ def _try_persist_implementation_notes(
             issue_number,
             exc_info=True,
         )
+        return False
 
 
 def _self_heal_scope(
@@ -291,7 +297,13 @@ def _self_heal_scope(
     print("⚠ Issue had no `## Implementation notes` section — auto-drafted one:")
     print(f"  FILES: {', '.join(review.files)}")
     print(f"  DONE: {review.done}")
-    _try_persist_implementation_notes(repo, issue_number, section)
+    if _try_persist_implementation_notes(repo, issue_number, section):
+        print("  (saved to the GitHub issue)")
+    else:
+        print(
+            "  (drafted for this run only — could not save it to the GitHub "
+            "issue; GITHUB_TOKEN may be missing or lack `issues: write`)"
+        )
     return review, healed_body
 
 

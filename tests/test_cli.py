@@ -555,7 +555,7 @@ def test_self_heal_scope_returns_healed_review_and_body(capsys):
     with patch("cli.build_coder"), patch(
         "cli._list_repo_top_level_files", return_value=["a.py"]
     ), patch("cli.draft_implementation_notes", return_value=section), patch(
-        "cli._try_persist_implementation_notes"
+        "cli._try_persist_implementation_notes", return_value=True
     ) as mock_persist:
         result = cli._self_heal_scope("o/r", 5, "plain body", {})
 
@@ -566,7 +566,93 @@ def test_self_heal_scope_returns_healed_review_and_body(capsys):
     assert review.done == "it works"
     assert body == f"plain body\n\n{section}"
     mock_persist.assert_called_once_with("o/r", 5, section)
-    assert "auto-drafted" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "auto-drafted" in out
+    assert "saved to the GitHub issue" in out
+
+
+@pytest.mark.usefixtures("_pro_cli_absent")
+def test_self_heal_scope_banner_says_when_persist_failed(capsys):
+    """`_try_persist_implementation_notes` returning False (missing token,
+    or a token without `issues: write`) must not be reported to the user
+    as if the GitHub issue was updated - see the DeepSeek review on PR #261
+    that flagged the original banner as misleading here.
+    """
+    section = "## Implementation notes\nFILES: a.py\nDONE: it works\n"
+    with patch("cli.build_coder"), patch(
+        "cli._list_repo_top_level_files", return_value=["a.py"]
+    ), patch("cli.draft_implementation_notes", return_value=section), patch(
+        "cli._try_persist_implementation_notes", return_value=False
+    ):
+        result = cli._self_heal_scope("o/r", 5, "plain body", {})
+
+    assert result is not None
+    out = capsys.readouterr().out
+    assert "auto-drafted" in out
+    assert "could not save it to the GitHub issue" in out
+    assert "saved to the GitHub issue" not in out
+
+
+def test_list_repo_top_level_files_returns_names(monkeypatch):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    contents = [
+        {"name": "cli.py", "type": "file"},
+        {"name": "docs", "type": "dir"},
+        {"name": "review.py", "type": "file"},
+    ]
+    with patch(
+        "cli.requests.get", return_value=_mock_get_response(200, contents)
+    ) as mock_get:
+        result = cli._list_repo_top_level_files("o/r")
+
+    assert result == ["cli.py", "review.py"]
+    assert mock_get.call_args[0][0] == "https://api.github.com/repos/o/r/contents"
+
+
+def test_list_repo_top_level_files_returns_empty_on_request_failure():
+    with patch("cli.requests.get", side_effect=requests.ConnectionError("down")):
+        result = cli._list_repo_top_level_files("o/r")
+
+    assert result == []
+
+
+def test_list_repo_top_level_files_returns_empty_on_bad_status():
+    with patch("cli.requests.get", return_value=_mock_get_response(403)):
+        result = cli._list_repo_top_level_files("o/r")
+
+    assert result == []
+
+
+def test_persist_implementation_notes_returns_false_without_token(monkeypatch):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+
+    result = cli._try_persist_implementation_notes("o/r", 5, "section text")
+
+    assert result is False
+
+
+def test_persist_implementation_notes_patches_appended_body(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    with patch(
+        "cli.requests.get", return_value=_mock_get_response(200, {"body": "original"})
+    ), patch(
+        "cli.requests.patch", return_value=_mock_get_response(200, {})
+    ) as mock_patch:
+        result = cli._try_persist_implementation_notes("o/r", 5, "healed section")
+
+    assert result is True
+    assert mock_patch.call_args[0][0] == "https://api.github.com/repos/o/r/issues/5"
+    assert mock_patch.call_args[1]["json"]["body"] == "original\n\nhealed section"
+
+
+def test_persist_implementation_notes_returns_false_on_403(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    with patch(
+        "cli.requests.get", return_value=_mock_get_response(200, {"body": "original"})
+    ), patch("cli.requests.patch", return_value=_mock_get_response(403)):
+        result = cli._try_persist_implementation_notes("o/r", 5, "healed section")
+
+    assert result is False
 
 
 @pytest.mark.usefixtures("_pro_cli_absent")
