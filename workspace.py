@@ -691,6 +691,22 @@ def parse_coder_output(output: str, declared_files: list[str]) -> list[FileChang
 # checks that follow are the only thing standing between it and a
 # misplaced insertion. `--3way` is deliberately absent: it needs the
 # `index` blob ids an LLM diff never carries.
+def _every_hunk_has_a_preimage(diff_text: str) -> bool:
+    """True when each `@@` hunk in ``diff_text`` removes at least one line.
+
+    Such a hunk carries a preimage git must match before applying, even
+    with zero context; a pure-addition hunk carries none and would be
+    placed by line number alone (see apply_file_change's -C0 rung).
+    """
+    hunks = re.split(r"(?m)^@@ .*$", diff_text)[1:]
+    if not hunks:
+        return False
+    return all(
+        any(line.startswith("-") and not line.startswith("---") for line in hunk.splitlines())
+        for hunk in hunks
+    )
+
+
 _APPLY_LADDER: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("strict", ("--recount",)),
     ("ignore-whitespace", ("--recount", "--ignore-whitespace")),
@@ -725,6 +741,15 @@ def apply_file_change(repo_path: str, change: FileChange) -> str | None:
 
     strict_error: str | None = None
     for rung, flags in _APPLY_LADDER:
+        if rung == "context-0" and not _every_hunk_has_a_preimage(change.body):
+            # With no context, a hunk that only ADDS lines is anchored by
+            # nothing but its line number, so git will happily put it
+            # wherever the (often wrong) header says. Seen live: an
+            # `import os` meant for the top of a test module landed as its
+            # last line, CI green, diff unmergeable. A hunk that removes or
+            # replaces lines still has a preimage that must match, so -C0
+            # stays available for those.
+            continue
         check_result = _run_git(
             repo_path, "apply", "--check", *flags, "-",
             check=False, input_text=change.body,

@@ -948,6 +948,31 @@ def test_apply_diff_whose_removed_lines_do_not_exist_still_fails_with_the_strict
     assert (Path(repo_with_context) / "a.py").read_text() == "# header\nvalue = 1\n# footer\n"
 
 
+def test_apply_pure_addition_hunk_with_wrong_context_is_not_applied_blind(repo_with_context):
+    """A hunk that only adds lines has no preimage: with -C0 git would put
+    it wherever its header says. Seen live (leonarduk/issue-worm-pro#512):
+    an `import os` meant for a module's imports landed as its last line,
+    CI green, diff unmergeable. Such a hunk must fail rather than land
+    somewhere arbitrary; the retry loop is cheaper than a wrong PR."""
+    body = (
+        "--- a/a.py\n+++ b/a.py\n"
+        "@@ -1,2 +1,3 @@\n"
+        " # not the header\n+import os\n # not value\n"
+    )
+    with pytest.raises(MalformedOutputError, match="does not apply"):
+        apply_file_change(repo_with_context, FileChange("a.py", "DIFF", body))
+    assert (Path(repo_with_context) / "a.py").read_text() == "# header\nvalue = 1\n# footer\n"
+
+
+def test_apply_replacement_hunk_with_wrong_context_still_reaches_context_0(repo_with_context):
+    """The -C0 rung stays available when every hunk removes something: the
+    removed lines are a preimage git must find, so placement is anchored."""
+    change = FileChange("a.py", "DIFF", _diff_for_a("# not the header", "# not the footer"))
+
+    assert apply_file_change(repo_with_context, change) == "context-0"
+    assert (Path(repo_with_context) / "a.py").read_text() == "# header\nvalue = 2\n# footer\n"
+
+
 def test_apply_ladder_is_ordered_strictest_first():
     assert [rung for rung, _ in _APPLY_LADDER][0] == "strict"
     assert [rung for rung, _ in _APPLY_LADDER][-1] == "context-0"
