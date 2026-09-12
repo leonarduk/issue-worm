@@ -51,6 +51,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -1208,19 +1209,142 @@ def ensure_gitignored(
         )
 
 
+# --- CI-check subprocess environment (allowlist, fail closed) ---------------
+#
+# The target repository's test suite is arbitrary code. It must not see the
+# tool's own configuration: not the API keys, endpoints and state directory
+# that `config.load_config()` loads into os.environ from `.env`, and not
+# whatever the parent shell exported either (a denylist that strips `.env`
+# keys still leaks a `DEEPSEEK_API_KEY` exported in the user's profile, and
+# leaks silently). Both worm repos have a test that asserts `.env` in the
+# cwd sets DEEPSEEK_API_KEY; with the tool's real key in the inherited
+# environment that test fails on every patch, correct or not, which is one
+# of the two reasons no recorded run ever passed Verify (2026-09-12 probe).
+#
+# So the CI subprocess gets an ALLOWLIST: PATH and the handful of variables
+# a process cannot run without on each platform, a throwaway HOME, the
+# workspace itself first on PYTHONPATH (below), a fixed git identity, and the
+# caller's explicit delta. Nothing else.
+#
+# PYTHONPATH=<workspace> is the other half of the same fix: a target whose
+# tests do `from coder import ...` against flat top-level modules resolves
+# them from site-packages when the package is installed there, so the
+# Verifier was testing the INSTALLED copy and never the patch. CI gets this
+# for free from `pip install -e .`; putting the checkout first on the path
+# is the equivalent for a scratch clone.
+_CI_ENV_PASSTHROUGH_POSIX = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ")
+_CI_ENV_PASSTHROUGH_WINDOWS = (
+    "PATH",
+    # Without SYSTEMROOT, Python itself cannot start on Windows (it is
+    # needed to seed os.urandom), and git/ssl need SYSTEMDRIVE/WINDIR.
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    # cicaid's run-ci-checks executes each check with shell=True, which
+    # needs COMSPEC; PATHEXT is how `pytest` resolves to `pytest.exe`.
+    "COMSPEC",
+    "PATHEXT",
+    "PROGRAMDATA",
+)
+CI_GIT_IDENTITY_NAME = "issue-worm verifier"
+CI_GIT_IDENTITY_EMAIL = "verifier@issue-worm.invalid"
+
+
+def ci_check_env(
+    repo_path: str,
+    extra_env: dict[str, str] | None = None,
+    *,
+    home: str,
+) -> dict[str, str]:
+    """The full environment for the target repo's CI-check subprocess.
+
+    Built up from nothing (see the module comment above), never down from
+    ``os.environ``:
+
+    - the platform pass-through set (PATH plus what the OS needs to run a
+      process at all);
+    - ``HOME`` (and ``USERPROFILE`` on Windows) pointing at ``home``, a
+      throwaway directory the caller owns, so nothing under the user's real
+      home - ``~/.gitconfig``, ``~/.issue-worm``, gh/ssh config - is visible,
+      and ``TMPDIR``/``TEMP``/``TMP`` pointing there too (a deliberate
+      semantic change from the target's own environment: a test suite that
+      relies on its temp dir sharing a filesystem/volume with the repo, or
+      being a tmpfs, sees a plain throwaway directory instead);
+    - ``PYTHONPATH`` = ``repo_path`` and nothing else, so the checkout under
+      test shadows any installed copy of the same modules;
+    - ``PYTHONIOENCODING=utf-8`` so the child's output decodes the way
+      :func:`run_ci_checks` reads it, whatever the console codepage;
+    - a fixed git author/committer identity, because a target's tests that
+      commit in temporary repos would otherwise fail without ``~/.gitconfig``;
+    - ``extra_env`` last, so a caller's explicit delta (the Scheduler's
+      per-target endpoint/model vars, #159) wins over all of the above -
+      including ``PYTHONPATH``, if a caller's delta sets it. That is
+      intentional (the caller's delta always wins), not an oversight.
+
+    ``extra_env`` is a delta, not a base environment: passing
+    ``os.environ`` here reintroduces exactly the leak this exists to stop.
+    A ``None`` value in ``extra_env`` is dropped rather than coerced to the
+    string ``"None"``.
+    """
+    passthrough = (
+        _CI_ENV_PASSTHROUGH_WINDOWS if os.name == "nt" else _CI_ENV_PASSTHROUGH_POSIX
+    )
+    env: dict[str, str] = {}
+    for key in passthrough:
+        value = os.environ.get(key)
+        if value is not None:
+            env[key] = value
+    env["HOME"] = home
+    if os.name == "nt":
+        env["USERPROFILE"] = home
+        env["TEMP"] = home
+        env["TMP"] = home
+    else:
+        env["TMPDIR"] = home
+    env["PYTHONPATH"] = str(Path(repo_path).resolve())
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["GIT_AUTHOR_NAME"] = CI_GIT_IDENTITY_NAME
+    env["GIT_AUTHOR_EMAIL"] = CI_GIT_IDENTITY_EMAIL
+    env["GIT_COMMITTER_NAME"] = CI_GIT_IDENTITY_NAME
+    env["GIT_COMMITTER_EMAIL"] = CI_GIT_IDENTITY_EMAIL
+    if extra_env:
+        env.update({str(k): str(v) for k, v in extra_env.items() if v is not None})
+    return env
+
+
+def _reject_base_environment_kwarg(func_name: str, kwargs: dict) -> None:
+    """`env=` (a full environment) is gone on purpose - a caller still
+    spreading ``os.environ`` into it must fail loudly, not leak silently."""
+    if "env" in kwargs:
+        raise TypeError(
+            f"{func_name}() no longer accepts env= (a full base environment); "
+            "pass extra_env= (a delta on top of the allowlist) instead - see "
+            "ci_check_env()."
+        )
+    if kwargs:
+        raise TypeError(
+            f"{func_name}() got unexpected keyword arguments: {sorted(kwargs)}"
+        )
+
+
 def run_ci_checks(
     repo_path: str,
     command: list[str] | None = None,
-    env: dict[str, str] | None = None,
+    extra_env: dict[str, str] | None = None,
     timeout: float | None = None,
+    **kwargs,
 ) -> tuple[bool, str]:
     """Run the configured CI-check command (default: `cicaid run-ci-checks
     --all`, which reads .cicaid-checks.toml - see design.md's "Relationship
     to cicaid") and capture pass/fail plus combined output.
 
-    ``env`` is the subprocess's full environment (None = inherit the
-    parent's, as before); the Scheduler passes its target's env explicitly
-    so parallel workers never rely on a mutated ``os.environ`` (#159).
+    The subprocess never inherits this process's environment: it runs in
+    the allowlisted environment :func:`ci_check_env` builds, with a fresh
+    throwaway HOME for the duration of the call. ``extra_env`` is the
+    caller's explicit delta on top of that (the Scheduler passes its
+    target's endpoint/model vars, #159); it is NOT a base environment, and
+    a caller must not spread ``os.environ`` into it.
+
     ``timeout`` defaults to :data:`DEFAULT_CI_TIMEOUT` (a real test suite
     takes minutes; the bound exists so a hung CI command surfaces as a
     :class:`WorkspaceError` instead of blocking the orchestrator forever,
@@ -1229,28 +1353,33 @@ def run_ci_checks(
     Returns (passed, output) rather than raising, so a missing/failing CI
     tool is reported to the caller (and, on the next revision, the
     Analyser) the same way a real test failure is. A command that exceeds
-    its timeout is different — it raises :class:`WorkspaceError` so the
+    its timeout is different - it raises :class:`WorkspaceError` so the
     stall is not mistaken for a test failure.
     """
+    _reject_base_environment_kwarg("run_ci_checks", kwargs)
     command = list(command) if command else list(DEFAULT_CI_COMMAND)
     effective_timeout = DEFAULT_CI_TIMEOUT if timeout is None else timeout
-    try:
-        result = subprocess.run(
-            command,
-            cwd=repo_path,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            env=env,
-            timeout=effective_timeout,
-        )
-    except OSError as exc:
-        return False, f"failed to run CI command {command}: {exc}"
-    except subprocess.TimeoutExpired as exc:
-        raise WorkspaceError(
-            f"CI command {' '.join(command)} timed out after "
-            f"{effective_timeout}s"
-        ) from exc
+    with tempfile.TemporaryDirectory(
+        prefix="issue-worm-ci-home-", ignore_cleanup_errors=True
+    ) as home:
+        env = _non_interactive_env(ci_check_env(repo_path, extra_env, home=home))
+        try:
+            result = subprocess.run(
+                command,
+                cwd=repo_path,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                env=env,
+                timeout=effective_timeout,
+            )
+        except OSError as exc:
+            return False, f"failed to run CI command {command}: {exc}"
+        except subprocess.TimeoutExpired as exc:
+            raise WorkspaceError(
+                f"CI command {' '.join(command)} timed out after "
+                f"{effective_timeout}s"
+            ) from exc
     return result.returncode == 0, result.stdout + result.stderr
 
 
@@ -1260,7 +1389,8 @@ def run_revision_attempt(
     declared_files: list[str],
     start_commit: str | None = None,
     ci_command: list[str] | None = None,
-    env: dict[str, str] | None = None,
+    extra_env: dict[str, str] | None = None,
+    **kwargs,
 ) -> WorkspaceResult:
     """Apply one bounded revision attempt and run CI checks, rolling back
     to `start_commit` on any failure or interruption.
@@ -1268,8 +1398,10 @@ def run_revision_attempt(
     This is the unit orchestrator.py calls once per attempt in the Coder ->
     Verifier loop (see design.md): reset to a known-good commit, apply this
     attempt's diff/full-file output, run CI checks, and leave the repo
-    clean again unless the attempt fully passed. ``env`` is forwarded to
-    the CI-check subprocess (see :func:`run_ci_checks`).
+    clean again unless the attempt fully passed. ``extra_env`` is the
+    caller's delta for the CI-check subprocess, which otherwise runs in
+    the allowlisted environment :func:`ci_check_env` builds (see
+    :func:`run_ci_checks`) - never in this process's own.
 
     Normally returns a :class:`WorkspaceResult` even on failure - but if
     the post-failure rollback to ``start_commit`` itself fails, a
@@ -1277,6 +1409,7 @@ def run_revision_attempt(
     that leaves the workspace in an unknown state, which is worse than
     the failure being reported and must not be swallowed.
     """
+    _reject_base_environment_kwarg("run_revision_attempt", kwargs)
     if start_commit is None:
         start_commit = get_current_commit(repo_path)
 
@@ -1309,7 +1442,7 @@ def run_revision_attempt(
         # pathspec if handed to `git add` unsanitized.
         diff_output = get_working_diff(repo_path, [change.path for change in changes])
 
-        passed, test_output = run_ci_checks(repo_path, ci_command, env=env)
+        passed, test_output = run_ci_checks(repo_path, ci_command, extra_env=extra_env)
         if not passed:
             return WorkspaceResult(
                 success=False,

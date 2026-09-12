@@ -27,7 +27,9 @@ from workspace import (
     _APPLY_LADDER,
     APPLY_CONTEXT0_ENV,
     _apply_ladder,
+    CI_GIT_IDENTITY_NAME,
     apply_file_change,
+    ci_check_env,
     ensure_base_clone,
     ensure_gitignored,
     get_current_commit,
@@ -747,36 +749,150 @@ def test_reset_to_commit_raises_workspace_error_on_bad_commit(repo):
         reset_to_commit(repo, "not-a-real-commit-sha")
 
 
-# --- run_ci_checks / run_revision_attempt: explicit env (#159) --------------
+# --- run_ci_checks: allowlisted subprocess environment ---------------------
+#
+# The target's test suite is arbitrary code and must not see the tool's own
+# configuration (API keys, endpoints, ISSUE_WORM_STATE_DIR) whether that
+# came from `.env` via load_config() or from the parent shell's exports;
+# and it must import the checkout under test, not an installed copy of the
+# same modules. Both were live defects that failed every Verify (2026-09-12).
 
 
-def test_run_ci_checks_passes_env_to_subprocess(repo):
-    """The Scheduler's target env reaches the CI subprocess explicitly."""
-    env = {"OLLAMA_ENDPOINT": "http://pc-a:11434", "OLLAMA_MODEL": "qwen:7b"}
+def test_ci_check_env_is_an_allowlist_not_a_copy_of_os_environ(repo, tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "leaked-secret")
+    monkeypatch.setenv("ISSUE_WORM_STATE_DIR", "leaked-state-dir")
+    monkeypatch.setenv("PYTHONPATH", "leaked-pythonpath")
+
+    env = ci_check_env(repo, home=str(tmp_path))
+
+    assert "DEEPSEEK_API_KEY" not in env
+    assert "ISSUE_WORM_STATE_DIR" not in env
+    assert env["PATH"] == os.environ["PATH"]
+    assert env["HOME"] == str(tmp_path)
+    assert env["PYTHONPATH"] == str(Path(repo).resolve())
+    assert env["PYTHONIOENCODING"] == "utf-8"
+    assert env["GIT_AUTHOR_NAME"] == CI_GIT_IDENTITY_NAME
+    assert env["GIT_COMMITTER_EMAIL"].endswith(".invalid")
+    documented = {
+        "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+        "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "PROGRAMDATA",
+        "HOME", "USERPROFILE", "TEMP", "TMP", "TMPDIR",
+        "PYTHONPATH", "PYTHONIOENCODING",
+        "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
+    }
+    assert set(env) <= documented, sorted(set(env) - documented)
+
+
+def test_ci_check_env_extra_env_is_a_delta_that_wins(repo, tmp_path):
+    env = ci_check_env(
+        repo, {"OLLAMA_ENDPOINT": "http://pc-a:11434", "HOME": "/elsewhere"}, home=str(tmp_path)
+    )
+
+    assert env["OLLAMA_ENDPOINT"] == "http://pc-a:11434"
+    assert env["HOME"] == "/elsewhere"
+    assert env["PYTHONPATH"] == str(Path(repo).resolve())
+
+
+def test_run_ci_checks_passes_extra_env_to_subprocess(repo, monkeypatch):
+    """The Scheduler's target delta reaches the CI subprocess explicitly (#159),
+    on top of the allowlist - never on top of this process's environment."""
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "leaked-secret")
+    extra = {"OLLAMA_ENDPOINT": "http://pc-a:11434", "OLLAMA_MODEL": "qwen:7b"}
     with patch("workspace.subprocess.run") as m_run:
-        m_run.return_value = subprocess.CompletedProcess(
-            [], 0, stdout="ok", stderr=""
-        )
-        passed, output = run_ci_checks(repo, ["echo", "hi"], env=env)
+        m_run.return_value = subprocess.CompletedProcess([], 0, stdout="ok", stderr="")
+        passed, output = run_ci_checks(repo, ["echo", "hi"], extra_env=extra)
 
     assert passed is True
     assert "ok" in output
-    assert m_run.call_args.kwargs["env"] == env
+    sent = m_run.call_args.kwargs["env"]
+    assert sent["OLLAMA_ENDPOINT"] == "http://pc-a:11434"
+    assert sent["OLLAMA_MODEL"] == "qwen:7b"
+    assert sent["PATH"] == os.environ["PATH"]
+    assert "DEEPSEEK_API_KEY" not in sent
 
 
-def test_run_revision_attempt_forwards_env_to_ci_checks(repo):
-    """run_revision_attempt forwards env to the CI-check subprocess."""
+def test_run_ci_checks_rejects_a_base_environment_keyword(repo):
+    """`env=` (a full environment) is gone on purpose: a caller still
+    spreading os.environ into it must fail loudly, not leak silently."""
+    with pytest.raises(TypeError, match="extra_env"):
+        run_ci_checks(repo, ["echo", "hi"], env={"PATH": "x"})  # type: ignore[call-arg]
+
+
+def test_run_revision_attempt_rejects_a_base_environment_keyword(repo):
+    with pytest.raises(TypeError, match="extra_env"):
+        run_revision_attempt(
+            repo, "", [], env={"PATH": "x"}  # type: ignore[call-arg]
+        )
+
+
+def test_ci_check_env_extra_env_none_value_is_dropped_not_stringified(repo, tmp_path):
+    """A caller passing an unset optional as None must not leak the literal
+    string "None" into the child's environment."""
+    env = ci_check_env(repo, {"OLLAMA_ENDPOINT": None}, home=str(tmp_path))
+
+    assert "OLLAMA_ENDPOINT" not in env
+
+
+def test_ci_check_env_extra_env_can_override_pythonpath(repo, tmp_path):
+    """extra_env is applied last and wins over everything above it,
+    including PYTHONPATH - documented behavior, not an oversight."""
+    env = ci_check_env(repo, {"PYTHONPATH": "/elsewhere"}, home=str(tmp_path))
+
+    assert env["PYTHONPATH"] == "/elsewhere"
+
+
+def test_run_ci_checks_subprocess_does_not_see_parent_environment(repo, monkeypatch):
+    monkeypatch.setenv("CANARY_SECRET", "leak")
+    passed, output = run_ci_checks(
+        repo, [sys.executable, "-c", "import os; print(repr(os.environ.get('CANARY_SECRET')))"]
+    )
+
+    assert passed is True, output
+    assert "None" in output
+    assert "leak" not in output
+
+
+def test_run_ci_checks_workspace_shadows_an_installed_copy(repo, tmp_path, monkeypatch):
+    """The checkout under test comes first on the child's import path, so a
+    module also present on the parent's PYTHONPATH (or in site-packages) is
+    shadowed by the patched workspace copy."""
+    stale = tmp_path / "installed"
+    stale.mkdir()
+    (stale / "shadowed_mod.py").write_text("VALUE = 'installed'\n")
+    (Path(repo) / "shadowed_mod.py").write_text("VALUE = 'workspace'\n")
+    monkeypatch.setenv("PYTHONPATH", str(stale))
+
+    passed, output = run_ci_checks(
+        repo, [sys.executable, "-c", "import shadowed_mod; print(shadowed_mod.VALUE)"]
+    )
+
+    assert passed is True, output
+    assert "workspace" in output
+    assert "installed" not in output
+
+
+def test_run_ci_checks_uses_a_throwaway_home(repo):
+    passed, output = run_ci_checks(
+        repo, [sys.executable, "-c", "import os; print(os.path.expanduser('~'))"]
+    )
+
+    assert passed is True, output
+    assert Path(output.strip()).resolve() != Path.home().resolve()
+
+
+def test_run_revision_attempt_forwards_extra_env_to_ci_checks(repo):
+    """run_revision_attempt forwards the caller's delta to the CI-check subprocess."""
     start = get_current_commit(repo)
-    env = {"OLLAMA_ENDPOINT": "http://pc-a:11434"}
+    extra = {"OLLAMA_ENDPOINT": "http://pc-a:11434"}
     output = _full_file_output("a.py", "value = 2")
 
     with patch("workspace.run_ci_checks", return_value=(True, "ok")) as m_ci:
         result = run_revision_attempt(
-            repo, output, ["a.py"], start_commit=start, env=env
+            repo, output, ["a.py"], start_commit=start, extra_env=extra
         )
 
     assert result.success is True
-    assert m_ci.call_args.kwargs["env"] == env
+    assert m_ci.call_args.kwargs["extra_env"] == extra
 
 
 # --- coder output recovery: implicit terminators and the apply ladder -------

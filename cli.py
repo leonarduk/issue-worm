@@ -16,12 +16,14 @@ import re
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as metadata_version
 from pathlib import Path
 
 import requests
 
 from config import ConfigError, load_config
-from coder import LocalOllamaCoder
+from coder import CoderConfigError, build_coder
 from history import DEFAULT_HISTORY_PATH, get_run, load_runs, record_run
 from registry import finish, heartbeat, list_runs, register
 from review import review_issue
@@ -321,10 +323,11 @@ def _run_build(args, config: dict) -> int:
     success = False
     try:
         coder_config = config.get("coder_config")
-        coder = LocalOllamaCoder(
-            endpoint=getattr(coder_config, "ollama_endpoint", None),
-            model=getattr(coder_config, "ollama_model", None),
-        )
+        try:
+            coder = build_coder(coder_config)
+        except CoderConfigError as exc:
+            print(f"✗ {exc}", file=sys.stderr)
+            return 1
         task = f"FILES: {', '.join(review.files)}\nDONE: {review.done}\n\n{body}"
         heartbeat(task_id, phase="coder")
         output = coder.propose(repo_path, task, review.files)
@@ -512,9 +515,22 @@ def _run_status(args) -> int:
 def _version_string() -> str:
     """The exact text `--version` prints - shared by the fast path in
     `main()` (#195) and argparse's own `--version` action below, so both
-    always agree."""
+    always agree.
+
+    Reports issue-worm-pro's own installed version alongside this shell's
+    when pro is present, rather than always claiming pro is missing (that
+    used to mislead users who *had* installed it) - via
+    `importlib.metadata` alone, deliberately NOT `_try_import_pro_cli`:
+    #195 makes `--version` a quick, offline lookup, and actually importing
+    `pro_cli` would pull in its whole dependency graph (agents.triage,
+    scheduler, usage_metering, ...) just to answer a version check.
+    """
     version = installed_version() or "unknown (source checkout)"
-    return f"{PACKAGE_NAME} {version} (public shell — triage/poll require issue-worm-pro)"
+    try:
+        pro_version = metadata_version("issue-worm-pro")
+    except PackageNotFoundError:
+        return f"{PACKAGE_NAME} {version} (public shell — triage/poll require issue-worm-pro)"
+    return f"{PACKAGE_NAME} {version} + issue-worm-pro {pro_version} (triage/poll/full build enabled)"
 
 
 def _build_parser() -> argparse.ArgumentParser:
