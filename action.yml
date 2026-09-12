@@ -81,7 +81,31 @@ runs:
       # from the caller's repo at `.` - those are two different checkouts
       # when this action is consumed as `uses: leonarduk/issue-worm@v1`
       # from someone else's workflow.
-      run: python -m pip install --upgrade pip && python -m pip install "${{ github.action_path }}"
+      #
+      # Into a fresh venv, not the runner's global/user site-packages: on a
+      # persistent self-hosted runner that also has issue-worm-pro installed
+      # (e.g. issue-worm-pro's own dogfood workflow, self-hosted per #580),
+      # a global install would leave `pro_cli` importable, and cli.py's
+      # `_try_import_pro_cli` (#352) silently delegates `issue-worm build`
+      # to the full pro scheduler/Triage instead of this action's advertised
+      # single-pass free engine - Triage then depends on Ollama being up on
+      # that runner for a workflow that never asked for it
+      # (issue-worm-pro#789). The venv's bin dir is prepended to PATH via
+      # GITHUB_PATH so every later step in this composite action resolves
+      # `issue-worm`/`python` here instead, regardless of what else is
+      # globally installed on the runner.
+      run: |
+        set -euo pipefail
+        venv_dir="${RUNNER_TEMP}/issue-worm-venv"
+        python -m venv "$venv_dir"
+        if [ -d "$venv_dir/Scripts" ]; then
+          venv_bin="$venv_dir/Scripts"
+        else
+          venv_bin="$venv_dir/bin"
+        fi
+        echo "$venv_bin" >> "$GITHUB_PATH"
+        "$venv_bin/python" -m pip install --upgrade pip
+        "$venv_bin/python" -m pip install "${{ github.action_path }}"
 
     - name: Run issue-worm build
       id: build
