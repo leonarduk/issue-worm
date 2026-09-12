@@ -159,6 +159,9 @@ runs:
         # so those changes will not be committed - a deliberate tradeoff,
         # since untracking `.issue-worm` is the point.
         git add -A .
+        # No default `.gitignore` template is shipped by this action, so a
+        # first-time adopter may not have `.issue-worm` ignored yet; this
+        # reset remains as a defensive fallback for that case.
         git reset -- .issue-worm
         git commit -m "issue-worm: apply changes for #${{ inputs.issue }}" -m "Closes #${{ inputs.issue }}"
         git push --force origin "$branch"
