@@ -164,9 +164,20 @@ runs:
           echo "PR for $branch already exists - pushed update, nothing more to do."
         else
           issue_title="$(gh issue view "${{ inputs.issue }}" --repo "${{ github.repository }}" --json title -q .title)"
+          # The action itself has no LLM-generated summary to draw on (that's
+          # the Coder's job, and its output is already applied as file
+          # edits, not prose) - so build the body from what's mechanically
+          # available: which files changed (this branch is always exactly
+          # one commit ahead of the base, so HEAD~1 is always the right
+          # diff base) and the issue it closes, rather than shipping the
+          # old placeholder text that told the reader nothing the title and
+          # "Closes #N" trailer didn't already say (issue-worm-pro#764).
+          changed_files="$(git diff --name-only HEAD~1 | sed 's/^/- /')"
+          pr_body="$(printf 'Automated single-pass change from the free issue-worm engine for #%s.\n\n**Files changed:**\n%s\n\nCloses #%s' \
+            "${{ inputs.issue }}" "$changed_files" "${{ inputs.issue }}")"
           gh pr create \
             --repo "${{ github.repository }}" \
             --head "$branch" \
             --title "issue-worm: ${issue_title:-issue #${{ inputs.issue }}}" \
-            --body "$(printf 'Automated single-pass change from the free issue-worm engine.\n\nCloses #%s' "${{ inputs.issue }}")"
+            --body "$pr_body"
         fi
