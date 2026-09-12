@@ -67,7 +67,7 @@ issue-worm isn't published on PyPI. Install the latest release wheel
 directly from GitHub Releases:
 
 ```bash
-pip install https://github.com/leonarduk/issue-worm/releases/download/v0.2.2/issue_worm-0.2.2-py3-none-any.whl
+pip install https://github.com/leonarduk/issue-worm/releases/download/v0.2.3/issue_worm-0.2.3-py3-none-any.whl
 ```
 
 `scripts/bump_readme_version.py`, run by
