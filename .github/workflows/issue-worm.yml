@@ -29,6 +29,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      # `uses: ./` below reads action.yml from this checkout's own working
+      # directory - unlike a remote `uses: owner/repo@ref`, which GitHub
+      # fetches independently, a local action needs the repo already
+      # checked out here or the run fails immediately with "Can't find
+      # 'action.yml' ... under <path>". Confirmed live (#258).
+      - uses: actions/checkout@v4
+
       - name: Run issue-worm
         uses: ./
         with:
