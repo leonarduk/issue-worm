@@ -216,17 +216,62 @@ runs:
           # is still modified on disk after the `git reset` above unstaged
           # it, so a working-tree diff would list files never committed.
           changed_files="$(git diff --name-only "$base_commit" HEAD | sed 's/^/- /' || true)"
+          # `review_issue` (review.py) already required a `DONE:` line under
+          # `## Implementation notes` before the build was allowed to run at
+          # all, so it's usually present here too - but that check was
+          # against cli.py's in-memory body, which may include a self-heal
+          # draft (`_self_heal_scope`) that failed to persist back to the
+          # actual GitHub issue for lack of `issues: write` (see the
+          # github-token input's description above). `|| true` on the `gh`
+          # call below means that gap - or any transient `gh` failure - just
+          # yields an empty $done_line and the older no-goal body, the same
+          # way changed_files degrades above; a best-effort goal line must
+          # never be the thing that aborts PR creation under this step's
+          # `set -e`.
+          #
+          # Scoped to the text between the "## Implementation notes" heading
+          # and the next "##" heading (or end of body), not a bare grep over
+          # the whole issue - a `DONE:`-looking line pasted elsewhere (an
+          # example, a quoted template) must not be mistaken for the real
+          # one. Mirrors review.py's own section-scoped `_DONE_RE` search,
+          # including "first well-formed section wins": only the first
+          # matching heading's text is scanned.
+          issue_body="$(gh issue view "${{ inputs.issue }}" --repo "${{ github.repository }}" --json body -q .body || true)"
+          notes_section="$(printf '%s\n' "$issue_body" | awk '
+            /^##[^#]/ {
+              heading = $0
+              sub(/^##[ \t]*/, "", heading)
+              sub(/[ \t]*$/, "", heading)
+              if (!found && tolower(heading) == "implementation notes") { f = 1; found = 1 }
+              else { f = 0 }
+              next
+            }
+            f { print }
+          ')"
+          done_line="$(printf '%s\n' "$notes_section" | grep -m1 -i '^DONE:' | sed -E 's/^[Dd][Oo][Nn][Ee]:[[:space:]]*//')"
+          goal_section=""
+          if [ -n "$done_line" ]; then
+            goal_section="$(printf '\n\n**Goal:** %s' "$done_line")"
+          fi
           # Branches on $() directly rather than composing through an
           # intermediate "files section" variable: command substitution
           # strips ALL trailing newlines, so a $(printf ...) meant to hold
           # "list\n\n" silently collapses to "list" with no separator,
           # running the last filename straight into "Closes #N" on one line.
+          # Mirrors issue-worm-pro's scheduler._pr_footer() so a PR carries
+          # the same "opened by issue-worm" attribution regardless of which
+          # of the two publishing paths (this Action vs. the pro scheduler)
+          # created it. The logo is always served from the public
+          # leonarduk/issue-worm repo (see that function's docstring for
+          # why: raw.githubusercontent.com 404s for unauthenticated
+          # viewers of a private target repo, github.com/.../raw/ does not).
+          pr_footer="$(printf '\n\n---\n<p align="center"><img src="https://github.com/leonarduk/issue-worm/raw/main/docs/logo.jpg" width="48" alt="issue-worm logo" /><br/><sub>🐛 Opened automatically by <a href="https://github.com/leonarduk/issue-worm">issue-worm</a></sub></p>')"
           if [ -n "$changed_files" ]; then
-            pr_body="$(printf 'Automated single-pass change from the free issue-worm engine for #%s.\n\n**Files changed:**\n%s\n\nCloses #%s' \
-              "${{ inputs.issue }}" "$changed_files" "${{ inputs.issue }}")"
+            pr_body="$(printf 'Automated single-pass change from the free issue-worm engine for #%s.%s\n\n**Files changed:**\n%s\n\nCloses #%s%s' \
+              "${{ inputs.issue }}" "$goal_section" "$changed_files" "${{ inputs.issue }}" "$pr_footer")"
           else
-            pr_body="$(printf 'Automated single-pass change from the free issue-worm engine for #%s.\n\nCloses #%s' \
-              "${{ inputs.issue }}" "${{ inputs.issue }}")"
+            pr_body="$(printf 'Automated single-pass change from the free issue-worm engine for #%s.%s\n\nCloses #%s%s' \
+              "${{ inputs.issue }}" "$goal_section" "${{ inputs.issue }}" "$pr_footer")"
           fi
           gh pr create \
             --repo "${{ github.repository }}" \
