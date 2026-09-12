@@ -11,7 +11,12 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      # Full vX.Y.Z only - NOT "v*". The floating action tag moved by the
+      # last step below (v1) must never cut a release of its own: a "v1"
+      # GitHub Release would become releases/latest, which is exactly what
+      # version_checker.py polls, and every free-engine user would be told
+      # to "upgrade" to it.
+      - "v[0-9]+.[0-9]+.[0-9]+"
 
 permissions:
   contents: write
@@ -94,3 +99,27 @@ jobs:
               echo "::warning::or manually run: scripts/bump_readme_version.py"
             fi
           fi
+
+      # Floating major tag for the composite action (action.yml): consumers
+      # write `uses: leonarduk/issue-worm@v1` (README "GitHub Action"), so
+      # each release moves v1 to the commit it just released. v1 is the
+      # action's interface version, deliberately independent of the 0.x
+      # package version - bump ACTION_MAJOR_TAG only for a breaking change
+      # to action.yml's inputs or behaviour (leonarduk/issue-worm-pro#581).
+      # The tag filter above keeps this push from cutting a "v1" release,
+      # and pyproject.toml's describe_command keeps setuptools-scm from
+      # deriving the package version from it.
+      - name: Move floating action tag
+        env:
+          ACTION_MAJOR_TAG: v1
+        run: |
+          # A patch release cut on an older line (v0.2.9 after v0.3.0 is
+          # out) must not drag v1 backwards - only the newest release moves it.
+          newest="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n 1)"
+          if [ "$newest" != "$GITHUB_REF_NAME" ]; then
+            echo "::notice::$GITHUB_REF_NAME is not the newest release ($newest); leaving $ACTION_MAJOR_TAG where it is."
+            exit 0
+          fi
+          git tag --force "$ACTION_MAJOR_TAG" "$GITHUB_SHA"
+          git push --force origin "refs/tags/$ACTION_MAJOR_TAG"
+          echo "Moved $ACTION_MAJOR_TAG to $GITHUB_REF_NAME ($GITHUB_SHA)."
