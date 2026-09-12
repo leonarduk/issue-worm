@@ -148,9 +148,10 @@ runs:
         # path doesn't exist at all - verified locally, since `set -e`
         # above would otherwise abort the step on a nonexistent pathspec.
         # If a consumer has `.issue-worm` *tracked* (committed by an older
-        # version of this action, before it was gitignored), this reset
-        # will unstage its changes along with everything else here - a
-        # deliberate tradeoff, since untracking it is the point.
+        # version of this action, before it was gitignored), `git add -A .`
+        # will stage modifications to it and this reset will unstage them,
+        # so those changes will not be committed - a deliberate tradeoff,
+        # since untracking `.issue-worm` is the point.
         git add -A .
         git reset -- .issue-worm
         git commit -m "issue-worm: apply changes for #${{ inputs.issue }}" -m "Closes #${{ inputs.issue }}"
