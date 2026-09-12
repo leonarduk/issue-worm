@@ -26,7 +26,7 @@ from config import ConfigError, load_config
 from coder import CoderConfigError, build_coder
 from history import DEFAULT_HISTORY_PATH, get_run, load_runs, record_run
 from registry import finish, heartbeat, list_runs, register
-from review import review_issue
+from review import ReviewResult, draft_implementation_notes, review_issue
 from version_checker import PACKAGE_NAME, check_and_prompt, installed_version
 from workspace import (
     FileChange,
@@ -201,6 +201,100 @@ def _fetch_issue_body(repo: str, issue_number: int) -> str | None:
         return None
 
 
+def _list_repo_top_level_files(repo: str) -> list[str]:
+    """Best-effort listing of ``repo``'s top-level file names, to ground a
+    self-heal draft (see `_self_heal_scope`) in what actually exists rather
+    than letting the coder invent plausible-looking paths. Returns []
+    on any failure - this is only context for a draft, never something
+    that should fail a build.
+    """
+    headers = {"Accept": "application/vnd.github+json"}
+    token = os.getenv("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    url = f"https://api.github.com/repos/{repo}/contents"
+    try:
+        response = requests.get(url, headers=headers, timeout=GITHUB_API_TIMEOUT)
+        response.raise_for_status()
+        return [
+            item["name"] for item in response.json() if item.get("type") == "file"
+        ]
+    except (requests.RequestException, ValueError, KeyError, TypeError):
+        logger.debug("Could not list top-level files for %s", repo, exc_info=True)
+        return []
+
+
+def _try_persist_implementation_notes(
+    repo: str, issue_number: int, section: str
+) -> None:
+    """Best-effort: append the auto-drafted section to the real issue body
+    on GitHub, so a human reading the issue (or the next run) sees the
+    same scope this run used instead of it existing only in this
+    process's memory. Never raises and never fails the build - a token
+    without `issues: write` (this action only documents needing
+    `issues: read`, see action.yml) is an expected, non-fatal case here,
+    not a reason to abandon a build that already has what it needs.
+    """
+    token = os.getenv("GITHUB_TOKEN")
+    if not token:
+        return
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+    }
+    url = f"https://api.github.com/repos/{repo}/issues/{issue_number}"
+    try:
+        current = requests.get(url, headers=headers, timeout=GITHUB_API_TIMEOUT)
+        current.raise_for_status()
+        current_body = current.json().get("body") or ""
+        response = requests.patch(
+            url,
+            headers=headers,
+            json={"body": f"{current_body}\n\n{section}"},
+            timeout=GITHUB_API_TIMEOUT,
+        )
+        response.raise_for_status()
+    except (requests.RequestException, ValueError, KeyError):
+        logger.debug(
+            "Could not persist auto-drafted Implementation notes to %s#%s",
+            repo,
+            issue_number,
+            exc_info=True,
+        )
+
+
+def _self_heal_scope(
+    repo: str, issue_number: int, body: str, config: dict
+) -> tuple[ReviewResult, str] | None:
+    """When `review_issue` rejects an issue as not scoped, try once to
+    draft the missing `## Implementation notes` section with the
+    configured Coder instead of just erroring - the dispatcher is meant to
+    heal a missing-scope issue itself rather than hand a human a manual
+    edit to make (issue-worm-pro#753's review thread flagged exactly this
+    gap). Returns the healed ``(review, body)`` pair on success, or None
+    if healing wasn't possible (Coder unconfigured/unreachable, or its
+    draft still doesn't parse) - callers should fall back to the original
+    `review.message` in that case.
+    """
+    try:
+        coder = build_coder(config.get("coder_config"))
+    except CoderConfigError:
+        return None
+    repo_files = _list_repo_top_level_files(repo)
+    section = draft_implementation_notes(body, repo_files, coder)
+    if section is None:
+        return None
+    healed_body = f"{body}\n\n{section}"
+    review = review_issue(healed_body)
+    if not review.ready:
+        return None
+    print("⚠ Issue had no `## Implementation notes` section — auto-drafted one:")
+    print(f"  FILES: {', '.join(review.files)}")
+    print(f"  DONE: {review.done}")
+    _try_persist_implementation_notes(repo, issue_number, section)
+    return review, healed_body
+
+
 @dataclass
 class _FreeBuildRun:
     """Minimal free-tier stand-in for issue-worm-pro's `orchestrator.TaskRun`
@@ -237,9 +331,11 @@ class _FreeBuildRun:
 
 
 def _run_build(args, config: dict) -> int:
-    """Single-pass, free-tier `build`: heuristic review + local Ollama
-    coder, writing changes straight to the working tree. No verifier/
-    retry loop, no scheduler — matches the free shell's scope (#2).
+    """Single-pass, free-tier `build`: heuristic review (self-healed by the
+    Coder if the issue isn't scoped yet - see `_self_heal_scope`) + local
+    Ollama coder, writing changes straight to the working tree. No
+    verifier/retry loop, no scheduler — matches the free shell's scope
+    (#2).
     """
     issue_numbers = list(args.issues) + list(args.issue or [])
     if not issue_numbers:
@@ -270,6 +366,10 @@ def _run_build(args, config: dict) -> int:
         return 1
 
     review = review_issue(body)
+    if not review.ready:
+        healed = _self_heal_scope(args.repo, issue_number, body, config)
+        if healed is not None:
+            review, body = healed
     if not review.ready:
         print(f"✗ {review.message}", file=sys.stderr)
         return 1

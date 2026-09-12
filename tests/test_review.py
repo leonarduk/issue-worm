@@ -3,7 +3,7 @@
 free-tier Coder?
 """
 
-from review import review_issue
+from review import draft_implementation_notes, review_issue
 
 
 def test_well_scoped_issue_is_ready():
@@ -131,3 +131,58 @@ def test_crlf_line_endings_are_handled():
     assert result.ready is True
     assert result.files == ["a.py"]
     assert result.done == "works"
+
+
+class _StubCoder:
+    def __init__(self, response):
+        self.response = response
+        self.prompts = []
+
+    def complete(self, prompt):
+        self.prompts.append(prompt)
+        return self.response
+
+
+def test_draft_implementation_notes_returns_well_formed_section():
+    coder = _StubCoder(
+        "## Implementation notes\nFILES: cli.py\nDONE: --version exits 0\n"
+    )
+
+    section = draft_implementation_notes("Add a --version flag.", ["cli.py"], coder)
+
+    assert section is not None
+    assert "FILES: cli.py" in section
+    assert "cli.py" in coder.prompts[0]
+    assert "Add a --version flag." in coder.prompts[0]
+
+
+def test_draft_implementation_notes_rejects_unparseable_response():
+    coder = _StubCoder("Sure, I'll get right on that!")
+
+    section = draft_implementation_notes("Add a --version flag.", [], coder)
+
+    assert section is None
+
+
+def test_draft_implementation_notes_rejects_empty_response():
+    coder = _StubCoder("")
+
+    section = draft_implementation_notes("Add a --version flag.", [], coder)
+
+    assert section is None
+
+
+def test_draft_implementation_notes_returns_none_without_a_coder():
+    assert draft_implementation_notes("Add a --version flag.", [], None) is None
+
+
+def test_draft_implementation_notes_returns_none_for_empty_body():
+    assert draft_implementation_notes("", [], _StubCoder("anything")) is None
+
+
+def test_draft_implementation_notes_survives_coder_exception():
+    class _RaisingCoder:
+        def complete(self, prompt):
+            raise RuntimeError("network exploded")
+
+    assert draft_implementation_notes("task", [], _RaisingCoder()) is None

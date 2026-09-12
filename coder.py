@@ -8,9 +8,10 @@ an HTTP endpoint and emit the same
 `workspace.parse_coder_output` already parses.
 
 Two coders live here, both satisfying the same informal Coder protocol
-(a constructor that accepts optional `endpoint`/`model`, and a
-`propose(workspace_dir, task, files) -> str` that never raises — any
-failure is logged and reported back as `""`):
+(a constructor that accepts optional `endpoint`/`model`, a
+`propose(workspace_dir, task, files) -> str` for the file-edit contract,
+and a `complete(prompt) -> str` for a plain-text completion — both never
+raise, any failure is logged and reported back as `""`):
 
 - `LocalOllamaCoder` — talks to a local/self-hosted Ollama's
   `/api/generate` (`CODER_MODEL_SOURCE=local`).
@@ -77,6 +78,15 @@ class LocalOllamaCoder:
         except Exception:  # noqa: BLE001 - _build_prompt is local/pure; any failure here is "cannot propose", not a bug to propagate
             logger.warning("Failed to build prompt for %s", workspace_dir, exc_info=True)
             return ""
+        return self.complete(prompt)
+
+    def complete(self, prompt: str) -> str:
+        """Return the raw text completion for an arbitrary `prompt`, or ""
+        on any failure — never raises. Unlike `propose`, this skips the
+        file-edit prompt/output contract, for callers that just want a
+        plain-text answer back (e.g. `review.draft_implementation_notes`,
+        which drafts a scope section rather than a file diff).
+        """
         try:
             response = requests.post(
                 f"{self.endpoint}/api/generate",
@@ -128,6 +138,15 @@ class RemoteOpenAICoder:
         except Exception:  # noqa: BLE001 - _build_prompt is local/pure; any failure here is "cannot propose", not a bug to propagate
             logger.warning("Failed to build prompt for %s", workspace_dir, exc_info=True)
             return ""
+        return self.complete(prompt)
+
+    def complete(self, prompt: str) -> str:
+        """Return the raw text completion for an arbitrary `prompt`, or ""
+        on any failure — never raises. Unlike `propose`, this skips the
+        file-edit prompt/output contract, for callers that just want a
+        plain-text answer back (e.g. `review.draft_implementation_notes`,
+        which drafts a scope section rather than a file diff).
+        """
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -161,6 +180,7 @@ class Coder(Protocol):
     """Informal protocol both coder classes satisfy — see module docstring."""
 
     def propose(self, workspace_dir: str, task: str, files: list[str]) -> str: ...
+    def complete(self, prompt: str) -> str: ...
 
 
 class CoderConfigError(ValueError):
