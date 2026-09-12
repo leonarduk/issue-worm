@@ -542,11 +542,19 @@ def test_build_skips_self_heal_when_already_ready(capsys):
         sys, "argv", ["issue-worm", "build", "5", "--repo", "o/r", "--dry-run"]
     ), patch("cli._fetch_issue_body", return_value="body"), patch(
         "cli.review_issue", return_value=ready
-    ), patch("cli._self_heal_scope") as mock_heal, pytest.raises(SystemExit) as exc:
+    ), patch("cli._self_heal_scope") as mock_heal, patch(
+        "cli.build_coder"
+    ) as mock_build_coder, pytest.raises(SystemExit) as exc:
         cli.main()
 
     assert exc.value.code == 0
     mock_heal.assert_not_called()
+    # Pins the docstring's actual claim (no wasted Coder call), not just
+    # that `_self_heal_scope` itself was skipped - DeepSeek's review of
+    # PR #268 pointed out a refactor moving the Coder construction out of
+    # `_self_heal_scope` could pass the old assertion while still
+    # regressing.
+    mock_build_coder.assert_not_called()
     assert "it works" in capsys.readouterr().out
 
 
