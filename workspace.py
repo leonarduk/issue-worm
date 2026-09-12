@@ -122,6 +122,7 @@ _FILE_END_RE = re.compile(r"^=== END FILE ===[ \t]*$", re.MULTILINE)
 # A unified diff's own syntax always starts with one of these; used to find
 # where a MODE: DIFF section's diff body starts amid surrounding prose.
 _DIFF_START_RE = re.compile(r"^(diff --git |--- )", re.MULTILINE)
+_HUNK_START_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@", re.MULTILINE)
 _DIFF_LINE_PREFIXES = ("diff --git", "index ", "---", "+++", "@@", " ", "+", "-", "\\")
 # Modalities may wrap a section's body in a Markdown fenced code block
 # (```diff / ```python / bare ``` / ...) in addition to the mandated
@@ -484,17 +485,31 @@ def _strip_edge_fences(text: str) -> str:
     return "\n".join(lines)
 
 
-def _extract_diff(body: str) -> str | None:
+def _extract_diff(body: str, path: str | None = None) -> str | None:
     """Pull the unified-diff hunk out of a MODE: DIFF section's body.
 
     NativeCoder's prompt asks for "a unified diff ... with a brief
     explanation" (agents/coder.py), so the body can have prose before
     and/or after the actual diff. Finds where diff syntax starts, then
-    stops at the first line that no longer looks diff-shaped.
+    stops at the first line that no longer looks diff-shaped. ``path`` is
+    the section's declared file, used to synthesise the ``---``/``+++``
+    header when the Coder sent bare hunks.
     """
     match = _DIFF_START_RE.search(body)
     if not match:
-        return None
+        # No `diff --git` / `---` header at all. A Coder that was told the
+        # file's path in the FILE marker often answers with bare hunks
+        # (`@@ -n,m +n,m @@` onward, usually inside a ```diff fence): the
+        # header is redundant with the marker, so synthesise it for the
+        # declared path rather than reject the section (2026-09-12: every
+        # attempt on a 123 KB file failed this way twice before a retry
+        # happened to include the header).
+        hunk = _HUNK_START_RE.search(body)
+        if not hunk or not path:
+            return None
+        body = f"--- a/{path}\n+++ b/{path}\n" + body[hunk.start():]
+        match = _DIFF_START_RE.search(body)
+        assert match is not None
 
     lines = body[match.start():].splitlines()
     end = len(lines)
@@ -614,10 +629,14 @@ def parse_coder_output(output: str, declared_files: list[str]) -> list[FileChang
         seen_paths.add(path)
 
         if mode == MODE_DIFF:
-            diff_text = _extract_diff(body)
+            diff_text = _extract_diff(body, path)
             if diff_text is None:
                 raise MalformedOutputError(
                     f"MODE: DIFF section for {path!r} contains no parseable unified diff"
+                )
+            if not _DIFF_START_RE.search(body):
+                recovery = (
+                    f"{recovery}; synthesised diff header" if recovery else "synthesised diff header"
                 )
             body = diff_text
         else:

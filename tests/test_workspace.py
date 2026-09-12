@@ -870,6 +870,29 @@ def test_parse_still_rejects_output_with_no_file_header():
         parse_coder_output("Here is the change you asked for:\n\nvalue = 2\n", ["a.py"])
 
 
+def test_parse_diff_section_with_bare_hunks_gets_a_synthesised_header():
+    """A ```diff-fenced body that starts at `@@` (no ---/+++ header) is a
+    valid patch once the header for the declared path is added."""
+    output = (
+        "=== FILE: a.py ===\n=== MODE: DIFF ===\n"
+        "```diff\n@@ -1 +1 @@\n-value = 1\n+value = 2\n```\n"
+        "**Explanation:** bumps the value.\n=== END FILE ===\n"
+    )
+    changes = parse_coder_output(output, ["a.py"])
+
+    assert changes[0].body == "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-value = 1\n+value = 2\n"
+    assert changes[0].recovery == "synthesised diff header"
+
+
+def test_parse_diff_section_with_no_hunks_is_still_rejected():
+    output = (
+        "=== FILE: a.py ===\n=== MODE: DIFF ===\n"
+        "Just change value to 2.\n=== END FILE ===\n"
+    )
+    with pytest.raises(MalformedOutputError, match="no parseable unified diff"):
+        parse_coder_output(output, ["a.py"])
+
+
 def _diff_for_a(before_context: str, after_context: str) -> str:
     return (
         "--- a/a.py\n+++ b/a.py\n"
