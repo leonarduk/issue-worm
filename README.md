@@ -142,7 +142,7 @@ for the working copy this repo runs on itself.
 | Input | Required | Description |
 |---|---|---|
 | `issue` | yes | Number of the issue to work. |
-| `github-token` | yes | A PAT or GitHub App token with `contents: write` and `pull-requests: write` on the target repo. The built-in `secrets.GITHUB_TOKEN` is **not** sufficient — a PR opened (or pushed to) with it deliberately does not trigger other workflow runs, so anything gated on the PR (CI, review bots, required checks) would never fire. This token also authenticates the issue-body fetch, the `git push`, and `gh pr create`. |
+| `github-token` | yes | A PAT or GitHub App token with `contents: write`, `pull-requests: write`, and `issues: read` on the target repo. A classic PAT's `repo` scope covers all three; a fine-grained PAT needs each granted separately — `issues: read` is easy to miss, since only the issue-body fetch needs it, and that runs (and fails) before the push/PR steps ever do. The built-in `secrets.GITHUB_TOKEN` is **not** sufficient either way — a PR opened (or pushed to) with it deliberately does not trigger other workflow runs, so anything gated on the PR (CI, review bots, required checks) would never fire. |
 | `license-key` | no | Reserved for the pro engine. Currently accepted and logged only — installing the pro wheel from a license key is a separate, unimplemented piece of work ([leonarduk/issue-worm-pro#584](https://github.com/leonarduk/issue-worm-pro/issues/584)). Omit it (the default) to run the free engine, which is everything the action does today. |
 
 ### `runs-on` options

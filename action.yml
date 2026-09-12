@@ -21,15 +21,20 @@ inputs:
     required: true
   github-token:
     description: >-
-      A PAT or GitHub App installation token with `contents: write` and
-      `pull-requests: write` on the target repo. Required - the built-in
-      `secrets.GITHUB_TOKEN` is NOT enough: pull requests (and pushes)
-      made with the default token deliberately do not trigger other
-      workflow runs, so any CI configured to run on the PR (tests, review
-      bots, required checks) would silently never fire. A PAT or App token
-      does trigger them. This same token also authenticates the `git push`
-      and `gh pr create` steps below and is used to fetch the issue body
-      (higher rate limit; required at all for a private repo).
+      A PAT or GitHub App installation token with `contents: write`,
+      `pull-requests: write`, and `issues: read` on the target repo. A
+      classic PAT's `repo` scope covers all three together; a fine-grained
+      PAT needs each granted separately - `issues: read` is easy to miss
+      since it isn't needed for the push/PR steps, only for fetching the
+      issue body below, and this action fails there first (before either
+      of the other two is ever exercised) if it's absent. Required - the
+      built-in `secrets.GITHUB_TOKEN` is NOT enough: pull requests (and
+      pushes) made with the default token deliberately do not trigger
+      other workflow runs, so any CI configured to run on the PR (tests,
+      review bots, required checks) would silently never fire. A PAT or
+      App token does trigger them. This same token also authenticates the
+      `git push` and `gh pr create` steps below and is used to fetch the
+      issue body (higher rate limit; required at all for a private repo).
     required: true
   license-key:
     description: >-
