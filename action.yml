@@ -1,15 +1,23 @@
 name: issue-worm
 description: >-
   Turn a GitHub issue into a pull request using issue-worm's free, single-pass
-  local-Ollama engine. This is a composite action, not a reusable workflow -
+  engine (local Ollama, or a cloud/OpenAI-compatible endpoint via
+  CODER_MODEL_SOURCE). This is a composite action, not a reusable workflow -
   it does not set `runs-on`, so the calling job chooses the runner
   (`ubuntu-latest`, a self-hosted pool, anything) with no branching in here.
 author: leonarduk
 
 inputs:
   issue:
+    # Not ${{ github.event.issue.number }} here: action.yml's own string
+    # fields (name/description/inputs.*.description/author) are themselves
+    # evaluated as expressions if they contain the ${{ }} delimiter, and
+    # `github` isn't a valid context in that evaluation - GitHub fails the
+    # whole manifest load with "Unrecognized named-value: 'github'" before
+    # the action ever runs. Keep this plain text; do not reintroduce it.
     description: >-
-      Number of the issue to work (e.g. ${{ github.event.issue.number }}).
+      Number of the issue to work (e.g. from a caller's
+      github.event.issue.number).
     required: true
   github-token:
     description: >-
