@@ -613,8 +613,9 @@ _MIN_BLOCK_REPEATS = 4
 # small repeated snippet inside an otherwise large, legitimate file (a table
 # of test cases, say) doesn't fail the whole attempt.
 _MIN_REPEATED_BLOCK_COVERAGE = 0.3
-# Bounding the block size searched keeps the scan roughly linear in body
-# length: a degenerate loop repeats a short pattern, never a huge one.
+# Bounding the block size searched caps the scan at O(n * max_block *
+# block_len) rather than letting it grow quadratically in body length: a
+# degenerate loop repeats a short pattern, never a huge one.
 _MAX_REPEATED_BLOCK_LINES = 60
 
 
@@ -833,16 +834,19 @@ def _apply_one_block(
             )
         return (replace + "\n" if replace else ""), None
 
-    exact = search + "\n"
-    # Match against a newline-terminated view so a SEARCH that quotes the
-    # file's last line still matches when the file has no final newline,
-    # then restore that absence: an edit must not change the file's
-    # end-of-file shape as a side effect.
+    # Match whole lines only: both the SEARCH text and the file are wrapped
+    # in newlines, so "x = 1" can't match inside "max = 1". The file view is
+    # newline-terminated so a SEARCH quoting the last line still matches
+    # when the file has no final newline; that absence is restored after,
+    # because an edit must not change the end-of-file shape as a side
+    # effect. Occurrences are counted with a lookahead, since adjacent
+    # identical lines share a newline and str.count would undercount them.
+    exact = "\n" + search + "\n"
     had_final_newline = text.endswith("\n")
-    probe = text if had_final_newline else text + "\n"
-    count = probe.count(exact)
+    probe = "\n" + (text if had_final_newline else text + "\n")
+    count = len(re.findall("(?=" + re.escape(exact) + ")", probe))
     if count == 1:
-        out = probe.replace(exact, replace + "\n" if replace else "", 1)
+        out = probe.replace(exact, "\n" + (replace + "\n" if replace else ""), 1)[1:]
         if not had_final_newline and out.endswith("\n"):
             out = out[:-1]
         return out, None
@@ -878,12 +882,20 @@ def _apply_one_block(
                 new_lines = _reindent(new_lines, search_lines, matched)
             eol = "\r\n" if file_lines[start].endswith("\r\n") else "\n"
             chunk = "".join(line + eol for line in new_lines)
-            return (
+            out = (
                 "".join(file_lines[:start])
                 + chunk
-                + "".join(file_lines[start + size :]),
-                rung,
+                + "".join(file_lines[start + size :])
             )
+            # Same end-of-file rule as the exact path: an edit that reaches
+            # the last line must not add a final newline the file lacked.
+            if (
+                not had_final_newline
+                and start + size == len(file_lines)
+                and out.endswith(eol)
+            ):
+                out = out[: -len(eol)]
+            return out, rung
 
     first = next((line.strip() for line in search_lines if line.strip()), "")
     raise MalformedOutputError(

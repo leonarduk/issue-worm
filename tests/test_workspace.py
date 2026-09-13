@@ -2436,6 +2436,48 @@ def test_search_replace_keeps_a_missing_final_newline_missing():
     )
 
 
+@pytest.mark.parametrize(
+    "content, search, replace, expected, rung",
+    [
+        # Whitespace-tolerant rung, edit reaches the last line.
+        (
+            "a = 1\nb = 2",
+            "b = 2  ",
+            "b = 3",
+            "a = 1\nb = 3",
+            "edit-whitespace-tolerant",
+        ),
+        # Indentation-tolerant rung, edit reaches the last line.
+        (
+            "def f():\n    return 2",
+            "return 2",
+            "return 3",
+            "def f():\n    return 3",
+            "edit-indentation-tolerant",
+        ),
+    ],
+)
+def test_search_replace_fallback_rungs_keep_a_missing_final_newline_missing(
+    content, search, replace, expected, rung
+):
+    body = f"<<<<<<< SEARCH\n{search}\n=======\n{replace}\n>>>>>>> REPLACE\n"
+
+    assert _apply_search_replace(content, body, "a.py") == (expected, rung)
+
+
+def test_search_replace_exact_match_is_anchored_to_whole_lines():
+    """SEARCH "x = 1" must not match inside "max = 1"; adjacent identical
+    lines still count as two matches (ambiguous)."""
+    body = "<<<<<<< SEARCH\nx = 1\n=======\nx = 3\n>>>>>>> REPLACE\n"
+
+    assert _apply_search_replace("max = 1\nx = 1\n", body, "a.py") == (
+        "max = 1\nx = 3\n",
+        None,
+    )
+    with pytest.raises(MalformedOutputError, match="matches 2 places"):
+        _apply_search_replace("x = 1\nx = 1\n", body, "a.py")
+
+
 def test_search_replace_new_file_later_blocks_edit_what_the_first_wrote():
     """For a missing file only the first (empty) SEARCH creates it; a later
     block may edit that content, and a later block that matches nothing
