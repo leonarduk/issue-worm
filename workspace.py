@@ -581,6 +581,143 @@ def _drop_prose_after_closing_fence(body: str) -> str:
     return body
 
 
+# Repetition guards (see issue-worm-pro runs #582/#623, 2026-09-13). A Coder
+# response can degenerate in two ways that the section grammar alone does
+# not catch:
+#
+# 1. The same FILE path is emitted more than once. Seen live: the model
+#    "planned" out loud with FILE/MODE headers carrying placeholder bodies
+#    ("[diff]", "(no change needed)"), never closed with END FILE, and only
+#    then wrote the real, END FILE-terminated sections - 18 sections for 6
+#    files. Treating the first placeholder as the change rejected the whole
+#    response ("contains no parseable unified diff") although a complete
+#    answer followed it. The same shape arises from a verbatim loop that
+#    runs into the output cap: complete copies, then a truncated one.
+# 2. A block of lines inside ONE section repeats over and over (a
+#    generation loop that keeps "succeeding" at producing output).
+#
+# _resolve_repeated_sections keeps exactly one section per path when that
+# is unambiguous and otherwise fails with a message naming the path and the
+# count; _detect_line_repetition flags case 2.
+
+# A repeated block must be at least this many lines and repeat at least this
+# many times, consecutively, to be flagged - short accidental repeats (e.g.
+# three near-identical `if` branches) are normal code and must not trip it.
+_MIN_REPEATED_BLOCK_LINES = 3
+_MIN_BLOCK_REPEATS = 4
+# ...and the repeated run must cover a meaningful share of the section, so a
+# small repeated snippet inside an otherwise large, legitimate file (a table
+# of test cases, say) doesn't fail the whole attempt.
+_MIN_REPEATED_BLOCK_COVERAGE = 0.3
+# Bounding the block size searched keeps the scan roughly linear in body
+# length: a degenerate loop repeats a short pattern, never a huge one.
+_MAX_REPEATED_BLOCK_LINES = 60
+
+
+def _detect_line_repetition(body: str) -> str | None:
+    """Find a contiguous block of lines repeated many times in ``body``.
+
+    Returns a short description of the largest such run (by lines
+    covered), or None when no block meets both the repeat-count and the
+    coverage thresholds above.
+    """
+    lines = body.splitlines()
+    n = len(lines)
+    if n < _MIN_REPEATED_BLOCK_LINES * _MIN_BLOCK_REPEATS:
+        return None
+
+    best: tuple[int, int, int] | None = None  # (lines covered, block len, repeats)
+    max_block = min(_MAX_REPEATED_BLOCK_LINES, n // _MIN_BLOCK_REPEATS)
+    for block_len in range(_MIN_REPEATED_BLOCK_LINES, max_block + 1):
+        i = 0
+        while i + block_len * 2 <= n:
+            block = lines[i : i + block_len]
+            if not any(line.strip() for line in block):
+                # Blank padding repeating is whitespace, not a content loop.
+                i += 1
+                continue
+            repeats = 1
+            j = i + block_len
+            while j + block_len <= n and lines[j : j + block_len] == block:
+                repeats += 1
+                j += block_len
+            if repeats >= _MIN_BLOCK_REPEATS:
+                covered = block_len * repeats
+                if covered / n >= _MIN_REPEATED_BLOCK_COVERAGE and (
+                    best is None or covered > best[0]
+                ):
+                    best = (covered, block_len, repeats)
+                i = j
+            else:
+                i += 1
+    if best is None:
+        return None
+    _, block_len, repeats = best
+    return f"a {block_len}-line block repeated {repeats} times in a row"
+
+
+def _resolve_repeated_sections(
+    sections: list[tuple[str, str, str, str | None]],
+) -> list[tuple[str, str, str, str | None]]:
+    """Collapse (path, mode, body, recovery) sections to one per path.
+
+    ``path`` must already be sanitized. Paths keep their first-seen order.
+    A path seen once passes through untouched. For a repeated path:
+
+    - every copy identical (same mode, same body modulo edge blank lines):
+      keep one;
+    - otherwise, if the copies closed with an explicit ``=== END FILE ===``
+      (recovery None) all agree and every other copy is unterminated: keep
+      the terminated one. The unterminated copies are drafts (placeholder
+      headers written while planning) or a loop cut off by the output cap;
+      the terminated copy is the one the Coder actually finished;
+    - anything else is ambiguous: MalformedOutputError naming the path and
+      how many times it was emitted.
+
+    A kept section's recovery note records what was dropped, so callers
+    can count how often this rescue, not the Coder, made an attempt usable.
+    """
+    order: list[str] = []
+    groups: dict[str, list[tuple[str, str, str | None]]] = {}
+    for path, mode, body, recovery in sections:
+        if path not in groups:
+            order.append(path)
+            groups[path] = []
+        groups[path].append((mode, body, recovery))
+
+    resolved: list[tuple[str, str, str, str | None]] = []
+    for path in order:
+        entries = groups[path]
+        if len(entries) == 1:
+            mode, body, recovery = entries[0]
+            resolved.append((path, mode, body, recovery))
+            continue
+
+        def key(entry: tuple[str, str, str | None]) -> tuple[str, str]:
+            return entry[0], entry[1].strip("\n")
+
+        terminated = [entry for entry in entries if entry[2] is None]
+        if len({key(entry) for entry in entries}) == 1:
+            kept = terminated[0] if terminated else entries[0]
+            note = f"kept 1 of {len(entries)} identical repeated FILE sections"
+        elif terminated and len({key(entry) for entry in terminated}) == 1:
+            kept = terminated[0]
+            dropped = len(entries) - len(terminated)
+            note = (
+                f"kept the END FILE-terminated section, dropped {dropped} "
+                f"unterminated draft/looped section(s) ({len(entries)} emitted)"
+            )
+        else:
+            raise MalformedOutputError(
+                f"coder output emits a FILE section for {path!r} "
+                f"{len(entries)} times with differing content (looks like a "
+                "repetition loop) - emit exactly one section per file"
+            )
+        mode, body, recovery = kept
+        resolved.append((path, mode, body, f"{recovery}; {note}" if recovery else note))
+    return resolved
+
+
 def parse_coder_output(output: str, declared_files: list[str]) -> list[FileChange]:
     """Split a Coder response into per-file changes, rejecting anything
     that isn't safe to hand to git apply / a direct file write.
@@ -604,14 +741,10 @@ def parse_coder_output(output: str, declared_files: list[str]) -> list[FileChang
     # matches its declared, sanitized file.
     declared = {sanitize_file_path(f) for f in declared_files}
     declared.discard(None)
-    changes: list[FileChange] = []
-    seen_paths: set[str] = set()
 
+    validated: list[tuple[str, str, str, str | None]] = []
     for path, mode, body, recovery in sections:
         path = path.strip()
-        mode = mode.strip()
-        body = body.strip("\n")
-
         normalized = sanitize_file_path(path)
         if normalized is None:
             raise MalformedOutputError(
@@ -625,8 +758,11 @@ def parse_coder_output(output: str, declared_files: list[str]) -> list[FileChang
             )
         if _escapes_repo(path):
             raise MalformedOutputError(f"file path escapes the repository: {path!r}")
-        if path in seen_paths:
-            raise MalformedOutputError(f"duplicate FILE section for {path!r}")
+        validated.append((path, mode.strip(), body.strip("\n"), recovery))
+
+    changes: list[FileChange] = []
+    seen_paths: set[str] = set()
+    for path, mode, body, recovery in _resolve_repeated_sections(validated):
         seen_paths.add(path)
 
         if mode == MODE_DIFF:
@@ -655,10 +791,16 @@ def parse_coder_output(output: str, declared_files: list[str]) -> list[FileChang
             # for its own fencing (issue #248).
             body = _strip_edge_fences(body)
 
+        loop = _detect_line_repetition(body)
+        if loop is not None:
+            raise MalformedOutputError(
+                f"MODE: {mode} section for {path!r} contains {loop} - looks "
+                "like a generation loop, refusing to apply it"
+            )
+
         if recovery is not None:
             logger.warning(
-                "parse_coder_output: FILE section for %r has no "
-                "'=== END FILE ===' line; %s",
+                "parse_coder_output: FILE section for %r needed recovery: %s",
                 path,
                 recovery,
             )

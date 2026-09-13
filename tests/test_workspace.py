@@ -19,6 +19,7 @@ from workspace import (
     FileChange,
     MalformedOutputError,
     WorkspaceError,
+    _detect_line_repetition,
     _non_interactive_env,
     _RollbackGuard,
     _redact_url,
@@ -447,9 +448,11 @@ def test_parse_rejects_absolute_path():
 
 
 def test_parse_rejects_duplicate_file_sections():
+    """Two complete, differing sections for one path: no way to tell which
+    one the Coder meant, so reject - naming the path and the count."""
     output = _full_file_output("a.py", "x = 1") + "\n" + _full_file_output("a.py", "x = 2")
 
-    with pytest.raises(MalformedOutputError, match="duplicate"):
+    with pytest.raises(MalformedOutputError, match=r"'a\.py' 2 times with differing content"):
         parse_coder_output(output, ["a.py"])
 
 
@@ -2177,3 +2180,112 @@ def test_ensure_base_clone_clone_is_non_interactive_even_on_a_terminal(
     ]
     assert clones, "ensure_base_clone no longer clones"
     assert clones[0].kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
+
+
+# --- repetition guards (issue-worm-pro runs #582 / #623) ---------------------
+#
+# The fixture below is a synthetic, trimmed copy of the SHAPE of a recorded
+# #582 Coder attempt (the real one targets private code): the model first
+# "planned" with FILE/MODE headers carrying placeholder bodies and never
+# closed them, then wrote the real, END FILE-terminated sections - 18
+# sections for 6 files. The old parser rejected it on the first placeholder
+# ("contains no parseable unified diff").
+
+
+def _planning_then_final_output(diff):
+    stub_round = (
+        "=== FILE: a.py ===\n=== MODE: DIFF ===\n[diff]\n\n"
+        "=== FILE: b.py ===\n=== MODE: FULL ===\n(no change needed - already correct)\n\n"
+        "Let me write these out now.\n\nFinal output:\n\n"
+    )
+    final_round = _diff_output("a.py", diff) + _full_file_output("b.py", "b = 2")
+    return "I'll analyze the feedback first.\n\n" + stub_round + stub_round + final_round
+
+
+def test_parse_keeps_terminated_section_over_unterminated_planning_drafts(repo):
+    diff = _make_diff(repo, "value = 1\n", "value = 2\n")
+
+    changes = parse_coder_output(_planning_then_final_output(diff), ["a.py", "b.py"])
+
+    by_path = {c.path: c for c in changes}
+    assert [c.path for c in changes] == ["a.py", "b.py"]
+    assert "+value = 2" in by_path["a.py"].body
+    assert by_path["b.py"].body == "b = 2"
+    for change in changes:
+        assert "dropped 2 unterminated draft/looped section(s) (3 emitted)" in change.recovery
+
+
+def test_parse_repeated_planning_drafts_result_applies(repo):
+    diff = _make_diff(repo, "value = 1\n", "value = 2\n")
+
+    result = run_revision_attempt(
+        repo,
+        _planning_then_final_output(diff),
+        ["a.py", "b.py"],
+        ci_command=[sys.executable, "-c", "pass"],
+    )
+
+    assert result.success, result.error
+    assert any("unterminated draft" in note for note in result.recovery)
+
+
+def test_parse_dedupes_identical_repeated_sections():
+    output = _full_file_output("a.py", "x = 1") * 3
+
+    changes = parse_coder_output(output, ["a.py"])
+
+    assert len(changes) == 1
+    assert changes[0].body == "x = 1"
+    assert changes[0].recovery == "kept 1 of 3 identical repeated FILE sections"
+
+
+def test_parse_keeps_complete_copies_of_a_loop_cut_off_by_the_output_cap():
+    """A verbatim loop that runs into the token cap: complete copies, then
+    a truncated one at EOF. The complete copies agree, so keep one."""
+    output = _full_file_output("a.py", "x = 1\ny = 2") * 2 + "=== FILE: a.py ===\n=== MODE: FULL ===\nx = 1\n"
+
+    changes = parse_coder_output(output, ["a.py"])
+
+    assert changes[0].body == "x = 1\ny = 2"
+    assert "dropped 1 unterminated" in changes[0].recovery
+
+
+def test_parse_rejects_repeats_when_only_unterminated_copies_differ():
+    output = "=== FILE: a.py ===\n=== MODE: FULL ===\nx = 1\n" "=== FILE: a.py ===\n=== MODE: FULL ===\nx = 2\n"
+
+    with pytest.raises(MalformedOutputError, match=r"'a\.py' 2 times with differing content"):
+        parse_coder_output(output, ["a.py"])
+
+
+def test_parse_rejects_a_section_that_is_one_block_repeated_in_a_loop():
+    loop = "    if x:\n        y += 1\n        log(y)\n" * 12
+    output = _full_file_output("a.py", "def f(x):\n    y = 0\n" + loop)
+
+    with pytest.raises(MalformedOutputError, match=r"'a\.py' contains a 3-line block repeated 12 times"):
+        parse_coder_output(output, ["a.py"])
+
+
+def test_parse_accepts_a_legitimate_file_with_a_few_similar_blocks():
+    """Real code repeats short shapes; only a long, dominant loop trips."""
+    body = "\n".join(
+        [f"def test_case_{i}():\n    assert run({i})\n    assert ok()\n" for i in range(10)]
+        + ["X = [\n    1,\n    1,\n    1,\n]\n"]
+        + ["if a:\n    pass\nelse:\n    pass\n"] * 3
+    )
+
+    changes = parse_coder_output(_full_file_output("a.py", body), ["a.py"])
+
+    assert changes[0].recovery is None
+
+
+def test_detect_line_repetition_thresholds():
+    block = "a = 1\nb = 2\nc = 3\n"
+    filler = "".join(f"line_{i} = {i}\n" for i in range(40))
+    # 4 repeats but only 12 of 52 lines (< 30%): a snippet, not a loop.
+    assert _detect_line_repetition(filler + block * 4) is None
+    # 3 repeats never trips however large the file share.
+    assert _detect_line_repetition(block * 3) is None
+    # Blank-line runs are padding, not a loop.
+    assert _detect_line_repetition("\n" * 100) is None
+    assert _detect_line_repetition(block * 20) == "a 3-line block repeated 20 times in a row"
+
