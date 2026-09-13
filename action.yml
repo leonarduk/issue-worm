@@ -216,17 +216,58 @@ runs:
           # is still modified on disk after the `git reset` above unstaged
           # it, so a working-tree diff would list files never committed.
           changed_files="$(git diff --name-only "$base_commit" HEAD | sed 's/^/- /' || true)"
+          # `review_issue` (review.py) already required a `DONE:` line under
+          # `## Implementation notes` before the build was allowed to run at
+          # all, so it's usually present here too - but that check was
+          # against cli.py's in-memory body, which may include a self-heal
+          # draft (`_self_heal_scope`) that failed to persist back to the
+          # actual GitHub issue for lack of `issues: write` (see the
+          # github-token input's description above). Every command in this
+          # extraction is `|| true`-guarded (or feeds a var that tolerates
+          # empty input) so a missing DONE: line, or a transient `gh`
+          # failure, yields an empty $done_line and the older no-goal body
+          # below - not an aborted step. Without the explicit `|| true` on
+          # `grep -m1`, its exit 1 on no-match would kill this step under
+          # `set -euo pipefail` (piping into `sed` doesn't hide that; a
+          # failing `grep` still propagates through the pipe).
+          #
+          # Scoped to the text between the "## Implementation notes" heading
+          # and the next "##" heading (or end of body), not a bare grep over
+          # the whole issue - a `DONE:`-looking line pasted elsewhere (an
+          # example, a quoted template) must not be mistaken for the real
+          # one. Mirrors review.py's own section-scoped `_DONE_RE` search,
+          # including "first well-formed section wins": only the first
+          # matching heading's text is scanned. `/^##([^#]|$)/` (not just
+          # `[^#]`) so a bare "##" heading line still resets the section,
+          # rather than having its body attributed to the prior heading.
+          issue_body="$(gh issue view "${{ inputs.issue }}" --repo "${{ github.repository }}" --json body -q .body || true)"
+          notes_section="$(printf '%s\n' "$issue_body" | awk '
+            /^##([^#]|$)/ {
+              heading = $0
+              sub(/^##[ \t]*/, "", heading)
+              sub(/[ \t]*$/, "", heading)
+              if (!found && tolower(heading) == "implementation notes") { f = 1; found = 1 }
+              else { f = 0 }
+              next
+            }
+            f { print }
+          ')"
+          done_line="$(printf '%s\n' "$notes_section" | { grep -m1 -i '^DONE:' || true; } | sed -E 's/^DONE:[[:space:]]*//I')"
+          goal_section=""
+          if [ -n "$done_line" ]; then
+            goal_section="$(printf '\n\n**Goal:** %s' "$done_line")"
+          fi
           # Branches on $() directly rather than composing through an
           # intermediate "files section" variable: command substitution
           # strips ALL trailing newlines, so a $(printf ...) meant to hold
           # "list\n\n" silently collapses to "list" with no separator,
           # running the last filename straight into "Closes #N" on one line.
           if [ -n "$changed_files" ]; then
-            pr_body="$(printf 'Automated single-pass change from the free issue-worm engine for #%s.\n\n**Files changed:**\n%s\n\nCloses #%s' \
-              "${{ inputs.issue }}" "$changed_files" "${{ inputs.issue }}")"
+            pr_body="$(printf 'Automated single-pass change from the free issue-worm engine for #%s.%s\n\n**Files changed:**\n%s\n\nCloses #%s' \
+              "${{ inputs.issue }}" "$goal_section" "$changed_files" "${{ inputs.issue }}")"
           else
-            pr_body="$(printf 'Automated single-pass change from the free issue-worm engine for #%s.\n\nCloses #%s' \
-              "${{ inputs.issue }}" "${{ inputs.issue }}")"
+            pr_body="$(printf 'Automated single-pass change from the free issue-worm engine for #%s.%s\n\nCloses #%s' \
+              "${{ inputs.issue }}" "$goal_section" "${{ inputs.issue }}")"
           fi
           gh pr create \
             --repo "${{ github.repository }}" \
