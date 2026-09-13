@@ -321,6 +321,7 @@ def test_no_command_prints_help_and_exits_nonzero(capsys):
 def test_version_flag_prints_name_and_exits_zero(monkeypatch, capsys):
     """With pro not installed - forced here so this test doesn't depend on
     whether the machine running it happens to have issue-worm-pro too."""
+    monkeypatch.setitem(sys.modules, "pro_cli", None)
     monkeypatch.setattr(cli, "metadata_version", MagicMock(side_effect=cli.PackageNotFoundError))
 
     with patch.object(
@@ -338,6 +339,7 @@ def test_version_flag_skips_the_update_check(monkeypatch, capsys):
     """#195: `issue-worm --version` must be a quick, offline lookup - it
     must not run check_and_prompt() (which makes a live GitHub API call
     outside of tests) before printing the version and exiting."""
+    monkeypatch.setitem(sys.modules, "pro_cli", None)
     monkeypatch.setattr(cli, "metadata_version", MagicMock(side_effect=cli.PackageNotFoundError))
 
     with patch.object(
