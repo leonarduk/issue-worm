@@ -151,6 +151,7 @@ full commit SHA instead.
 | `issue` | yes | Number of the issue to work. |
 | `github-token` | yes | A PAT or GitHub App token with `contents: write`, `pull-requests: write`, and `issues: read` on the target repo. A classic PAT's `repo` scope covers all three; a fine-grained PAT needs each granted separately — `issues: read` is easy to miss, since only the issue-body fetch needs it, and that runs (and fails) before the push/PR steps ever do. The built-in `secrets.GITHUB_TOKEN` is **not** sufficient either way — a PR opened (or pushed to) with it deliberately does not trigger other workflow runs, so anything gated on the PR (CI, review bots, required checks) would never fire. |
 | `license-key` | no | Reserved for the pro engine. Currently accepted and logged only — installing the pro wheel from a license key is a separate, unimplemented piece of work ([leonarduk/issue-worm-pro#584](https://github.com/leonarduk/issue-worm-pro/issues/584)). Omit it (the default) to run the free engine, which is everything the action does today. |
+| `close-issue` | no | Whether to include a `Closes #N` trailer in the commit message body, which makes GitHub auto-close the issue when the PR is merged. Defaults to `'true'` (issues close on merge), matching the action's historical behaviour. Set to `'false'` to keep the issue open after merge — useful when the PR addresses only part of the issue, or when the issue tracks broader work that continues after this PR. Only the commit body is affected; the PR body's own `Closes #N` line is left as-is. |
 
 ### `runs-on` options
 
@@ -189,6 +190,11 @@ what actually select the coder.
    see [leonarduk/issue-worm-pro#582](https://github.com/leonarduk/issue-worm-pro/issues/582)'s
    retry UX), and opens a PR with `gh pr create` (or leaves the existing
    PR for that branch as-is if one is already open).
+
+   The commit message body carries a `Closes #N` trailer by default, so
+   merging the PR closes the issue. Pass `close-issue: 'false'` to omit
+   that trailer and leave the issue open after merge — see the
+   [`close-issue` input](#inputs) above.
 
 The action never commits its own per-run bookkeeping: it stages
 everything with `git add -A .` and then unstages `.issue-worm/` (this
