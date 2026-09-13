@@ -870,6 +870,32 @@ def test_build_reports_apply_failure_without_crashing(tmp_path, capsys):
     assert "git apply failed" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("bad_targets", ["invalid", "host:notaport", "a:b:c"])
+@pytest.mark.usefixtures("_pro_cli_absent")
+def test_main_catches_config_error_and_exits_one(
+    bad_targets, monkeypatch, capsys
+):
+    """#216: a malformed CODER_TARGETS must be caught by main()'s own
+    ConfigError handler and turned into a clean exit 1 with a message on
+    stderr - not an uncaught traceback.
+
+    Exercises the real CLI entry point end-to-end (no mocking of the
+    parsing internals), so removing the try/except in main() or changing
+    the exit code would fail this test.
+    """
+    monkeypatch.setenv("CODER_TARGETS", bad_targets)
+
+    with patch.object(
+        sys, "argv", ["issue-worm", "build", "5", "--repo", "o/r"]
+    ), pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "Config error" in err
+    assert bad_targets in err
+
+
 # --- registry wiring around `build` (#179) ------------------------------
 
 
