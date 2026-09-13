@@ -19,6 +19,7 @@ from workspace import (
     FileChange,
     MalformedOutputError,
     WorkspaceError,
+    _apply_search_replace,
     _detect_line_repetition,
     _non_interactive_env,
     _RollbackGuard,
@@ -2289,3 +2290,174 @@ def test_detect_line_repetition_thresholds():
     assert _detect_line_repetition("\n" * 100) is None
     assert _detect_line_repetition(block * 20) == "a 3-line block repeated 20 times in a row"
 
+
+# --- MODE: EDIT (SEARCH/REPLACE blocks) ---------------------------------------
+#
+# Unified diffs written by an LLM carry hunk headers and context it has to
+# compute; the recorded runs lose attempts to exactly that (hunks that match
+# nowhere, a first hunk re-emitted hundreds of times). EDIT has the Coder
+# quote the lines it changes instead. No recorded output uses EDIT yet, so
+# these tests are its coverage.
+
+
+def _edit_output(path, *blocks, fence=False):
+    body = "".join(
+        f"<<<<<<< SEARCH\n{search}=======\n{replace}>>>>>>> REPLACE\n"
+        for search, replace in blocks
+    )
+    if fence:
+        body = f"```python\n{body}```\n"
+    return f"=== FILE: {path} ===\n=== MODE: EDIT ===\n{body}=== END FILE ===\n"
+
+
+SAMPLE = "import os\n\n\ndef f(x):\n    if x:\n        return 1\n    return 2\n"
+
+
+def test_parse_edit_section_keeps_blocks():
+    changes = parse_coder_output(
+        _edit_output("a.py", ("value = 1\n", "value = 2\n")), ["a.py"]
+    )
+
+    assert changes[0].mode == "EDIT"
+    assert "<<<<<<< SEARCH" in changes[0].body
+
+
+def test_parse_edit_section_ignores_fences_and_prose_around_blocks():
+    output = _edit_output("a.py", ("value = 1\n", "value = 2\n"), fence=True).replace(
+        "=== MODE: EDIT ===\n", "=== MODE: EDIT ===\nChange the value:\n"
+    )
+
+    changes = parse_coder_output(output, ["a.py"])
+
+    assert _apply_search_replace("value = 1\n", changes[0].body, "a.py") == (
+        "value = 2\n",
+        None,
+    )
+
+
+@pytest.mark.parametrize(
+    "body, match",
+    [
+        ("just prose, no blocks\n", "contains no"),
+        ("<<<<<<< SEARCH\nx\n>>>>>>> REPLACE\n", "no '=======' divider"),
+        ("<<<<<<< SEARCH\nx\n=======\ny\n", "not closed.*truncated"),
+        (
+            "<<<<<<< SEARCH\nx\n=======\ny\n<<<<<<< SEARCH\n",
+            "no '>>>>>>> REPLACE' line",
+        ),
+    ],
+)
+def test_parse_rejects_malformed_edit_sections(body, match):
+    output = f"=== FILE: a.py ===\n=== MODE: EDIT ===\n{body}=== END FILE ===\n"
+
+    with pytest.raises(MalformedOutputError, match=match):
+        parse_coder_output(output, ["a.py"])
+
+
+def test_search_replace_exact_match_applies_blocks_in_order():
+    body = (
+        "<<<<<<< SEARCH\nimport os\n=======\nimport json\nimport os\n>>>>>>> REPLACE\n"
+        "<<<<<<< SEARCH\n    return 2\n=======\n    return json.dumps(2)\n>>>>>>> REPLACE\n"
+    )
+
+    text, rung = _apply_search_replace(SAMPLE, body, "a.py")
+
+    assert rung is None
+    assert text.startswith("import json\nimport os\n")
+    assert text.endswith("    return json.dumps(2)\n")
+
+
+def test_search_replace_whitespace_tolerant_fallback():
+    body = "<<<<<<< SEARCH\n    if x:   \n        return 1\n=======\n    if x:\n        return 3\n>>>>>>> REPLACE\n"
+
+    text, rung = _apply_search_replace(SAMPLE, body, "a.py")
+
+    assert rung == "edit-whitespace-tolerant"
+    assert "        return 3\n" in text
+
+
+def test_search_replace_indentation_tolerant_fallback_reindents_replacement():
+    body = "<<<<<<< SEARCH\nif x:\n    return 1\n=======\nif x:\n    log(x)\n    return 1\n>>>>>>> REPLACE\n"
+
+    text, rung = _apply_search_replace(SAMPLE, body, "a.py")
+
+    assert rung == "edit-indentation-tolerant"
+    assert "    if x:\n        log(x)\n        return 1\n" in text
+
+
+def test_search_replace_preserves_crlf_line_endings():
+    content = SAMPLE.replace("\n", "\r\n")
+    body = "<<<<<<< SEARCH\n    return 2\n=======\n    return 5\n>>>>>>> REPLACE\n"
+
+    text, _ = _apply_search_replace(content, body, "a.py")
+
+    assert text.endswith("    return 5\r\n")
+    assert "\n" not in text.replace("\r\n", "")
+
+
+def test_search_replace_missing_search_fails_clearly():
+    body = "<<<<<<< SEARCH\nnot in the file\n=======\nx\n>>>>>>> REPLACE\n"
+
+    with pytest.raises(
+        MalformedOutputError,
+        match=r"block 1 for 'a\.py': SEARCH text not found.*'not in the file'",
+    ):
+        _apply_search_replace(SAMPLE, body, "a.py")
+
+
+def test_search_replace_ambiguous_search_fails_clearly():
+    content = "x = 1\ny = 2\nx = 1\n"
+    body = "<<<<<<< SEARCH\nx = 1\n=======\nx = 3\n>>>>>>> REPLACE\n"
+
+    with pytest.raises(MalformedOutputError, match="matches 2 places"):
+        _apply_search_replace(content, body, "a.py")
+
+
+def test_search_replace_empty_search_creates_new_file_only():
+    body = "<<<<<<< SEARCH\n=======\nnew = 1\n>>>>>>> REPLACE\n"
+
+    assert _apply_search_replace(None, body, "n.py") == ("new = 1\n", None)
+    with pytest.raises(MalformedOutputError, match="empty SEARCH"):
+        _apply_search_replace(SAMPLE, body, "a.py")
+    with pytest.raises(MalformedOutputError, match="does not exist"):
+        _apply_search_replace(
+            None, "<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE\n", "n.py"
+        )
+
+
+def test_apply_edit_never_partially_applies_a_file(repo):
+    """Block 1 matches, block 2 doesn't: the file must be left as it was."""
+    body = (
+        "<<<<<<< SEARCH\nvalue = 1\n=======\nvalue = 2\n>>>>>>> REPLACE\n"
+        "<<<<<<< SEARCH\nnope\n=======\nx\n>>>>>>> REPLACE\n"
+    )
+
+    with pytest.raises(MalformedOutputError, match="block 2"):
+        apply_file_change(repo, FileChange(path="a.py", mode="EDIT", body=body))
+
+    assert (Path(repo) / "a.py").read_text() == "value = 1\n"
+
+
+def test_run_revision_attempt_applies_edit_and_records_fallback(repo):
+    output = _edit_output("a.py", ("value = 1   \n", "value = 2\n"))
+
+    result = run_revision_attempt(
+        repo, output, ["a.py"], ci_command=[sys.executable, "-c", "pass"]
+    )
+
+    assert result.success, result.error
+    assert (Path(repo) / "a.py").read_text() == "value = 2\n"
+    assert result.recovery == ["a.py: applied with edit-whitespace-tolerant"]
+
+
+def test_run_revision_attempt_reports_unmatched_edit_as_apply_failure(repo):
+    output = _edit_output("a.py", ("value = 9\n", "value = 2\n"))
+
+    result = run_revision_attempt(
+        repo, output, ["a.py"], ci_command=[sys.executable, "-c", "pass"]
+    )
+
+    assert not result.success
+    assert result.error.startswith("apply failed:")
+    assert "SEARCH text not found" in result.error
+    assert (Path(repo) / "a.py").read_text() == "value = 1\n"
