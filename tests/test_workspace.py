@@ -2465,6 +2465,24 @@ def test_search_replace_fallback_rungs_keep_a_missing_final_newline_missing(
     assert _apply_search_replace(content, body, "a.py") == (expected, rung)
 
 
+@pytest.mark.parametrize(
+    "content, expected",
+    [
+        ("a\nb\n", "a\n"),
+        ("a\nb\nc\n", "a\nc\n"),
+        ("b\na\n", "a\n"),
+        ("a\nb", "a"),
+        ("a\nb\nc", "a\nc"),
+    ],
+)
+def test_search_replace_empty_replace_deletes_the_line_cleanly(content, expected):
+    """Deleting a line (empty REPLACE) leaves no stray blank line and keeps
+    the file's end-of-file shape."""
+    body = "<<<<<<< SEARCH\nb\n=======\n>>>>>>> REPLACE\n"
+
+    assert _apply_search_replace(content, body, "a.py") == (expected, None)
+
+
 def test_search_replace_exact_match_is_anchored_to_whole_lines():
     """SEARCH "x = 1" must not match inside "max = 1"; adjacent identical
     lines still count as two matches (ambiguous)."""
