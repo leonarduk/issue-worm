@@ -467,6 +467,19 @@ def test_parse_coder_targets_wrong_field_count_raises():
     assert "4 colon-separated fields" in str(exc_info.value)
 
 
+def test_parse_coder_targets_unset_uses_defaults(monkeypatch):
+    """Regression guard for #216: an unset CODER_TARGETS must not raise.
+
+    PR #216 changed malformed CODER_TARGETS from "log and continue" to
+    "raise ConfigError". This test pins the complementary case: when the
+    variable is simply absent, parsing must fall back to the default
+    (empty list) rather than tripping the new error path.
+    """
+    monkeypatch.delenv("CODER_TARGETS", raising=False)
+
+    assert _parse_coder_targets("") == []
+
+
 def test_parse_coder_targets_non_numeric_port_raises():
     """A non-numeric port can never be dialed - raise instead of handing
     out a target that will only fail at connect time."""
