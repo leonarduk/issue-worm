@@ -55,6 +55,23 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Validate issue input
+      shell: bash
+      # `inputs.issue` is interpolated directly into shell commands below
+      # (the `issue-worm build` invocation and the `gh pr create` body).
+      # GitHub's own `github.event.issue.number` is always an integer, but
+      # this action accepts `issue` as a caller-supplied input, so a
+      # misconfigured or malicious caller could pass arbitrary shell
+      # metacharacters. Reject anything that isn't a plain run of digits
+      # before it ever reaches a shell command. Leading zeros and very
+      # large numbers are still accepted (they're valid issue numbers as
+      # far as this check is concerned); only non-numeric input fails.
+      run: |
+        if ! [[ "${{ inputs.issue }}" =~ ^[0-9]+$ ]]; then
+          echo "::error::The 'issue' input must be a numeric issue number. Got: '${{ inputs.issue }}'"
+          exit 1
+        fi
+
     - name: Report license-key status
       shell: bash
       run: |
