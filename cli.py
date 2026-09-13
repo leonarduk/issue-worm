@@ -114,6 +114,12 @@ def _try_import_pro_cli():
     `ModuleNotFoundError` naming ``pro_cli``; re-raising anything else
     keeps a genuine installation problem from being reported as "not
     installed" and pointed at the wrong fix.
+
+    NOTE: this helper performs a *real* ``import pro_cli`` and therefore
+    executes pro_cli's module-level code. It must never be called from a
+    path that promises to be cheap/offline (e.g. ``--version``, see
+    ``_version_string`` and #195) - use ``importlib.metadata`` there
+    instead.
     """
     try:
         import pro_cli
@@ -636,6 +642,10 @@ def _version_string() -> str:
     #195 makes `--version` a quick, offline lookup, and actually importing
     `pro_cli` would pull in its whole dependency graph (agents.triage,
     scheduler, usage_metering, ...) just to answer a version check.
+
+    `_try_import_pro_cli` performs a real ``import pro_cli`` (executing
+    its module-level code), so it must never be called from here - the
+    metadata lookup below is the only pro probe this path may use.
     """
     version = installed_version() or "unknown (source checkout)"
     try:
