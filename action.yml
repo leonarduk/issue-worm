@@ -217,16 +217,33 @@ runs:
           # against cli.py's in-memory body, which may include a self-heal
           # draft (`_self_heal_scope`) that failed to persist back to the
           # actual GitHub issue for lack of `issues: write` (see the
-          # github-token input's description above). Re-fetching the issue
-          # body fresh and grep'ing it, rather than trusting it's there, means
-          # that gap just yields an empty $done_line and the older no-goal
-          # body below - not a broken PR. When it is there, this gives the PR
-          # body a one-line summary of intent without an LLM call, straight
-          # from what the issue author (human or persisted self-heal) wrote.
-          # `-m1` takes the first match only, matching review.py's "first
-          # well-formed section wins" behaviour.
-          issue_body="$(gh issue view "${{ inputs.issue }}" --repo "${{ github.repository }}" --json body -q .body)"
-          done_line="$(printf '%s\n' "$issue_body" | grep -m1 -i '^DONE:' | sed -E 's/^[Dd][Oo][Nn][Ee]:[[:space:]]*//')"
+          # github-token input's description above). `|| true` on the `gh`
+          # call below means that gap - or any transient `gh` failure - just
+          # yields an empty $done_line and the older no-goal body, the same
+          # way changed_files degrades above; a best-effort goal line must
+          # never be the thing that aborts PR creation under this step's
+          # `set -e`.
+          #
+          # Scoped to the text between the "## Implementation notes" heading
+          # and the next "##" heading (or end of body), not a bare grep over
+          # the whole issue - a `DONE:`-looking line pasted elsewhere (an
+          # example, a quoted template) must not be mistaken for the real
+          # one. Mirrors review.py's own section-scoped `_DONE_RE` search,
+          # including "first well-formed section wins": only the first
+          # matching heading's text is scanned.
+          issue_body="$(gh issue view "${{ inputs.issue }}" --repo "${{ github.repository }}" --json body -q .body || true)"
+          notes_section="$(printf '%s\n' "$issue_body" | awk '
+            /^##[^#]/ {
+              heading = $0
+              sub(/^##[ \t]*/, "", heading)
+              sub(/[ \t]*$/, "", heading)
+              if (!found && tolower(heading) == "implementation notes") { f = 1; found = 1 }
+              else { f = 0 }
+              next
+            }
+            f { print }
+          ')"
+          done_line="$(printf '%s\n' "$notes_section" | grep -m1 -i '^DONE:' | sed -E 's/^[Dd][Oo][Nn][Ee]:[[:space:]]*//')"
           goal_section=""
           if [ -n "$done_line" ]; then
             goal_section="$(printf '\n\n**Goal:** %s' "$done_line")"
