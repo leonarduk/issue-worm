@@ -181,6 +181,7 @@ def test_remote_propose_posts_openai_chat_completions_shape(tmp_path):
     coder = RemoteOpenAICoder(
         endpoint="https://api.openai.com", model="gpt-5", api_key="sk-test"
     )
+    (tmp_path / "a.py").write_text("print(1)\n", encoding="utf-8")
     expected = "=== FILE: a.py ===\n=== MODE: FULL ===\nprint(1)\n=== END FILE ===\n"
 
     with patch(
@@ -193,7 +194,10 @@ def test_remote_propose_posts_openai_chat_completions_shape(tmp_path):
     assert called_url == "https://api.openai.com/v1/chat/completions"
     payload = mock_post.call_args[1]["json"]
     assert payload["model"] == "gpt-5"
-    assert payload["messages"] == [{"role": "user", "content": payload["messages"][0]["content"]}]
+    assert len(payload["messages"]) == 1
+    assert payload["messages"][0]["role"] == "user"
+    assert "do the thing" in payload["messages"][0]["content"]
+    assert "print(1)" in payload["messages"][0]["content"]
     assert "do the thing" in payload["messages"][0]["content"]
     headers = mock_post.call_args[1]["headers"]
     assert headers["Authorization"] == "Bearer sk-test"
