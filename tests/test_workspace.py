@@ -2345,6 +2345,12 @@ def test_parse_edit_section_ignores_fences_and_prose_around_blocks():
             "<<<<<<< SEARCH\nx\n=======\ny\n<<<<<<< SEARCH\n",
             "no '>>>>>>> REPLACE' line",
         ),
+        # #338: a second divider just before REPLACE (the shape a live run
+        # produced) must be rejected, not pasted into the file.
+        (
+            "<<<<<<< SEARCH\nx\n=======\ny\n=======\n>>>>>>> REPLACE\n",
+            "block 1 has a second '=======' divider",
+        ),
     ],
 )
 def test_parse_rejects_malformed_edit_sections(body, match):
@@ -2352,6 +2358,20 @@ def test_parse_rejects_malformed_edit_sections(body, match):
 
     with pytest.raises(MalformedOutputError, match=match):
         parse_coder_output(output, ["a.py"])
+
+
+def test_edit_keeps_a_heading_underline_in_a_markup_file():
+    """In a markup file a line of "=" underlines a heading, so it is REPLACE
+    content there, not a second divider (#338)."""
+    body = "<<<<<<< SEARCH\nold\n=======\nTitle\n=======\n>>>>>>> REPLACE\n"
+    output = f"=== FILE: a.md ===\n=== MODE: EDIT ===\n{body}=== END FILE ===\n"
+
+    changes = parse_coder_output(output, ["a.md"])
+
+    assert _apply_search_replace("intro\nold\n", changes[0].body, "a.md") == (
+        "intro\nTitle\n=======\n",
+        None,
+    )
 
 
 def test_search_replace_exact_match_applies_blocks_in_order():
