@@ -64,6 +64,10 @@ logger = logging.getLogger(__name__)
 # agents/coder.py imports these back for the instructions it gives the LLM.
 MODE_FULL = "FULL"
 MODE_DIFF = "DIFF"
+# Aider-style SEARCH/REPLACE blocks (see _parse_search_replace_blocks): the
+# Coder quotes the exact lines to change instead of computing hunk headers
+# and context, which is where LLM-written unified diffs most often break.
+MODE_EDIT = "EDIT"
 
 # The only forge this package clones from; part of a checkout's
 # identity in _repo_identity (#178).
@@ -86,12 +90,12 @@ DEFAULT_CI_COMMAND = ["cicaid", "run-ci-checks", "--all"]
 # Matches the per-file sections NativeCoder instructs the LLM to emit (see
 # agents/coder.py's FILE_START_MARKER/MODE_MARKER/FILE_END_MARKER):
 #   === FILE: <path> ===
-#   === MODE: FULL or DIFF ===
+#   === MODE: FULL, DIFF or EDIT ===
 #   <content>
 #   === END FILE ===
 _FILE_SECTION_RE = re.compile(
     r"=== FILE: (?P<path>.+?) ===\r?\n"
-    r"=== MODE: (?P<mode>FULL|DIFF) ===\r?\n"
+    r"=== MODE: (?P<mode>FULL|DIFF|EDIT) ===\r?\n"
     r"(?P<body>.*?)"
     # The terminator must be the entire line (modulo trailing spaces/tabs). A
     # bare substring match (the old `\r?\n?=== END FILE ===`) truncated MODE:
@@ -114,7 +118,7 @@ _FILE_SECTION_RE = re.compile(
 # missing sign-off line threw away work that was otherwise applicable.
 _FILE_HEADER_RE = re.compile(
     r"^=== FILE: (?P<path>.+?) ===[ \t]*\r?\n"
-    r"=== MODE: (?P<mode>FULL|DIFF) ===[ \t]*\r?\n",
+    r"=== MODE: (?P<mode>FULL|DIFF|EDIT) ===[ \t]*\r?\n",
     re.MULTILINE,
 )
 # Whole-line only, for the same #254 reason as above.
@@ -170,7 +174,7 @@ APPLY_FAILED_ERROR_PREFIX = "apply failed:"
 class FileChange:
     """One file's worth of a parsed Coder response."""
     path: str
-    mode: str  # MODE_FULL | MODE_DIFF
+    mode: str  # MODE_FULL | MODE_DIFF | MODE_EDIT
     body: str
     # How the section was recovered when the Coder's output was not
     # strictly to spec (None when it was): "implicit-terminator" for a
@@ -581,6 +585,356 @@ def _drop_prose_after_closing_fence(body: str) -> str:
     return body
 
 
+# Repetition guards (see issue-worm-pro runs #582/#623, 2026-09-13). A Coder
+# response can degenerate in two ways that the section grammar alone does
+# not catch:
+#
+# 1. The same FILE path is emitted more than once. Seen live: the model
+#    "planned" out loud with FILE/MODE headers carrying placeholder bodies
+#    ("[diff]", "(no change needed)"), never closed with END FILE, and only
+#    then wrote the real, END FILE-terminated sections - 18 sections for 6
+#    files. Treating the first placeholder as the change rejected the whole
+#    response ("contains no parseable unified diff") although a complete
+#    answer followed it. The same shape arises from a verbatim loop that
+#    runs into the output cap: complete copies, then a truncated one.
+# 2. A block of lines inside ONE section repeats over and over (a
+#    generation loop that keeps "succeeding" at producing output).
+#
+# _resolve_repeated_sections keeps exactly one section per path when that
+# is unambiguous and otherwise fails with a message naming the path and the
+# count; _detect_line_repetition flags case 2.
+
+# A repeated block must be at least this many lines and repeat at least this
+# many times, consecutively, to be flagged - short accidental repeats (e.g.
+# three near-identical `if` branches) are normal code and must not trip it.
+_MIN_REPEATED_BLOCK_LINES = 3
+_MIN_BLOCK_REPEATS = 4
+# ...and the repeated run must cover a meaningful share of the section, so a
+# small repeated snippet inside an otherwise large, legitimate file (a table
+# of test cases, say) doesn't fail the whole attempt.
+_MIN_REPEATED_BLOCK_COVERAGE = 0.3
+# Bounding the block size searched caps the scan at O(n * max_block *
+# block_len) rather than letting it grow quadratically in body length: a
+# degenerate loop repeats a short pattern, never a huge one.
+_MAX_REPEATED_BLOCK_LINES = 60
+
+
+def _detect_line_repetition(body: str) -> str | None:
+    """Find a contiguous block of lines repeated many times in ``body``.
+
+    Returns a short description of the largest such run (by lines
+    covered), or None when no block meets both the repeat-count and the
+    coverage thresholds above.
+    """
+    lines = body.splitlines()
+    n = len(lines)
+    if n < _MIN_REPEATED_BLOCK_LINES * _MIN_BLOCK_REPEATS:
+        return None
+
+    best: tuple[int, int, int] | None = None  # (lines covered, block len, repeats)
+    max_block = min(_MAX_REPEATED_BLOCK_LINES, n // _MIN_BLOCK_REPEATS)
+    for block_len in range(_MIN_REPEATED_BLOCK_LINES, max_block + 1):
+        i = 0
+        while i + block_len * 2 <= n:
+            block = lines[i : i + block_len]
+            if not any(line.strip() for line in block):
+                # Blank padding repeating is whitespace, not a content loop.
+                i += 1
+                continue
+            repeats = 1
+            j = i + block_len
+            while j + block_len <= n and lines[j : j + block_len] == block:
+                repeats += 1
+                j += block_len
+            if repeats >= _MIN_BLOCK_REPEATS:
+                covered = block_len * repeats
+                if covered / n >= _MIN_REPEATED_BLOCK_COVERAGE and (
+                    best is None or covered > best[0]
+                ):
+                    best = (covered, block_len, repeats)
+                i = j
+            else:
+                i += 1
+    if best is None:
+        return None
+    _, block_len, repeats = best
+    return f"a {block_len}-line block repeated {repeats} times in a row"
+
+
+def _resolve_repeated_sections(
+    sections: list[tuple[str, str, str, str | None]],
+) -> list[tuple[str, str, str, str | None]]:
+    """Collapse (path, mode, body, recovery) sections to one per path.
+
+    ``path`` must already be sanitized. Paths keep their first-seen order.
+    A path seen once passes through untouched. For a repeated path:
+
+    - every copy identical (same mode, same body modulo edge blank lines):
+      keep one;
+    - otherwise, if the copies closed with an explicit ``=== END FILE ===``
+      (recovery None) all agree and every other copy is unterminated: keep
+      the terminated one. The unterminated copies are drafts (placeholder
+      headers written while planning) or a loop cut off by the output cap;
+      the terminated copy is the one the Coder actually finished;
+    - anything else is ambiguous: MalformedOutputError naming the path and
+      how many times it was emitted.
+
+    A kept section's recovery note records what was dropped, so callers
+    can count how often this rescue, not the Coder, made an attempt usable.
+    """
+    order: list[str] = []
+    groups: dict[str, list[tuple[str, str, str | None]]] = {}
+    for path, mode, body, recovery in sections:
+        if path not in groups:
+            order.append(path)
+            groups[path] = []
+        groups[path].append((mode, body, recovery))
+
+    resolved: list[tuple[str, str, str, str | None]] = []
+    for path in order:
+        entries = groups[path]
+        if len(entries) == 1:
+            mode, body, recovery = entries[0]
+            resolved.append((path, mode, body, recovery))
+            continue
+
+        def key(entry: tuple[str, str, str | None]) -> tuple[str, str]:
+            return entry[0], entry[1].strip("\n")
+
+        terminated = [entry for entry in entries if entry[2] is None]
+        if len({key(entry) for entry in entries}) == 1:
+            kept = terminated[0] if terminated else entries[0]
+            note = f"kept 1 of {len(entries)} identical repeated FILE sections"
+        elif terminated and len({key(entry) for entry in terminated}) == 1:
+            kept = terminated[0]
+            dropped = len(entries) - len(terminated)
+            note = (
+                f"kept the END FILE-terminated section, dropped {dropped} "
+                f"unterminated draft/looped section(s) ({len(entries)} emitted)"
+            )
+        else:
+            raise MalformedOutputError(
+                f"coder output emits a FILE section for {path!r} "
+                f"{len(entries)} times with differing content (looks like a "
+                "repetition loop) - emit exactly one section per file"
+            )
+        mode, body, recovery = kept
+        resolved.append((path, mode, body, f"{recovery}; {note}" if recovery else note))
+    return resolved
+
+
+# MODE: EDIT body grammar - one or more of:
+#   <<<<<<< SEARCH
+#   <lines copied verbatim from the current file>
+#   =======
+#   <lines to put in their place>
+#   >>>>>>> REPLACE
+# Anything outside a block (prose, Markdown fences) is ignored. Marker
+# lines tolerate 5-9 marker characters and trailing whitespace, since
+# models miscount them.
+_SEARCH_MARKER_RE = re.compile(r"^<{5,9} ?SEARCH[ \t]*$")
+_DIVIDER_MARKER_RE = re.compile(r"^={5,9}[ \t]*$")
+_REPLACE_MARKER_RE = re.compile(r"^>{5,9} ?REPLACE[ \t]*$")
+
+# Fallbacks, in order, when a SEARCH block has no exact match. Each is
+# only used when it finds exactly one match; the weakest one needed for a
+# file is reported like apply_file_change's diff ladder rungs.
+EDIT_RUNG_WHITESPACE = "edit-whitespace-tolerant"
+EDIT_RUNG_INDENT = "edit-indentation-tolerant"
+
+
+def _parse_search_replace_blocks(body: str, path: str) -> list[tuple[str, str]]:
+    """Return the (search, replace) pairs of a MODE: EDIT body, in order.
+
+    Raises MalformedOutputError for a body with no blocks or a block whose
+    markers are out of order or never closed (usually a truncated reply).
+    """
+    blocks: list[tuple[str, str]] = []
+    state = "outside"
+    search: list[str] = []
+    replace: list[str] = []
+    for line in body.splitlines():
+        stripped = line.rstrip("\r")
+        if state == "outside":
+            if _SEARCH_MARKER_RE.match(stripped):
+                state, search, replace = "search", [], []
+        elif state == "search":
+            if _DIVIDER_MARKER_RE.match(stripped):
+                state = "replace"
+            elif _SEARCH_MARKER_RE.match(stripped) or _REPLACE_MARKER_RE.match(
+                stripped
+            ):
+                raise MalformedOutputError(
+                    f"MODE: EDIT section for {path!r}: SEARCH block "
+                    f"{len(blocks) + 1} has no '=======' divider"
+                )
+            else:
+                search.append(line)
+        else:  # replace
+            if _REPLACE_MARKER_RE.match(stripped):
+                blocks.append(("\n".join(search), "\n".join(replace)))
+                state = "outside"
+            elif _SEARCH_MARKER_RE.match(stripped):
+                raise MalformedOutputError(
+                    f"MODE: EDIT section for {path!r}: block {len(blocks) + 1} "
+                    "has no '>>>>>>> REPLACE' line before the next SEARCH"
+                )
+            else:
+                replace.append(line)
+    if state != "outside":
+        raise MalformedOutputError(
+            f"MODE: EDIT section for {path!r}: block {len(blocks) + 1} is not "
+            "closed with '>>>>>>> REPLACE' (response may have been truncated)"
+        )
+    if not blocks:
+        raise MalformedOutputError(
+            f"MODE: EDIT section for {path!r} contains no "
+            "'<<<<<<< SEARCH / ======= / >>>>>>> REPLACE' blocks"
+        )
+    return blocks
+
+
+def _leading_ws(line: str) -> str:
+    return line[: len(line) - len(line.lstrip())]
+
+
+def _reindent(
+    lines: list[str], search_lines: list[str], matched: list[str]
+) -> list[str]:
+    """Shift ``lines`` by the indentation difference between the first
+    non-blank SEARCH line and the file line it matched."""
+    for want, got in zip(search_lines, matched):
+        if want.strip():
+            old, new = _leading_ws(want), _leading_ws(got)
+            break
+    else:
+        return lines
+    if old == new:
+        return lines
+    out = []
+    for line in lines:
+        if not line.strip():
+            out.append(line)
+        elif line.startswith(old):
+            out.append(new + line[len(old) :])
+        else:
+            out.append(line)
+    return out
+
+
+def _apply_one_block(
+    text: str, search: str, replace: str, path: str, number: int
+) -> tuple[str, str | None]:
+    """Apply one SEARCH/REPLACE pair to ``text``; return (text, rung)."""
+    if not search.strip():
+        if text.strip():
+            raise MalformedOutputError(
+                f"MODE: EDIT block {number} for {path!r} has an empty SEARCH "
+                "but the file is not empty - quote the lines to replace"
+            )
+        return (replace + "\n" if replace else ""), None
+
+    # Match whole lines only: both the SEARCH text and the file are wrapped
+    # in newlines, so "x = 1" can't match inside "max = 1". The file view is
+    # newline-terminated so a SEARCH quoting the last line still matches
+    # when the file has no final newline; that absence is restored after,
+    # because an edit must not change the end-of-file shape as a side
+    # effect. Occurrences are counted with a lookahead, since adjacent
+    # identical lines share a newline and str.count would undercount them.
+    exact = "\n" + search + "\n"
+    had_final_newline = text.endswith("\n")
+    probe = "\n" + (text if had_final_newline else text + "\n")
+    count = len(re.findall("(?=" + re.escape(exact) + ")", probe))
+    if count == 1:
+        out = probe.replace(exact, "\n" + (replace + "\n" if replace else ""), 1)[1:]
+        if not had_final_newline and out.endswith("\n"):
+            out = out[:-1]
+        return out, None
+    if count > 1:
+        raise MalformedOutputError(
+            f"MODE: EDIT block {number} for {path!r}: SEARCH text matches "
+            f"{count} places - include more surrounding lines so it is unique"
+        )
+
+    file_lines = text.splitlines(keepends=True)
+    search_lines = search.splitlines()
+    size = len(search_lines)
+    for rung, norm in (
+        (EDIT_RUNG_WHITESPACE, lambda s: s.rstrip()),
+        (EDIT_RUNG_INDENT, lambda s: s.strip()),
+    ):
+        want = [norm(line) for line in search_lines]
+        have = [norm(line) for line in file_lines]
+        hits = [
+            i for i in range(len(file_lines) - size + 1) if have[i : i + size] == want
+        ]
+        if len(hits) > 1:
+            raise MalformedOutputError(
+                f"MODE: EDIT block {number} for {path!r}: SEARCH text matches "
+                f"{len(hits)} places ({rung}) - include more surrounding lines "
+                "so it is unique"
+            )
+        if hits:
+            start = hits[0]
+            matched = [line.rstrip("\r\n") for line in file_lines[start : start + size]]
+            new_lines = replace.splitlines()
+            if rung == EDIT_RUNG_INDENT:
+                new_lines = _reindent(new_lines, search_lines, matched)
+            eol = "\r\n" if file_lines[start].endswith("\r\n") else "\n"
+            chunk = "".join(line + eol for line in new_lines)
+            out = (
+                "".join(file_lines[:start])
+                + chunk
+                + "".join(file_lines[start + size :])
+            )
+            # Same end-of-file rule as the exact path: an edit that reaches
+            # the last line must not add a final newline the file lacked.
+            if (
+                not had_final_newline
+                and start + size == len(file_lines)
+                and out.endswith(eol)
+            ):
+                out = out[: -len(eol)]
+            return out, rung
+
+    first = next((line.strip() for line in search_lines if line.strip()), "")
+    raise MalformedOutputError(
+        f"MODE: EDIT block {number} for {path!r}: SEARCH text not found in the "
+        f"current file (first line: {first[:80]!r}) - copy it verbatim"
+    )
+
+
+def _apply_search_replace(
+    content: str | None, body: str, path: str
+) -> tuple[str, str | None]:
+    """Apply a MODE: EDIT body to ``content`` (None: file doesn't exist).
+
+    Every block is applied in memory, in order, before anything is
+    written, so a bad block leaves the file untouched. Returns the new
+    content and the weakest fallback needed (None when every block
+    matched exactly). Raises MalformedOutputError when a SEARCH block is
+    missing, or matches more than once, at every rung.
+    """
+    text = "" if content is None else content
+    blocks = _parse_search_replace_blocks(body, path)
+    # A missing file can only be created by an empty first SEARCH; later
+    # blocks may then edit what that block wrote, so only the first one
+    # is checked here - a bad later block fails in _apply_one_block with
+    # its own "not found" message.
+    if content is None and blocks and blocks[0][0].strip():
+        raise MalformedOutputError(
+            f"MODE: EDIT section for {path!r}: the file does not exist - use "
+            "MODE: FULL (or an empty SEARCH) to create it"
+        )
+    order = (None, EDIT_RUNG_WHITESPACE, EDIT_RUNG_INDENT)
+    worst: str | None = None
+    for number, (search, replace) in enumerate(blocks, 1):
+        text, rung = _apply_one_block(text, search, replace, path, number)
+        if order.index(rung) > order.index(worst):
+            worst = rung
+    return text, worst
+
+
 def parse_coder_output(output: str, declared_files: list[str]) -> list[FileChange]:
     """Split a Coder response into per-file changes, rejecting anything
     that isn't safe to hand to git apply / a direct file write.
@@ -604,14 +958,10 @@ def parse_coder_output(output: str, declared_files: list[str]) -> list[FileChang
     # matches its declared, sanitized file.
     declared = {sanitize_file_path(f) for f in declared_files}
     declared.discard(None)
-    changes: list[FileChange] = []
-    seen_paths: set[str] = set()
 
+    validated: list[tuple[str, str, str, str | None]] = []
     for path, mode, body, recovery in sections:
         path = path.strip()
-        mode = mode.strip()
-        body = body.strip("\n")
-
         normalized = sanitize_file_path(path)
         if normalized is None:
             raise MalformedOutputError(
@@ -625,8 +975,11 @@ def parse_coder_output(output: str, declared_files: list[str]) -> list[FileChang
             )
         if _escapes_repo(path):
             raise MalformedOutputError(f"file path escapes the repository: {path!r}")
-        if path in seen_paths:
-            raise MalformedOutputError(f"duplicate FILE section for {path!r}")
+        validated.append((path, mode.strip(), body.strip("\n"), recovery))
+
+    changes: list[FileChange] = []
+    seen_paths: set[str] = set()
+    for path, mode, body, recovery in _resolve_repeated_sections(validated):
         seen_paths.add(path)
 
         if mode == MODE_DIFF:
@@ -640,6 +993,12 @@ def parse_coder_output(output: str, declared_files: list[str]) -> list[FileChang
                     f"{recovery}; synthesised diff header" if recovery else "synthesised diff header"
                 )
             body = diff_text
+        elif mode == MODE_EDIT:
+            # Fences around (or between) blocks are ignored by the block
+            # parser; validating here fails a malformed or truncated EDIT
+            # section before anything is applied.
+            body = _strip_edge_fences(body)
+            _parse_search_replace_blocks(body, path)
         else:
             if recovery is not None:
                 # An unterminated FULL section may carry the model's
@@ -655,10 +1014,16 @@ def parse_coder_output(output: str, declared_files: list[str]) -> list[FileChang
             # for its own fencing (issue #248).
             body = _strip_edge_fences(body)
 
+        loop = _detect_line_repetition(body)
+        if loop is not None:
+            raise MalformedOutputError(
+                f"MODE: {mode} section for {path!r} contains {loop} - looks "
+                "like a generation loop, refusing to apply it"
+            )
+
         if recovery is not None:
             logger.warning(
-                "parse_coder_output: FILE section for %r has no "
-                "'=== END FILE ===' line; %s",
+                "parse_coder_output: FILE section for %r needed recovery: %s",
                 path,
                 recovery,
             )
@@ -734,7 +1099,8 @@ def _apply_ladder() -> tuple[tuple[str, tuple[str, ...]], ...]:
 
 
 def apply_file_change(repo_path: str, change: FileChange) -> str | None:
-    """Apply one parsed file change: a direct write for MODE_FULL, or
+    """Apply one parsed file change: a direct write for MODE_FULL,
+    in-memory SEARCH/REPLACE for MODE_EDIT (see _apply_search_replace), or
     `git apply` (pre-checked with --check) for MODE_DIFF.
 
     For a diff, the rungs of :data:`_APPLY_LADDER` are tried in order and
@@ -755,6 +1121,25 @@ def apply_file_change(repo_path: str, change: FileChange) -> str | None:
             content += "\n"
         target.write_text(content, encoding="utf-8")
         return None
+
+    if change.mode == MODE_EDIT:
+        target = Path(repo_path) / change.path
+        current: str | None = None
+        if target.is_file():
+            # newline="" keeps the file's own line endings intact.
+            with open(target, encoding="utf-8", newline="") as handle:
+                current = handle.read()
+        new_text, rung = _apply_search_replace(current, change.body, change.path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, "w", encoding="utf-8", newline="") as handle:
+            handle.write(new_text)
+        if rung is not None:
+            logger.warning(
+                "apply_file_change: EDIT for %r applied only with %s",
+                change.path,
+                rung,
+            )
+        return rung
 
     strict_error: str | None = None
     for rung, flags in _apply_ladder():
