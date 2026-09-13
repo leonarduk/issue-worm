@@ -262,12 +262,21 @@ runs:
           # strips ALL trailing newlines, so a $(printf ...) meant to hold
           # "list\n\n" silently collapses to "list" with no separator,
           # running the last filename straight into "Closes #N" on one line.
+          # Mirrors issue-worm-pro's scheduler._pr_footer() so a PR carries
+          # the same "opened by issue-worm" attribution regardless of which
+          # of the two publishing paths (this Action vs. the pro scheduler)
+          # created it. The logo is always served from the public
+          # leonarduk/issue-worm repo, never the target repo - target repos
+          # don't carry their own docs/logo.jpg, so pointing there 404'd on
+          # every PR (see that function's docstring and
+          # leonarduk/issue-worm-pro#483).
+          pr_footer="$(printf '\n\n---\n<p align="center"><img src="https://github.com/leonarduk/issue-worm/raw/main/docs/logo.jpg" width="48" alt="issue-worm logo" /><br/><sub>🐛 Opened automatically by <a href="https://github.com/leonarduk/issue-worm">issue-worm</a></sub></p>')"
           if [ -n "$changed_files" ]; then
-            pr_body="$(printf 'Automated single-pass change from the free issue-worm engine for #%s.%s\n\n**Files changed:**\n%s\n\nCloses #%s' \
-              "${{ inputs.issue }}" "$goal_section" "$changed_files" "${{ inputs.issue }}")"
+            pr_body="$(printf 'Automated single-pass change from the free issue-worm engine for #%s.%s\n\n**Files changed:**\n%s\n\nCloses #%s%s' \
+              "${{ inputs.issue }}" "$goal_section" "$changed_files" "${{ inputs.issue }}" "$pr_footer")"
           else
-            pr_body="$(printf 'Automated single-pass change from the free issue-worm engine for #%s.%s\n\nCloses #%s' \
-              "${{ inputs.issue }}" "$goal_section" "${{ inputs.issue }}")"
+            pr_body="$(printf 'Automated single-pass change from the free issue-worm engine for #%s.%s\n\nCloses #%s%s' \
+              "${{ inputs.issue }}" "$goal_section" "${{ inputs.issue }}" "$pr_footer")"
           fi
           gh pr create \
             --repo "${{ github.repository }}" \
