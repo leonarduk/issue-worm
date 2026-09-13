@@ -834,11 +834,18 @@ def _apply_one_block(
         return (replace + "\n" if replace else ""), None
 
     exact = search + "\n"
-    count = text.count(exact) if text.endswith("\n") else (text + "\n").count(exact)
+    # Match against a newline-terminated view so a SEARCH that quotes the
+    # file's last line still matches when the file has no final newline,
+    # then restore that absence: an edit must not change the file's
+    # end-of-file shape as a side effect.
+    had_final_newline = text.endswith("\n")
+    probe = text if had_final_newline else text + "\n"
+    count = probe.count(exact)
     if count == 1:
-        if not text.endswith("\n"):
-            text += "\n"
-        return text.replace(exact, replace + "\n" if replace else "", 1), None
+        out = probe.replace(exact, replace + "\n" if replace else "", 1)
+        if not had_final_newline and out.endswith("\n"):
+            out = out[:-1]
+        return out, None
     if count > 1:
         raise MalformedOutputError(
             f"MODE: EDIT block {number} for {path!r}: SEARCH text matches "
@@ -897,18 +904,19 @@ def _apply_search_replace(
     missing, or matches more than once, at every rung.
     """
     text = "" if content is None else content
-    if content is None and any(
-        search.strip() for search, _ in _parse_search_replace_blocks(body, path)[:1]
-    ):
+    blocks = _parse_search_replace_blocks(body, path)
+    # A missing file can only be created by an empty first SEARCH; later
+    # blocks may then edit what that block wrote, so only the first one
+    # is checked here - a bad later block fails in _apply_one_block with
+    # its own "not found" message.
+    if content is None and blocks and blocks[0][0].strip():
         raise MalformedOutputError(
             f"MODE: EDIT section for {path!r}: the file does not exist - use "
             "MODE: FULL (or an empty SEARCH) to create it"
         )
     order = (None, EDIT_RUNG_WHITESPACE, EDIT_RUNG_INDENT)
     worst: str | None = None
-    for number, (search, replace) in enumerate(
-        _parse_search_replace_blocks(body, path), 1
-    ):
+    for number, (search, replace) in enumerate(blocks, 1):
         text, rung = _apply_one_block(text, search, replace, path, number)
         if order.index(rung) > order.index(worst):
             worst = rung

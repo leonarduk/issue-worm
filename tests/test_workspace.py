@@ -2425,6 +2425,33 @@ def test_search_replace_empty_search_creates_new_file_only():
         )
 
 
+def test_search_replace_keeps_a_missing_final_newline_missing():
+    """An exact-match edit must not add a final newline the file never had."""
+    body = "<<<<<<< SEARCH\nb = 2\n=======\nb = 3\n>>>>>>> REPLACE\n"
+
+    assert _apply_search_replace("a = 1\nb = 2", body, "a.py") == ("a = 1\nb = 3", None)
+    assert _apply_search_replace("a = 1\nb = 2\n", body, "a.py") == (
+        "a = 1\nb = 3\n",
+        None,
+    )
+
+
+def test_search_replace_new_file_later_blocks_edit_what_the_first_wrote():
+    """For a missing file only the first (empty) SEARCH creates it; a later
+    block may edit that content, and a later block that matches nothing
+    fails with its own "not found" message, not the missing-file one."""
+    create = "<<<<<<< SEARCH\n=======\na = 1\nb = 2\n>>>>>>> REPLACE\n"
+    edit = "<<<<<<< SEARCH\nb = 2\n=======\nb = 3\n>>>>>>> REPLACE\n"
+    stray = "<<<<<<< SEARCH\nzzz\n=======\ny\n>>>>>>> REPLACE\n"
+
+    assert _apply_search_replace(None, create + edit, "n.py") == (
+        "a = 1\nb = 3\n",
+        None,
+    )
+    with pytest.raises(MalformedOutputError, match=r"block 2 .*SEARCH text not found"):
+        _apply_search_replace(None, create + stray, "n.py")
+
+
 def test_apply_edit_never_partially_applies_a_file(repo):
     """Block 1 matches, block 2 doesn't: the file must be left as it was."""
     body = (
