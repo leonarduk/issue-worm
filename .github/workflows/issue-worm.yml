@@ -3,6 +3,10 @@ name: issue-worm
 # Label-gated dispatch (leonarduk/issue-worm-pro#582): applying the
 # `issue-worm` label to an issue runs the engine on it.
 #
+# Manual dispatch: maintainers can also trigger this workflow from the
+# Actions tab ("Run workflow") with an explicit issue number, avoiding
+# the label gymnastics required by the label-triggered path.
+#
 # The `if:` guard below is LOAD-BEARING, not cosmetic. The action's own
 # commit/push/PR steps run with a PAT (`secrets.WORM_PAT`, not the default
 # `secrets.GITHUB_TOKEN`) so that the opened PR triggers this repo's other
@@ -15,9 +19,15 @@ name: issue-worm
 on:
   issues:
     types: [labeled]
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: 'Issue number to run issue-worm against'
+        required: true
+        type: string
 
 concurrency:
-  group: issue-worm-${{ github.event.issue.number }}
+  group: issue-worm-${{ github.event.issue.number || github.event.inputs.issue }}
   cancel-in-progress: false
 
 permissions:
@@ -25,7 +35,9 @@ permissions:
 
 jobs:
   build:
-    if: github.event.label.name == 'issue-worm'
+    # Label-triggered runs must match the `issue-worm` label; manual
+    # dispatch runs bypass the label check entirely.
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'issue-worm'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -39,7 +51,10 @@ jobs:
       - name: Run issue-worm
         uses: ./
         with:
-          issue: ${{ github.event.issue.number }}
+          # Source the issue number from whichever trigger fired: the
+          # `issues` event payload for label-triggered runs, or the
+          # `workflow_dispatch` input for manual runs.
+          issue: ${{ github.event.issue.number || github.event.inputs.issue }}
           # A fine-grained PAT (or GitHub App token) with `contents: write`
           # and `pull-requests: write` on this repo - see action.yml's
           # `github-token` input for why the default GITHUB_TOKEN can't be
