@@ -8,6 +8,7 @@ from config import (
     ConfigError,
     RoleConfig,
     TargetPool,
+    _parse_coder_backend,
     _parse_coder_targets,
     get_role_env_vars,
     load_config,
@@ -212,6 +213,24 @@ def test_load_config_unknown_coder_backend_falls_back_to_native(monkeypatch, cap
 
     assert config["coder_backend"] == "native"
     assert "CODER_BACKEND='aidr'" in caplog.text
+
+
+def test_parse_coder_backend_strips_whitespace(caplog):
+    """A whitespace-padded CODER_BACKEND (e.g. " aider" from an env file
+    or shell quoting) is a formatting artifact, not a different backend -
+    it must parse to the stripped value without a warning, matching
+    _parse_log_level's normalization."""
+    assert _parse_coder_backend(" aider") == "aider"
+    assert _parse_coder_backend("native ") == "native"
+    assert _parse_coder_backend("  native  ") == "native"
+    assert "not one of" not in caplog.text
+
+
+def test_parse_coder_backend_still_rejects_invalid(caplog):
+    """Stripping whitespace must not weaken validation: a genuinely
+    invalid value still warns and falls back to 'native'."""
+    assert _parse_coder_backend("bogus") == "native"
+    assert "CODER_BACKEND='bogus'" in caplog.text
 
 
 def test_load_config_unknown_log_level_falls_back_to_info(monkeypatch, caplog):

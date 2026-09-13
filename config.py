@@ -152,14 +152,20 @@ _VALID_CODER_BACKENDS = {"native", "aider"}
 
 
 def _parse_coder_backend(raw: str) -> str:
-    """Parse CODER_BACKEND, falling back to 'native' on an unknown value."""
-    if raw not in _VALID_CODER_BACKENDS:
+    """Parse CODER_BACKEND, falling back to 'native' on an unknown value.
+
+    Whitespace is stripped before validation, matching _parse_log_level -
+    a value like " native" (leading space from an env file or shell
+    quoting) is a formatting artifact, not a different backend.
+    """
+    value = raw.strip()
+    if value not in _VALID_CODER_BACKENDS:
         logger.warning(
             "CODER_BACKEND=%r is not one of %s; using 'native'",
             raw, sorted(_VALID_CODER_BACKENDS),
         )
         return "native"
-    return raw
+    return value
 
 
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
