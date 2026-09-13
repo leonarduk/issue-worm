@@ -217,12 +217,14 @@ runs:
           # against cli.py's in-memory body, which may include a self-heal
           # draft (`_self_heal_scope`) that failed to persist back to the
           # actual GitHub issue for lack of `issues: write` (see the
-          # github-token input's description above). `|| true` on the `gh`
-          # call below means that gap - or any transient `gh` failure - just
-          # yields an empty $done_line and the older no-goal body, the same
-          # way changed_files degrades above; a best-effort goal line must
-          # never be the thing that aborts PR creation under this step's
-          # `set -e`.
+          # github-token input's description above). Every command in this
+          # extraction is `|| true`-guarded (or feeds a var that tolerates
+          # empty input) so a missing DONE: line, or a transient `gh`
+          # failure, yields an empty $done_line and the older no-goal body
+          # below - not an aborted step. Without the explicit `|| true` on
+          # `grep -m1`, its exit 1 on no-match would kill this step under
+          # `set -euo pipefail` (piping into `sed` doesn't hide that; a
+          # failing `grep` still propagates through the pipe).
           #
           # Scoped to the text between the "## Implementation notes" heading
           # and the next "##" heading (or end of body), not a bare grep over
@@ -230,10 +232,12 @@ runs:
           # example, a quoted template) must not be mistaken for the real
           # one. Mirrors review.py's own section-scoped `_DONE_RE` search,
           # including "first well-formed section wins": only the first
-          # matching heading's text is scanned.
+          # matching heading's text is scanned. `/^##([^#]|$)/` (not just
+          # `[^#]`) so a bare "##" heading line still resets the section,
+          # rather than having its body attributed to the prior heading.
           issue_body="$(gh issue view "${{ inputs.issue }}" --repo "${{ github.repository }}" --json body -q .body || true)"
           notes_section="$(printf '%s\n' "$issue_body" | awk '
-            /^##[^#]/ {
+            /^##([^#]|$)/ {
               heading = $0
               sub(/^##[ \t]*/, "", heading)
               sub(/[ \t]*$/, "", heading)
@@ -243,7 +247,7 @@ runs:
             }
             f { print }
           ')"
-          done_line="$(printf '%s\n' "$notes_section" | grep -m1 -i '^DONE:' | sed -E 's/^[Dd][Oo][Nn][Ee]:[[:space:]]*//')"
+          done_line="$(printf '%s\n' "$notes_section" | { grep -m1 -i '^DONE:' || true; } | sed -E 's/^DONE:[[:space:]]*//I')"
           goal_section=""
           if [ -n "$done_line" ]; then
             goal_section="$(printf '\n\n**Goal:** %s' "$done_line")"
