@@ -51,6 +51,17 @@ inputs:
       action does today.
     required: false
     default: ''
+  close-issue:
+    description: >-
+      Whether to include a `Closes #N` trailer in the commit message body,
+      which makes GitHub auto-close the issue when the PR is merged. Set to
+      'false' to keep the issue open after merge - useful when the PR only
+      addresses part of the issue, or when the issue tracks broader work
+      that continues after this PR. Defaults to 'true' (issues close on
+      merge), matching the action's historical behaviour. Only the commit
+      body is affected; the PR body's own `Closes #N` line is left as-is.
+    required: false
+    default: 'true'
 
 runs:
   using: composite
@@ -192,7 +203,17 @@ runs:
         # this step resets defensively). This reset remains as a defensive
         # fallback for a first-time adopter who hasn't added it yet.
         git reset -- .issue-worm
-        git commit -m "issue-worm: apply changes for #${{ inputs.issue }}" -m "Closes #${{ inputs.issue }}"
+        # `close-issue` (default 'true') controls whether the commit body
+        # carries a `Closes #N` trailer. GitHub only auto-closes the linked
+        # issue on merge when that trailer is present, so setting the input
+        # to 'false' keeps the issue open - for a PR that addresses only
+        # part of the issue, or one whose issue tracks broader follow-up
+        # work. The default preserves the historical behaviour exactly.
+        if [ "${{ inputs.close-issue }}" = "true" ]; then
+          git commit -m "issue-worm: apply changes for #${{ inputs.issue }}" -m "Closes #${{ inputs.issue }}"
+        else
+          git commit -m "issue-worm: apply changes for #${{ inputs.issue }}"
+        fi
         git push --force origin "$branch"
 
         # A retry (branch already had an open PR) just needed the push
