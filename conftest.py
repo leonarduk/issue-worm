@@ -8,6 +8,13 @@ machine with both halves installed, that probe succeeds, so tests that
 mean to exercise the core-only path (build/history/status) would
 silently dispatch into the real `pro_cli.main()` instead.
 
+#227 review note: `cli.py`'s dispatch (`_try_import_pro_cli`, called as
+`pro_cli = _try_import_pro_cli()` from the `_PRO_COMMANDS` check) does a
+real `import pro_cli` - not `importlib.util.find_spec("pro_cli")` -
+confirmed by reading `cli.py:104-124`. That's why the `sys.modules`
+sentinel below works: it's exactly what a real `ModuleNotFoundError`
+looks like, not a probe this idiom would leave unaffected.
+
 The autouse fixture below neutralizes `pro_cli` by default for every
 test in the suite, using the same `monkeypatch.setitem(sys.modules,
 "pro_cli", None)` sentinel idiom already established in
