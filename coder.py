@@ -54,6 +54,13 @@ REQUEST_TIMEOUT_SECONDS = 300
 # `cloud` branch) - these are only the fallback when unset.
 DEFAULT_DEEPSEEK_ENDPOINT = "https://api.deepseek.com"
 DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
+# Output-token cap sent as `max_tokens` for CODER_MODEL_SOURCE=cloud. Left
+# unset, the provider applies its own (much smaller) default, and a
+# multi-file FULL rewrite is silently cut off mid-file - the Coder output
+# then fails parse_coder_output as "missing declared file(s)". 32768 covers
+# a FULL rewrite of several large files and stays well under DeepSeek
+# V4's documented output ceiling. Overridable via CODER_MAX_TOKENS.
+DEFAULT_DEEPSEEK_MAX_TOKENS = 32768
 
 
 class LocalOllamaCoder:
@@ -118,6 +125,7 @@ class RemoteOpenAICoder:
         model: str | None = None,
         api_key: str | None = None,
         timeout: int = REQUEST_TIMEOUT_SECONDS,
+        max_tokens: int | None = None,
     ):
         # No fallback default endpoint/model here (unlike LocalOllamaCoder):
         # there is no sensible generic default for an arbitrary OpenAI-
@@ -128,6 +136,10 @@ class RemoteOpenAICoder:
         self.model = model or ""
         self.api_key = api_key
         self.timeout = timeout
+        # None = don't send `max_tokens` at all (provider default). Not
+        # every OpenAI-compatible provider accepts the field for every
+        # model, so it is only sent when build_coder (or a caller) sets it.
+        self.max_tokens = max_tokens
 
     def propose(self, workspace_dir: str, task: str, files: list[str]) -> str:
         """Return raw Coder-formatted output, or "" on any failure — never
@@ -150,14 +162,17 @@ class RemoteOpenAICoder:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+        payload: dict = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+        }
+        if self.max_tokens is not None:
+            payload["max_tokens"] = self.max_tokens
         try:
             response = requests.post(
                 f"{self.endpoint}/v1/chat/completions",
-                json={
-                    "model": self.model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "stream": False,
-                },
+                json=payload,
                 headers=headers,
                 timeout=self.timeout,
             )
@@ -165,6 +180,20 @@ class RemoteOpenAICoder:
             choices = response.json().get("choices") or []
             if not choices:
                 return ""
+            if choices[0].get("finish_reason") == "length":
+                # The provider stopped at its output-token cap, so the text
+                # below is cut off. Still return it (the parser's recovery
+                # may salvage it), but name the cause - otherwise it only
+                # surfaces later as "missing declared file(s)".
+                logger.warning(
+                    "Remote LLM %s (model %s) stopped at its output-token "
+                    "cap (finish_reason=length, max_tokens=%s); the response "
+                    "is truncated - raise CODER_MAX_TOKENS if the provider "
+                    "allows it",
+                    self.endpoint,
+                    self.model,
+                    self.max_tokens if self.max_tokens is not None else "provider default",
+                )
             return choices[0].get("message", {}).get("content") or ""
         except (requests.RequestException, ValueError, KeyError, IndexError, TypeError):
             logger.warning(
@@ -214,6 +243,11 @@ def build_coder(role_config) -> Coder:
     # Global, not role-prefixed - one HTTP timeout for whichever coder this
     # factory returns, same as REMOTE_LLM_*/DEEPSEEK_* below.
     timeout = _env_int("CODER_REQUEST_TIMEOUT_SECONDS", REQUEST_TIMEOUT_SECONDS)
+    # Global output-token cap for the OpenAI-compatible coders (remote and
+    # cloud). 0 / negative / non-integer = not configured.
+    max_tokens_override: int | None = _env_int("CODER_MAX_TOKENS", 0)
+    if max_tokens_override is not None and max_tokens_override <= 0:
+        max_tokens_override = None
 
     if model_source == "local":
         # Endpoint/model here are unchanged from before this factory
@@ -248,7 +282,15 @@ def build_coder(role_config) -> Coder:
                 "CODER_MODEL_SOURCE=remote requires REMOTE_LLM_MODEL to be "
                 "set — see issue-worm-pro's .env-example-openai."
             )
-        return RemoteOpenAICoder(endpoint=endpoint, model=model, api_key=api_key, timeout=timeout)
+        # No default cap for a generic provider: some OpenAI models reject
+        # `max_tokens`, so it is only sent when CODER_MAX_TOKENS is set.
+        return RemoteOpenAICoder(
+            endpoint=endpoint,
+            model=model,
+            api_key=api_key,
+            timeout=timeout,
+            max_tokens=max_tokens_override,
+        )
 
     if model_source == "cloud":
         # DeepSeek is the only `cloud` provider implemented today (its API
@@ -265,7 +307,11 @@ def build_coder(role_config) -> Coder:
         endpoint = os.getenv("DEEPSEEK_ENDPOINT") or DEFAULT_DEEPSEEK_ENDPOINT
         model = os.getenv("DEEPSEEK_MODEL") or DEFAULT_DEEPSEEK_MODEL
         return RemoteOpenAICoder(
-            endpoint=endpoint, model=model, api_key=api_key, timeout=timeout
+            endpoint=endpoint,
+            model=model,
+            api_key=api_key,
+            timeout=timeout,
+            max_tokens=max_tokens_override or DEFAULT_DEEPSEEK_MAX_TOKENS,
         )
 
     if model_source == "claude":
