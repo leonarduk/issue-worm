@@ -383,6 +383,72 @@ def test_version_string_does_not_import_pro_cli(monkeypatch):
     assert "issue-worm-pro 1.2.3" in out
 
 
+def test_version_string_never_imports_pro_cli_even_when_installed(monkeypatch):
+    """#195 contract: `--version` must be a quick, offline lookup.
+
+    `_try_import_pro_cli` performs a *real* ``import pro_cli`` (executing
+    its module-level code, which may include network calls, config reads,
+    or telemetry). If `_version_string` ever called it, any such
+    import-time side effect would run on every `--version` invocation -
+    silently regressing #195. This test forces `pro_cli` to be
+    *importable* (so a naive `_try_import_pro_cli`-based implementation
+    would succeed and be tempted to use it) while recording any attempt
+    to import it, then asserts none happened.
+    """
+    import builtins
+
+    imported = []
+    real_import = builtins.__import__
+
+    def _recording_import(name, *args, **kwargs):
+        if name == "pro_cli":
+            imported.append(name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _recording_import)
+    # Make pro appear installed via metadata so the pro-present branch of
+    # _version_string is the one exercised.
+    monkeypatch.setattr(cli, "metadata_version", lambda name: "1.2.3")
+
+    out = cli._version_string()
+
+    assert "issue-worm-pro 1.2.3" in out
+    assert imported == [], (
+        "_version_string imported pro_cli - #195 requires --version to be "
+        "a cheap, offline lookup that never executes pro_cli's module-level code"
+    )
+
+
+def test_version_flag_never_imports_pro_cli(monkeypatch, capsys):
+    """End-to-end guard for the same #195 contract, through `main()`'s
+    `--version` fast path: even with pro installed (metadata present),
+    running `issue-worm --version` must not import `pro_cli`."""
+    import builtins
+
+    imported = []
+    real_import = builtins.__import__
+
+    def _recording_import(name, *args, **kwargs):
+        if name == "pro_cli":
+            imported.append(name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _recording_import)
+    monkeypatch.setattr(cli, "metadata_version", lambda name: "1.2.3")
+
+    with patch.object(
+        sys, "argv", ["issue-worm", "--version"]
+    ), pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+    assert "issue-worm-pro 1.2.3" in capsys.readouterr().out
+    assert imported == [], (
+        "`issue-worm --version` imported pro_cli - #195 requires the "
+        "version path to stay offline and import-free"
+    )
+
+
 def test_version_flag_still_wins_when_combined_with_pro_dispatch(monkeypatch, capsys):
     """An exact top-level `--version` must take the fast path and exit
     before the pro-command dispatch check even runs, so it never imports
