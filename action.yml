@@ -66,9 +66,16 @@ runs:
       # before it ever reaches a shell command. Leading zeros and very
       # large numbers are still accepted (they're valid issue numbers as
       # far as this check is concerned); only non-numeric input fails.
+      # `ISSUE_INPUT` is passed via `env:` rather than interpolated inline
+      # into `run:` - inline `${{ inputs.issue }}` inside the shell script
+      # is itself an expression-injection surface (the very class of bug
+      # this guard exists to close), since GitHub substitutes it into the
+      # script text before bash ever sees it.
+      env:
+        ISSUE_INPUT: ${{ inputs.issue }}
       run: |
-        if ! [[ "${{ inputs.issue }}" =~ ^[0-9]+$ ]]; then
-          echo "::error::The 'issue' input must be a numeric issue number. Got: '${{ inputs.issue }}'"
+        if ! [[ "$ISSUE_INPUT" =~ ^[0-9]+$ ]]; then
+          echo "::error::The 'issue' input must be a numeric issue number. Got: '$ISSUE_INPUT'"
           exit 1
         fi
 
