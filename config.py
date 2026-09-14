@@ -67,7 +67,7 @@ def load_config() -> dict:
     environment.
 
     Returns a dict with:
-    - coder_backend: "native" | "aider"
+    - coder_backend: "native" (the only backend; see _parse_coder_backend)
     - coder_targets: list of CoderTarget
     - workspace_root: path to workspace directory
     - test_command: shell command to run tests
@@ -148,7 +148,7 @@ def _parse_max_concurrent_issues(raw: str) -> int:
     return value
 
 
-_VALID_CODER_BACKENDS = {"native", "aider"}
+_VALID_CODER_BACKENDS = {"native"}
 
 
 def _parse_coder_backend(raw: str) -> str:
@@ -157,8 +157,19 @@ def _parse_coder_backend(raw: str) -> str:
     Whitespace is stripped before validation, matching _parse_log_level -
     a value like " native" (leading space from an env file or shell
     quoting) is a formatting artifact, not a different backend.
+
+    "aider" was a valid value until issue-worm-pro removed its Aider
+    backend (a same-model benchmark re-run found it no better than the
+    native coder); it now falls back to 'native' with its own warning, so
+    an old .env keeps working and says why.
     """
     value = raw.strip()
+    if value.lower() == "aider":
+        logger.warning(
+            "CODER_BACKEND=aider is no longer supported (the Aider backend "
+            "was removed); using 'native'"
+        )
+        return "native"
     if value not in _VALID_CODER_BACKENDS:
         logger.warning(
             "CODER_BACKEND=%r is not one of %s; using 'native'",
@@ -220,9 +231,8 @@ def _load_role_config(role_prefix: str) -> RoleConfig:
     # MCP doc lookup keys are global, not role-prefixed (issue #15): every
     # role reads the same MCP_* vars, and only an agent that acts on them
     # (currently the Analyser) uses them. The Context7 API key is deliberately
-    # NOT loaded here - it must stay out of role_env_vars (which AiderCoder
-    # merges into the aider subprocess env) and is read from os.environ by
-    # cicaid_bridge.mcp_doc_lookup instead.
+    # NOT loaded here - a secret stays out of role_env_vars - and is read
+    # from os.environ by cicaid_bridge.mcp_doc_lookup instead.
     mcp_doc_lookup_enabled = _env_flag("MCP_DOC_LOOKUP_ENABLED")
 
     return RoleConfig(
