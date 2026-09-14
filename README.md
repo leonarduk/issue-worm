@@ -83,7 +83,7 @@ sync with the latest tag on every release.
 |---|---|---|
 | `local` (default) | A local/self-hosted Ollama instance's `/api/generate`. | `CODER_TARGETS` (see below); optionally `CODER_OLLAMA_ENDPOINT` / `CODER_OLLAMA_MODEL` to override per role. |
 | `remote` | Any OpenAI-compatible `/v1/chat/completions` endpoint — OpenAI itself, a self-hosted vLLM/SGLang box, or an Ollama instance serving the OpenAI API. | `REMOTE_LLM_ENDPOINT` (no trailing `/v1` — that's appended automatically), `REMOTE_LLM_MODEL`, `REMOTE_LLM_API_KEY`. |
-| `cloud` | DeepSeek's API (`https://api.deepseek.com`), which is itself OpenAI-compatible, so it reuses the same `remote` client with DeepSeek's endpoint/model as the default. | `DEEPSEEK_API_KEY`; optionally `DEEPSEEK_MODEL` (default `deepseek-v4-flash`). |
+| `cloud` | DeepSeek's API (`https://api.deepseek.com`), which is itself OpenAI-compatible, so it reuses the same `remote` client with DeepSeek's endpoint/model as the default. | `DEEPSEEK_API_KEY`; optionally `DEEPSEEK_MODEL` (default `deepseek-v4-flash`) and `CODER_MAX_TOKENS` (output-token cap sent as `max_tokens`; default `32768` for `cloud`, not sent for `remote` unless set). |
 | `claude` | Not implemented by this free engine's `build` coder yet. Setting it fails fast with an explanatory error rather than silently falling back to `local`. | — |
 
 An unset `CODER_MODEL_SOURCE` defaults to `local` — today's original
