@@ -136,7 +136,7 @@ runs:
           --repo "${{ github.repository }}" \
           --workspace "${{ github.workspace }}"
 
-    - name: Commit, push, and publish the PR via cicaid
+    - name: Commit, push, verify, and publish the PR via cicaid
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
@@ -192,6 +192,31 @@ runs:
         # already-pushed branch and only opens (or finds) the PR.
         git push -q --force -u origin "$branch"
 
+        # Verifier stage: run the repository's own checks via cicaid. This is
+        # plain free cicaid (no LLM call), so it stays within the free tier's
+        # "coder is the only LLM" constraint. A pass opens a normal PR with a
+        # short summary under ## Testing; a failure opens a draft PR with the
+        # failing output under ## Testing (issue-worm-pro#1079).
+        checks_log="$(mktemp)"
+        checks_status=0
+        set +e
+        cicaid run-ci-checks --all > "$checks_log" 2>&1
+        checks_status=$?
+        set -e
+
+        if [ "$checks_status" -eq 0 ]; then
+          testing="✓ \`cicaid run-ci-checks --all\` passed."
+        else
+          checks_output="$(cat "$checks_log")"
+          # GitHub PR bodies cap at 65536 chars; keep the check output well
+          # under that so the rest of the body always fits.
+          if [ "${#checks_output}" -gt 60000 ]; then
+            checks_output="${checks_output:0:60000}"$'\n... (truncated)'
+          fi
+          testing="$(printf '✗ `cicaid run-ci-checks --all` failed.\n\n<details><summary>Check output</summary>\n\n```\n%s\n```\n\n</details>' "$checks_output")"
+        fi
+        rm -f "$checks_log"
+
         changed_files="$(git diff --name-only "$base_commit" HEAD | sed 's/^/- /')"
 
         # Extract the DONE: line from the issue's ## Implementation notes
@@ -244,7 +269,6 @@ runs:
         fi
 
         approach="Single-pass free-engine build: the coder applied the change and the Action published it without an LLM-generated summary."
-        testing="not verified"
 
         # Logo footer, matching issue-worm-pro's scheduler._pr_footer().
         pr_footer="$(printf '\n\n---\n<p align="center"><img src="https://github.com/leonarduk/issue-worm/raw/main/docs/logo.jpg" width="48" alt="issue-worm logo" /><br/><sub>🐛 Opened automatically by <a href="https://github.com/leonarduk/issue-worm">issue-worm</a></sub></p>')"
@@ -259,8 +283,13 @@ runs:
         # --body-file skips publish-pr's LLM body generation entirely (no
         # LLM outside the coder). It titles the PR `[Issue #N] <title>`,
         # appends `Closes #N` to the body, and returns an already-open PR
-        # for this branch instead of opening a second one.
-        cicaid publish-pr --body-file "$body_file"
+        # for this branch instead of opening a second one. --draft is
+        # passed only when the verifier failed.
+        if [ "$checks_status" -eq 0 ]; then
+          cicaid publish-pr --body-file "$body_file"
+        else
+          cicaid publish-pr --draft --body-file "$body_file"
+        fi
 
         # REST, not `gh pr view`/`gh pr edit`: their GraphQL queries need
         # read:org, which a repo-scoped PAT doesn't have.

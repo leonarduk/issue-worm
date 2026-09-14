@@ -347,7 +347,9 @@ def _run_build(args, config: dict) -> int:
     Coder if the issue isn't scoped yet - see `_self_heal_scope`) + local
     Ollama coder, writing changes straight to the working tree. No
     verifier/retry loop, no scheduler — matches the free shell's scope
-    (#2).
+    (#2). The GitHub Action wraps this command with a single
+    `cicaid run-ci-checks --all` verifier stage before publishing, but that
+    is not part of this CLI command itself.
     """
     issue_numbers = list(args.issues) + list(args.issue or [])
     if not issue_numbers:
@@ -723,7 +725,8 @@ def _build_parser() -> argparse.ArgumentParser:
     build_parser = subparsers.add_parser(
         "build",
         help="Heuristic review + local Ollama coder, single pass "
-        "(no verifier/retry loop — that needs issue-worm-pro)",
+        "(the GitHub Action adds a cicaid run-ci-checks verifier before publishing; "
+        "no retry loop — that needs issue-worm-pro)",
     )
     build_parser.add_argument("issues", nargs="*", type=int, metavar="ISSUE")
     build_parser.add_argument("--repo", help="owner/name of the target GitHub repo")
