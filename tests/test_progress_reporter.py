@@ -7,6 +7,7 @@ happens from a test, only from a genuine build/Action run.
 """
 
 import json
+import sys
 from unittest.mock import patch
 
 import pytest
@@ -279,3 +280,27 @@ def test_find_progress_comment_id_returns_none_when_no_comment_matches(monkeypat
     )
 
     assert pr._find_progress_comment_id("owner/repo", 1) is None
+
+
+def test_load_post_issue_comment_raises_cleanly_when_cicaid_devtools_is_absent(
+    monkeypatch,
+):
+    """`progress_reporter.py` must not require `cicaid_devtools` at module
+    import time - `cli.py` imports this module unconditionally for every
+    subcommand (`history`, `status`, `poll`, not just `build`/`progress`),
+    so a hard top-level import here would take down the whole CLI on a
+    broken `cicaid-devtools` install (DeepSeek review of #359). Simulates
+    it genuinely absent via the same `sys.modules` sentinel idiom already
+    used elsewhere in this codebase for `pro_cli`."""
+    monkeypatch.setattr(pr, "post_issue_comment", None)
+    monkeypatch.setitem(sys.modules, "cicaid_devtools", None)
+
+    with pytest.raises(ImportError, match="cicaid-devtools is not installed"):
+        pr._load_post_issue_comment()
+
+
+def test_start_degrades_gracefully_when_cicaid_devtools_is_absent(monkeypatch):
+    monkeypatch.setattr(pr, "post_issue_comment", None)
+    monkeypatch.setitem(sys.modules, "cicaid_devtools", None)
+
+    pr.start("owner/repo", 1)  # must not raise

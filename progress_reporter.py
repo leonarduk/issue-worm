@@ -33,27 +33,52 @@ import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-# cicaid_devtools.lib.github_issues does bare top-level imports of its own
-# sibling modules rather than package-relative ones, so it isn't importable
-# as a plain subpackage - its lib/ dir has to be on sys.path first. Same
-# hack issue-worm-pro's cicaid_bridge.py uses for the same reason (see that
-# module's docstring); duplicated here rather than shared since pro isn't a
-# dependency of this package.
-try:
-    import cicaid_devtools as _cicaid_devtools
-except ImportError as _exc:
-    raise ImportError(
-        "cicaid-devtools is not installed. Install the project's "
-        "dependencies (see pyproject.toml) before running issue-worm."
-    ) from _exc
-
-for _lib_dir in {Path(p) / "lib" for p in _cicaid_devtools.__path__}:
-    if _lib_dir.is_dir() and str(_lib_dir) not in sys.path:
-        sys.path.insert(0, str(_lib_dir))
-
-from github_issues import post_issue_comment
-
 logger = logging.getLogger(__name__)
+
+# Resolved lazily by _load_post_issue_comment - None until first use, or
+# already set here by a test's `patch.object(progress_reporter,
+# "post_issue_comment", ...)`, which _load_post_issue_comment then leaves
+# untouched (see its own "already resolved" check).
+post_issue_comment = None
+
+
+def _load_post_issue_comment():
+    """Return cicaid-devtools' `post_issue_comment`, importing it (and
+    caching the result on the module-level `post_issue_comment` name
+    above) on first use only - not at module import time.
+
+    `cicaid_devtools.lib.github_issues` does bare top-level imports of its
+    own sibling modules rather than package-relative ones, so it isn't
+    importable as a plain subpackage - its lib/ dir has to be on sys.path
+    first. Same hack issue-worm-pro's cicaid_bridge.py uses for the same
+    reason (see that module's docstring); duplicated here rather than
+    shared since pro isn't a dependency of this package.
+
+    Deferred rather than done at module scope: `cli.py` imports this
+    module unconditionally (for `build`'s own progress calls), and every
+    other subcommand - `history`, `status`, `poll` - has nothing to do
+    with progress reporting or cicaid-devtools. A git dependency install
+    hiccup (network, a missing `git` on PATH - real risks for a `pip
+    install git+https://...` dependency) would otherwise take down every
+    subcommand, not just the one that actually needs it.
+    """
+    global post_issue_comment
+    if post_issue_comment is not None:
+        return post_issue_comment
+    try:
+        import cicaid_devtools
+    except ImportError as exc:
+        raise ImportError(
+            "cicaid-devtools is not installed. Install the project's "
+            "dependencies (see pyproject.toml) before running issue-worm."
+        ) from exc
+    for lib_dir in {Path(p) / "lib" for p in cicaid_devtools.__path__}:
+        if lib_dir.is_dir() and str(lib_dir) not in sys.path:
+            sys.path.insert(0, str(lib_dir))
+    from github_issues import post_issue_comment as _post_issue_comment
+
+    post_issue_comment = _post_issue_comment
+    return post_issue_comment
 
 # Same marker text issue-worm-pro's progress_reporter.py uses, so a reader
 # (or a script) can't tell which engine produced a given comment without
@@ -278,6 +303,7 @@ def _render(state: _ProgressState) -> str:
 def _sync(state: _ProgressState, dry_run: bool) -> None:
     body = _render(state)
     if state.comment_id is None:
+        post_issue_comment = _load_post_issue_comment()
         if not post_issue_comment(state.repo, state.issue_number, body, dry_run=dry_run):
             logger.warning(
                 "issue #%s: could not post progress comment", state.issue_number
