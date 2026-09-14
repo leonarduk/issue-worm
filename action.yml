@@ -91,6 +91,32 @@ runs:
           exit 1
         fi
 
+    - name: Announce the run on the issue
+      shell: bash
+      # #383: first thing, before checkout/Python/install (a minute or
+      # more) - mark the issue `in-progress` and post the progress comment
+      # with a link to this run, so the issue shows a run has started
+      # before `issue-worm build` exists on this runner at all. `build`'s
+      # own progress_reporter finds this comment by its run link and edits
+      # it, rather than posting a second one; the run URL built here must
+      # match progress_reporter._run_url(), attempt suffix included. Only
+      # `gh`, which the publish step below already requires. Best-effort:
+      # neither write may fail the run.
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        ISSUE: ${{ inputs.issue }}
+        REPO: ${{ github.repository }}
+      run: |
+        run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+        if [ "${GITHUB_RUN_ATTEMPT:-1}" != "1" ]; then
+          run_url="${run_url}/attempts/${GITHUB_RUN_ATTEMPT}"
+        fi
+        gh api -X POST "repos/$REPO/issues/$ISSUE/labels" -f 'labels[]=in-progress' > /dev/null \
+          || echo "::warning::Could not add the in-progress label to #$ISSUE."
+        body="$(printf '<!-- issue-worm:progress -->\n🪱 issue-worm · working\n[Actions run](%s)' "$run_url")"
+        gh api -X POST "repos/$REPO/issues/$ISSUE/comments" -f body="$body" > /dev/null \
+          || echo "::warning::Could not post the progress comment on #$ISSUE."
+
     - name: Report license-key status
       shell: bash
       run: |
@@ -409,3 +435,36 @@ runs:
         # is idempotent besides.
         issue-worm progress --issue "$ISSUE" --repo "$REPO" \
           --pr-url "https://github.com/$REPO/pull/$pr_number" || true
+
+    - name: Report a failure on the progress comment
+      # #383: `build` and the publish step report their own failures, but
+      # a run can fail before either reaches that point (checkout/install
+      # failing, or `build` returning "not ready" before it starts the
+      # comment) - which would leave the announce comment saying "working"
+      # forever. finish() is idempotent, so this never overwrites a
+      # failure (or a result) already recorded. `command -v`: if the
+      # install step is what failed, there is no issue-worm to run.
+      if: failure()
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        ISSUE: ${{ inputs.issue }}
+        REPO: ${{ github.repository }}
+        ISSUE_WORM_SKIP_UPDATE_CHECK: "1"
+      run: |
+        if command -v issue-worm > /dev/null; then
+          issue-worm progress --issue "$ISSUE" --repo "$REPO" \
+            --failure "Action run failed before a PR was opened - see the run log" || true
+        fi
+
+    - name: Clear the in-progress label
+      # #383: finish() already removes it on every path that reaches it;
+      # this covers the ones that don't. 404 (already removed) is normal.
+      if: always()
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        ISSUE: ${{ inputs.issue }}
+        REPO: ${{ github.repository }}
+      run: |
+        gh api -X DELETE "repos/$REPO/issues/$ISSUE/labels/in-progress" > /dev/null 2>&1 || true

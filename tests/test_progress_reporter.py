@@ -20,24 +20,112 @@ def _isolated_state_dir(tmp_path, monkeypatch):
     """Point progress_reporter at an isolated state dir under tmp_path,
     so tests never read or write the real `~/.issue-worm/progress/`."""
     monkeypatch.setenv(pr.STATE_DIR_ENV, str(tmp_path / "progress"))
+    # This suite itself runs inside GitHub Actions in CI - without this,
+    # every test would see a real run URL and take the #383 "adopt this
+    # run's announce comment" path. Tests that want it opt in via
+    # `_in_actions`.
+    for name in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_REPOSITORY", "GITHUB_SERVER_URL"):
+        monkeypatch.delenv(name, raising=False)
+
+
+def _in_actions(monkeypatch, run_id="42", attempt="1"):
+    monkeypatch.setenv("GITHUB_SERVER_URL", "https://github.com")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "owner/repo")
+    monkeypatch.setenv("GITHUB_RUN_ID", run_id)
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", attempt)
+    return f"https://github.com/owner/repo/actions/runs/{run_id}"
 
 
 @pytest.fixture
 def gh(monkeypatch):
-    """Mocks for the three GitHub-facing calls, plus a `body()` helper
-    that returns the most recent comment body written (post, or the
-    latest update)."""
+    """Mocks for the GitHub-facing calls, plus a `body()` helper that
+    returns the most recent comment body written (post, or the latest
+    update)."""
     post = patch.object(pr, "post_issue_comment", return_value=True).start()
     find = patch.object(pr, "_find_progress_comment_id", return_value=99).start()
     update = patch.object(pr, "_update_progress_comment", return_value=True).start()
+    label = patch.object(pr, "_set_in_progress_label").start()
 
     def body():
         if update.call_args_list:
             return update.call_args_list[-1][0][2]
         return post.call_args_list[-1][0][2]
 
-    yield type("GH", (), {"post": post, "find": find, "update": update, "body": staticmethod(body)})
+    yield type(
+        "GH",
+        (),
+        {"post": post, "find": find, "update": update, "label": label, "body": staticmethod(body)},
+    )
     patch.stopall()
+
+
+def test_no_run_link_outside_actions(gh):
+    pr.start("owner/repo", 1)
+
+    assert "Actions run" not in gh.body()
+
+
+def test_run_link_is_rendered_under_the_header_in_actions(gh, monkeypatch):
+    url = _in_actions(monkeypatch)
+    gh.find.side_effect = [None, 99]  # no announce comment to adopt; then the posted one
+
+    pr.start("owner/repo", 1)
+
+    gh.post.assert_called_once()
+    assert gh.body().splitlines()[2] == f"[Actions run]({url})"
+
+
+def test_a_rerun_links_to_its_own_attempt(gh, monkeypatch):
+    url = _in_actions(monkeypatch, attempt="2")
+    gh.find.side_effect = [None, 99]
+
+    pr.start("owner/repo", 1)
+
+    assert f"[Actions run]({url}/attempts/2)" in gh.body()
+
+
+def test_start_adopts_this_runs_announce_comment_instead_of_posting(gh, monkeypatch):
+    url = _in_actions(monkeypatch)
+
+    pr.start("owner/repo", 1)
+
+    gh.post.assert_not_called()
+    assert gh.find.call_args.kwargs["must_contain"] == f"[Actions run]({url})"
+    assert gh.update.call_args.args[1] == 99
+
+
+def test_state_left_by_a_different_run_is_ignored(gh, monkeypatch):
+    _in_actions(monkeypatch, run_id="42")
+    pr.start("owner/repo", 1)
+    pr.finish("owner/repo", 1, pr_url="https://example.com/pr/1")
+    writes = gh.update.call_count
+
+    # The next run never reaches start() (e.g. "not ready"), so only
+    # action.yml's failure step calls finish(). The previous run's
+    # finished record must not turn that into a no-op.
+    url = _in_actions(monkeypatch, run_id="43")
+    pr.finish("owner/repo", 1, failure_detail="not ready")
+
+    assert gh.update.call_count == writes + 1
+    assert f"[Actions run]({url})" in gh.body()
+    assert "**Result:** ❌ not ready" in gh.body()
+
+
+def test_start_adds_and_finish_removes_the_in_progress_label(gh):
+    pr.start("owner/repo", 1)
+    pr.finish("owner/repo", 1, pr_url="https://example.com/pr/1")
+
+    assert [c.args for c in gh.label.call_args_list] == [
+        ("owner/repo", 1, True),
+        ("owner/repo", 1, False),
+    ]
+
+
+def test_dry_run_never_touches_the_label(gh):
+    pr.start("owner/repo", 1, dry_run=True)
+    pr.finish("owner/repo", 1, pr_url="https://example.com/pr/1", dry_run=True)
+
+    gh.label.assert_not_called()
 
 
 def test_start_posts_the_initial_working_comment(gh):
@@ -280,6 +368,41 @@ def test_find_progress_comment_id_returns_none_when_no_comment_matches(monkeypat
     )
 
     assert pr._find_progress_comment_id("owner/repo", 1) is None
+
+
+def test_find_progress_comment_id_with_must_contain_skips_other_runs(monkeypatch):
+    link = "[Actions run](https://github.com/owner/repo/actions/runs/12)"
+    stdout = json.dumps(
+        [
+            {"id": 1, "created_at": "2026-01-01T00:00:00Z", "body": f"{pr.PROGRESS_MARKER}\n{link}"},
+            # Newer, but another run's - and run 123's link contains
+            # run 12's URL as a plain prefix.
+            {
+                "id": 2,
+                "created_at": "2026-01-02T00:00:00Z",
+                "body": f"{pr.PROGRESS_MARKER}\n[Actions run](https://github.com/owner/repo/actions/runs/123)",
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        pr.subprocess, "run", lambda *a, **k: _FakeCompletedProcess(stdout=stdout)
+    )
+
+    assert pr._find_progress_comment_id("owner/repo", 1, must_contain=link) == 1
+
+
+@pytest.mark.parametrize("present", [True, False])
+def test_set_in_progress_label_never_raises(monkeypatch, present):
+    monkeypatch.setattr(
+        pr.subprocess, "run", lambda *a, **k: _FakeCompletedProcess(returncode=1, stderr="404")
+    )
+    pr._set_in_progress_label("owner/repo", 1, present)
+
+    def _raise(*a, **k):
+        raise OSError("gh not on PATH")
+
+    monkeypatch.setattr(pr.subprocess, "run", _raise)
+    pr._set_in_progress_label("owner/repo", 1, present)
 
 
 def test_load_post_issue_comment_raises_cleanly_when_cicaid_devtools_is_absent(

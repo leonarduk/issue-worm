@@ -204,13 +204,16 @@ too, add it to your `.gitignore`:
 
 ### Live progress on the issue
 
-The action posts one comment on the issue when it starts, and edits that
-same comment as each stage finishes — coder, verifier, and publish — in
-the same format issue-worm-pro's own scheduler uses, so an issue looks
-the same whichever engine dispatched it:
+As its very first step, before checkout or install, the action labels the
+issue `in-progress` and posts one comment linking to the Actions run. It
+then edits that same comment as each stage finishes — coder, verifier,
+and publish — in the same format issue-worm-pro's own scheduler uses, so
+an issue looks the same whichever engine dispatched it. The
+`in-progress` label is removed when the run ends, pass or fail:
 
 ```
 🪱 issue-worm · done
+[Actions run](https://github.com/owner/repo/actions/runs/123456789)
 - [x] coder (5.1s)
 - [x] verifier (14.2s)
 - [x] publish (2.0s)
