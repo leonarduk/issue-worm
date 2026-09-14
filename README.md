@@ -151,7 +151,7 @@ full commit SHA instead.
 | `issue` | yes | Number of the issue to work. |
 | `github-token` | yes | A PAT or GitHub App token with `contents: write`, `pull-requests: write`, and `issues: read` on the target repo. A classic PAT's `repo` scope covers all three; a fine-grained PAT needs each granted separately — `issues: read` is easy to miss, since only the issue-body fetch needs it, and that runs (and fails) before the push/PR steps ever do. The built-in `secrets.GITHUB_TOKEN` is **not** sufficient either way — a PR opened (or pushed to) with it deliberately does not trigger other workflow runs, so anything gated on the PR (CI, review bots, required checks) would never fire. |
 | `license-key` | no | Reserved for the pro engine. Currently accepted and logged only — installing the pro wheel from a license key is a separate, unimplemented piece of work ([leonarduk/issue-worm-pro#584](https://github.com/leonarduk/issue-worm-pro/issues/584)). Omit it (the default) to run the free engine, which is everything the action does today. |
-| `close-issue` | no | Whether to include a `Closes #N` trailer in the commit message body, which makes GitHub auto-close the issue when the PR is merged. Defaults to `'true'` (issues close on merge), matching the action's historical behaviour. Set to `'false'` to keep the issue open after merge — useful when the PR addresses only part of the issue, or when the issue tracks broader work that continues after this PR. Only the commit body is affected; the PR body's own `Closes #N` line is left as-is. |
+| `close-issue` | no | Whether to include a `Closes #N` trailer in the commit message body. Note: `cicaid publish-pr` always appends `Closes #N` to the PR body, so the issue will close on merge regardless of this input. Defaults to `'true'`. |
 
 ### `runs-on` options
 
@@ -184,17 +184,21 @@ what actually select the coder.
 3. Runs `issue-worm build <issue> --repo <owner/name> --workspace
    <checkout>`, reusing the already-checked-out, already-credentialed
    working tree instead of `build`'s normal unauthenticated fresh clone.
-4. If that produced changes, commits them to a deterministic
-   `issue-worm/issue-<N>` branch, force-pushes it (so re-labelling the
-   issue supersedes a previous attempt rather than piling up branches —
-   see [leonarduk/issue-worm-pro#582](https://github.com/leonarduk/issue-worm-pro/issues/582)'s
-   retry UX), and opens a PR with `gh pr create` (or leaves the existing
-   PR for that branch as-is if one is already open).
+4. If that produced changes, it creates a `fix/issue-N-<slug>` branch
+   (same slug rule as `cicaid work-on-issue`), builds a PR body
+   mechanically with `## What`, `## Why`, `## Approach`, `## Testing`,
+   and `## Checklist` sections plus the logo footer, then publishes the
+   PR with `cicaid publish-pr --body-file ... -m ...`. That produces a
+   `[Issue #N] <title>` title, appends `Closes #N` to the body, and
+   force-pushes the branch on retry (re-labelling the issue supersedes a
+   previous attempt — see
+   [leonarduk/issue-worm-pro#582](https://github.com/leonarduk/issue-worm-pro/issues/582)'s
+   retry UX). The PR is then labelled `issue-worm`.
 
    The commit message body carries a `Closes #N` trailer by default, so
    merging the PR closes the issue. Pass `close-issue: 'false'` to omit
-   that trailer and leave the issue open after merge — see the
-   [`close-issue` input](#inputs) above.
+   that trailer — note that the PR body itself always carries `Closes #N`
+   now, so the issue will still close on merge.
 
 The action never commits its own per-run bookkeeping: it stages
 everything with `git add -A .` and then unstages `.issue-worm/` (this

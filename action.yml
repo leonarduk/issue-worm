@@ -53,13 +53,10 @@ inputs:
     default: ''
   close-issue:
     description: >-
-      Whether to include a `Closes #N` trailer in the commit message body,
-      which makes GitHub auto-close the issue when the PR is merged. Set to
-      'false' to keep the issue open after merge - useful when the PR only
-      addresses part of the issue, or when the issue tracks broader work
-      that continues after this PR. Defaults to 'true' (issues close on
-      merge), matching the action's historical behaviour. Only the commit
-      body is affected; the PR body's own `Closes #N` line is left as-is.
+      Whether to include a `Closes #N` trailer in the commit message body.
+      Note: `cicaid publish-pr` always appends a `Closes #N` line to the PR
+      body, so the issue will close on merge regardless of this input. This
+      input only controls the commit message trailer. Defaults to 'true'.
     required: false
     default: 'true'
 
@@ -138,7 +135,7 @@ runs:
           --repo "${{ github.repository }}" \
           --workspace "${{ github.workspace }}"
 
-    - name: Commit, push, and open the PR
+    - name: Publish the PR via cicaid
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
@@ -151,157 +148,122 @@ runs:
           exit 1
         fi
 
-        # Deterministic per-issue branch name so that re-labelling the
-        # issue (issue-worm-pro#582's "remove-and-re-add means try again"
-        # UX) supersedes the previous attempt instead of piling up
-        # branches - hence --force below, always overwriting this branch.
-        branch="issue-worm/issue-${{ inputs.issue }}"
-        # Captured before checkout -b so the PR-body diff below has an
-        # explicit base to compare against, rather than assuming HEAD~1
-        # (DeepSeek flagged HEAD~1 as fragile on review of #278 - it happens
-        # to work today since this step makes exactly one commit, but that's
-        # an implicit invariant a future change could silently break).
-        base_commit="$(git rev-parse HEAD)"
+        # Fetch the issue title and body once; both the branch slug and the
+        # PR body are built from them mechanically.
+        issue_title="$(gh issue view "${{ inputs.issue }}" --repo "${{ github.repository }}" --json title -q .title)"
+        issue_body="$(gh issue view "${{ inputs.issue }}" --repo "${{ github.repository }}" --json body -q .body || true)"
+
+        # Slug rule mirrors cicaid work-on-issue's branch naming:
+        # lower-case, non-alphanumeric runs -> hyphens, trim, cap length.
+        slugify() {
+          local input="$1"
+          local slug
+          slug="$(printf '%s' "$input" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed -E 's/[^a-z0-9]+/-/g' \
+            | sed -E 's/^-+//' \
+            | sed -E 's/-+$//' \
+            | cut -c1-50)"
+          slug="$(printf '%s' "$slug" | sed -E 's/-+$//')"
+          if [ -z "$slug" ]; then
+            slug="issue-${{ inputs.issue }}"
+          fi
+          printf '%s' "$slug"
+        }
+
+        branch="fix/issue-${{ inputs.issue }}-$(slugify "$issue_title")"
+
         git config user.name "issue-worm[bot]"
         git config user.email "issue-worm[bot]@users.noreply.github.com"
-        git checkout -b "$branch"
-        # Excludes .issue-worm/ (this run's own bookkeeping - history.jsonl,
-        # the in-flight registry): it's meaningful only for this one
-        # ephemeral job, not the consumer's source tree, and a repo that
-        # has never used issue-worm before has no reason to already
-        # gitignore it - every commit from a first-time adopter would
-        # otherwise carry an ever-growing, meaningless JSONL file into
-        # their history (leonarduk/cicaid#36).
-        #
-        # Plain `git add -A .` plus an explicit `git reset -- .issue-worm`
-        # afterward, NOT `git add -A -- . ':!.issue-worm'` (issue #270):
-        # that pathspec-negation form dies with "The following paths are
-        # ignored by one of your .gitignore files" and exit 1 whenever
-        # .issue-worm *is* already gitignored - which is true for this
-        # action's own two home repos (issue-worm, issue-worm-pro) that
-        # dogfood it on themselves. `git add -A .` never errors on ignored
-        # paths regardless of whether they're gitignored yet, so it
-        # handles both a fresh consumer repo (nothing gitignored: adds
-        # everything, then the reset below unstages just .issue-worm) and
-        # a dogfooding repo (already gitignored: -A skips it, and the
-        # reset is then a harmless no-op) with the same two commands.
-        # `git reset -- .issue-worm` also no-ops cleanly (exit 0) when the
-        # path doesn't exist at all - verified locally, since `set -e`
-        # above would otherwise abort the step on a nonexistent pathspec.
-        # If a consumer has `.issue-worm` *tracked* (committed by an older
-        # version of this action, before it was gitignored), `git add -A .`
-        # will stage modifications to it and this reset will unstage them,
-        # so those changes will not be committed - a deliberate tradeoff,
-        # since untracking `.issue-worm` is the point.
-        git add -A .
-        # `.gitignore` audit (search performed 2026-09-01, follow-up to the
-        # AI review of PR #284): a repo-wide search of README.md, docs/,
-        # and any scaffold/template/example directories found no default
-        # `.gitignore` template shipped by this action or by a scaffold
-        # step. The only onboarding `.gitignore` guidance in the repo is in
-        # README.md, and it now lists `.issue-worm` (the working directory
-        # this step resets defensively). This reset remains as a defensive
-        # fallback for a first-time adopter who hasn't added it yet.
-        git reset -- .issue-worm
-        # `close-issue` (default 'true') controls whether the commit body
-        # carries a `Closes #N` trailer. GitHub only auto-closes the linked
-        # issue on merge when that trailer is present, so setting the input
-        # to 'false' keeps the issue open - for a PR that addresses only
-        # part of the issue, or one whose issue tracks broader follow-up
-        # work. The default preserves the historical behaviour exactly.
-        if [ "${{ inputs.close-issue }}" = "true" ]; then
-          git commit -m "issue-worm: apply changes for #${{ inputs.issue }}" -m "Closes #${{ inputs.issue }}"
-        else
-          git commit -m "issue-worm: apply changes for #${{ inputs.issue }}"
-        fi
-        git push --force origin "$branch"
+        # -B resets the branch if it somehow already exists locally;
+        # cicaid publish-pr handles the remote force-push on retry.
+        git checkout -B "$branch"
 
-        # A retry (branch already had an open PR) just needed the push
-        # above to update it - creating a second PR for the same head
-        # branch would fail, so only open one if none exists yet.
-        if gh pr view "$branch" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-          echo "PR for $branch already exists - pushed update, nothing more to do."
-        else
-          issue_title="$(gh issue view "${{ inputs.issue }}" --repo "${{ github.repository }}" --json title -q .title)"
-          # The action itself has no LLM-generated summary to draw on (that's
-          # the Coder's job, and its output is already applied as file
-          # edits, not prose) - so build the body from what's mechanically
-          # available: which files changed against $base_commit (captured
-          # above, before this branch existed) and the issue it closes,
-          # rather than shipping the old placeholder text that told the
-          # reader nothing the title and "Closes #N" trailer didn't already
-          # say (issue-worm-pro#764). `|| true` so a diff failure degrades
-          # to an empty section instead of aborting under `set -e` and
-          # leaving no PR at all - the one outcome worse than a bare body.
-          # Diffs against HEAD, not the working tree: a tracked .issue-worm
-          # is still modified on disk after the `git reset` above unstaged
-          # it, so a working-tree diff would list files never committed.
-          changed_files="$(git diff --name-only "$base_commit" HEAD | sed 's/^/- /' || true)"
-          # `review_issue` (review.py) already required a `DONE:` line under
-          # `## Implementation notes` before the build was allowed to run at
-          # all, so it's usually present here too - but that check was
-          # against cli.py's in-memory body, which may include a self-heal
-          # draft (`_self_heal_scope`) that failed to persist back to the
-          # actual GitHub issue for lack of `issues: write` (see the
-          # github-token input's description above). Every command in this
-          # extraction is `|| true`-guarded (or feeds a var that tolerates
-          # empty input) so a missing DONE: line, or a transient `gh`
-          # failure, yields an empty $done_line and the older no-goal body
-          # below - not an aborted step. Without the explicit `|| true` on
-          # `grep -m1`, its exit 1 on no-match would kill this step under
-          # `set -euo pipefail` (piping into `sed` doesn't hide that; a
-          # failing `grep` still propagates through the pipe).
-          #
-          # Scoped to the text between the "## Implementation notes" heading
-          # and the next "##" heading (or end of body), not a bare grep over
-          # the whole issue - a `DONE:`-looking line pasted elsewhere (an
-          # example, a quoted template) must not be mistaken for the real
-          # one. Mirrors review.py's own section-scoped `_DONE_RE` search,
-          # including "first well-formed section wins": only the first
-          # matching heading's text is scanned. `/^##([^#]|$)/` (not just
-          # `[^#]`) so a bare "##" heading line still resets the section,
-          # rather than having its body attributed to the prior heading.
-          issue_body="$(gh issue view "${{ inputs.issue }}" --repo "${{ github.repository }}" --json body -q .body || true)"
-          notes_section="$(printf '%s\n' "$issue_body" | awk '
-            /^##([^#]|$)/ {
-              heading = $0
-              sub(/^##[ \t]*/, "", heading)
-              sub(/[ \t]*$/, "", heading)
-              if (!found && tolower(heading) == "implementation notes") { f = 1; found = 1 }
-              else { f = 0 }
-              next
-            }
-            f { print }
-          ')"
-          done_line="$(printf '%s\n' "$notes_section" | { grep -m1 -i '^DONE:' || true; } | sed -E 's/^DONE:[[:space:]]*//I')"
-          goal_section=""
-          if [ -n "$done_line" ]; then
-            goal_section="$(printf '\n\n**Goal:** %s' "$done_line")"
-          fi
-          # Branches on $() directly rather than composing through an
-          # intermediate "files section" variable: command substitution
-          # strips ALL trailing newlines, so a $(printf ...) meant to hold
-          # "list\n\n" silently collapses to "list" with no separator,
-          # running the last filename straight into "Closes #N" on one line.
-          # Mirrors issue-worm-pro's scheduler._pr_footer() so a PR carries
-          # the same "opened by issue-worm" attribution regardless of which
-          # of the two publishing paths (this Action vs. the pro scheduler)
-          # created it. The logo is always served from the public
-          # leonarduk/issue-worm repo, never the target repo - target repos
-          # don't carry their own docs/logo.jpg, so pointing there 404'd on
-          # every PR (see that function's docstring and
-          # leonarduk/issue-worm-pro#483).
-          pr_footer="$(printf '\n\n---\n<p align="center"><img src="https://github.com/leonarduk/issue-worm/raw/main/docs/logo.jpg" width="48" alt="issue-worm logo" /><br/><sub>🐛 Opened automatically by <a href="https://github.com/leonarduk/issue-worm">issue-worm</a></sub></p>')"
-          if [ -n "$changed_files" ]; then
-            pr_body="$(printf 'Automated single-pass change from the free issue-worm engine for #%s.%s\n\n**Files changed:**\n%s\n\nCloses #%s%s' \
-              "${{ inputs.issue }}" "$goal_section" "$changed_files" "${{ inputs.issue }}" "$pr_footer")"
-          else
-            pr_body="$(printf 'Automated single-pass change from the free issue-worm engine for #%s.%s\n\nCloses #%s%s' \
-              "${{ inputs.issue }}" "$goal_section" "${{ inputs.issue }}" "$pr_footer")"
-          fi
-          gh pr create \
-            --repo "${{ github.repository }}" \
-            --head "$branch" \
-            --title "issue-worm: ${issue_title:-issue #${{ inputs.issue }}}" \
-            --body "$pr_body"
+        # Keep this run's bookkeeping out of the commit. .git/info/exclude
+        # is local to this checkout and never committed.
+        mkdir -p .git/info
+        if ! grep -qxF '.issue-worm/' .git/info/exclude 2>/dev/null; then
+          echo '.issue-worm/' >> .git/info/exclude
         fi
+
+        git add -A .
+        # Unstage any tracked .issue-worm modifications as well - exclude
+        # only prevents staging untracked/ignored paths.
+        git reset -- .issue-worm
+
+        changed_files="$(git diff --cached --name-only | sed 's/^/- /')"
+
+        # Extract the DONE: line from the issue's ## Implementation notes
+        # section (same scoping as review.py).
+        notes_section="$(printf '%s\n' "$issue_body" | awk '
+          /^##([^#]|$)/ {
+            heading = $0
+            sub(/^##[ \t]*/, "", heading)
+            sub(/[ \t]*$/, "", heading)
+            if (!found && tolower(heading) == "implementation notes") { f = 1; found = 1 }
+            else { f = 0 }
+            next
+          }
+          f { print }
+        ')"
+        done_line="$(printf '%s\n' "$notes_section" | { grep -m1 -i '^DONE:' || true; } | sed -E 's/^DONE:[[:space:]]*//I')"
+
+        # Why: the issue text outside ## Implementation notes, capped at
+        # 500 characters so the PR body stays readable.
+        why_excerpt="$(printf '%s\n' "$issue_body" | awk '
+          /^##([^#]|$)/ {
+            heading = $0
+            sub(/^##[ \t]*/, "", heading)
+            sub(/[ \t]*$/, "", heading)
+            if (tolower(heading) == "implementation notes") { f = 1 } else { f = 0 }
+            next
+          }
+          !f { print }
+        ')"
+        why_excerpt="$(printf '%s' "$why_excerpt" | cut -c1-500)"
+        if [ "${#why_excerpt}" -eq 500 ]; then
+          why_excerpt="${why_excerpt}..."
+        fi
+
+        what_section=""
+        if [ -n "$done_line" ]; then
+          what_section="$done_line"
+        fi
+        if [ -n "$changed_files" ]; then
+          if [ -n "$what_section" ]; then
+            what_section="$what_section"$'\n\n'"**Files changed:**"$'\n'"$changed_files"
+          else
+            what_section="**Files changed:**"$'\n'"$changed_files"
+          fi
+        fi
+        if [ -z "$what_section" ]; then
+          what_section="No goal line or changed files detected."
+        fi
+
+        approach="Single-pass free-engine build: the coder applied the change and the Action published it without an LLM-generated summary."
+        testing="not verified"
+
+        # Logo footer, matching issue-worm-pro's scheduler._pr_footer().
+        pr_footer="$(printf '\n\n---\n<p align="center"><img src="https://github.com/leonarduk/issue-worm/raw/main/docs/logo.jpg" width="48" alt="issue-worm logo" /><br/><sub>🐛 Opened automatically by <a href="https://github.com/leonarduk/issue-worm">issue-worm</a></sub></p>')"
+
+        pr_body="$(printf '## What\n%s\n\n## Why\n%s\n\n## Approach\n%s\n\n## Testing\n%s\n\n## Checklist\n- [ ] Tests added or updated\n- [ ] Documentation updated\n- [ ] No breaking changes\n%s' \
+          "$what_section" "$why_excerpt" "$approach" "$testing" "$pr_footer")"
+
+        body_file="$(mktemp)"
+        printf '%s\n' "$pr_body" > "$body_file"
+
+        if [ "${{ inputs.close-issue }}" = "true" ]; then
+          commit_msg="issue-worm: apply changes for #${{ inputs.issue }}"$'\n\n'"Closes #${{ inputs.issue }}"
+        else
+          commit_msg="issue-worm: apply changes for #${{ inputs.issue }}"
+        fi
+
+        # cicaid publish-pr does the commit, push, and gh pr create/update.
+        # --body-file and -m skip its LLM generation entirely (no LLM
+        # outside the coder). It derives the PR title ([Issue #N] <title>)
+        # from the branch name and appends Closes #N to the body.
+        cicaid publish-pr --body-file "$body_file" -m "$commit_msg"
+
+        # Add pro's PR_AUTHOR_LABEL to the PR (new or existing).
+        pr_number="$(gh pr view "$branch" --repo "${{ github.repository }}" --json number -q .number)"
+        gh pr edit "$pr_number" --repo "${{ github.repository }}" --add-label issue-worm
