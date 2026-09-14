@@ -15,10 +15,30 @@ import pytest
 import requests
 
 import cli
+import progress_reporter
 import registry
 from coder import CoderConfigError
 from review import ReviewResult
 from workspace import FileChange, MalformedOutputError, WorkspaceError
+
+
+@pytest.fixture(autouse=True)
+def _mute_progress_reporter(monkeypatch):
+    """Neutralize every progress-comment write for every test by default.
+
+    `_run_build` (#345) calls `progress_reporter.start`/
+    `record_stage_start`/`record_stage_done`/`finish` directly, and those
+    ultimately shell out to `gh` for a real GitHub write. Without this,
+    every `build`-exercising test in this file would attempt a live
+    network call (slow at best; on a machine authenticated against a real
+    repo, an actual comment on a real issue at worst) - exactly the class
+    of test/live-pipeline collision this suite already guards against for
+    `pro_cli` (see `_pro_cli_absent` below). A test that wants to assert
+    *how* progress reporting is called overrides these with its own
+    monkeypatch, which runs after this fixture and wins.
+    """
+    for name in ("start", "record_stage_start", "record_stage_done", "finish"):
+        monkeypatch.setattr(progress_reporter, name, lambda *a, **k: None)
 
 
 @pytest.fixture
@@ -732,6 +752,203 @@ def test_build_applies_changes_end_to_end(tmp_path, capsys):
     mock_apply.assert_called_once_with(str(tmp_path), change)
     out = capsys.readouterr().out
     assert "a.py" in out
+
+
+@pytest.mark.usefixtures("_pro_cli_absent")
+def test_build_reports_progress_through_the_coder_stage(tmp_path):
+    """#345: `build` posts the initial progress comment once the issue is
+    claimed (not for --dry-run or a not-ready issue), then opens and
+    closes a checklist row for the coder stage - the only stage `build`
+    itself runs; verifier/publish are the Action's own `progress`
+    subcommand calls, covered separately."""
+    ready = ReviewResult(ready=True, files=["a.py"], done="it works")
+    change = FileChange(path="a.py", mode="FULL", body="print(1)\n")
+    with patch.object(
+        sys, "argv", ["issue-worm", "build", "5", "--repo", "o/r"]
+    ), patch("cli._fetch_issue_body", return_value="body"), patch(
+        "cli.review_issue", return_value=ready
+    ), patch("cli.ensure_base_clone", return_value=str(tmp_path)), patch(
+        "cli.build_coder"
+    ) as mock_build_coder, patch(
+        "cli.parse_coder_output", return_value=[change]
+    ), patch("cli.apply_file_change"), patch.object(
+        progress_reporter, "start"
+    ) as mock_start, patch.object(
+        progress_reporter, "record_stage_start"
+    ) as mock_stage_start, patch.object(
+        progress_reporter, "record_stage_done"
+    ) as mock_stage_done, patch.object(
+        progress_reporter, "finish"
+    ) as mock_finish, pytest.raises(SystemExit) as exc:
+        mock_build_coder.return_value.propose.return_value = "raw coder output"
+        cli.main()
+
+    assert exc.value.code == 0
+    mock_start.assert_called_once_with("o/r", 5)
+    mock_stage_start.assert_called_once_with("o/r", 5, "coder")
+    mock_stage_done.assert_called_once()
+    assert mock_stage_done.call_args[0][:3] == ("o/r", 5, "coder")
+    assert isinstance(mock_stage_done.call_args[0][3], float)
+    # Build succeeded but hasn't been published yet - `finish()` is the
+    # Action's own job (verifier/publish still to come), not build's.
+    mock_finish.assert_not_called()
+
+
+@pytest.mark.usefixtures("_pro_cli_absent")
+def test_build_finishes_progress_with_failure_on_a_build_side_error(tmp_path):
+    """A failure inside `build` itself (never reaches the Action's
+    verifier/publish steps) must close out the progress comment with a
+    failure reason, since nothing downstream ever will."""
+    ready = ReviewResult(ready=True, files=["a.py"], done="it works")
+    with patch.object(
+        sys, "argv", ["issue-worm", "build", "5", "--repo", "o/r"]
+    ), patch("cli._fetch_issue_body", return_value="body"), patch(
+        "cli.review_issue", return_value=ready
+    ), patch("cli.ensure_base_clone", return_value=str(tmp_path)), patch(
+        "cli.build_coder"
+    ) as mock_build_coder, patch.object(
+        progress_reporter, "finish"
+    ) as mock_finish, pytest.raises(SystemExit) as exc:
+        mock_build_coder.return_value.propose.return_value = ""
+        cli.main()
+
+    assert exc.value.code == 1
+    mock_finish.assert_called_once_with(
+        "o/r", 5, failure_detail="The Coder produced no output — is Ollama reachable?"
+    )
+
+
+@pytest.mark.usefixtures("_pro_cli_absent")
+def test_build_does_not_start_progress_for_a_dry_run(tmp_path):
+    ready = ReviewResult(ready=True, files=["a.py"], done="it works")
+    with patch.object(
+        sys, "argv", ["issue-worm", "build", "5", "--repo", "o/r", "--dry-run"]
+    ), patch("cli._fetch_issue_body", return_value="body"), patch(
+        "cli.review_issue", return_value=ready
+    ), patch.object(progress_reporter, "start") as mock_start, pytest.raises(
+        SystemExit
+    ):
+        cli.main()
+
+    mock_start.assert_not_called()
+
+
+@pytest.mark.usefixtures("_pro_cli_absent")
+def test_build_does_not_start_progress_for_a_not_ready_issue(tmp_path):
+    not_ready = ReviewResult(ready=False, message="missing DONE line")
+    with patch.object(
+        sys, "argv", ["issue-worm", "build", "5", "--repo", "o/r"]
+    ), patch("cli._fetch_issue_body", return_value="body"), patch(
+        "cli.review_issue", return_value=not_ready
+    ), patch("cli._self_heal_scope", return_value=None), patch.object(
+        progress_reporter, "start"
+    ) as mock_start, pytest.raises(SystemExit):
+        cli.main()
+
+    mock_start.assert_not_called()
+
+
+@pytest.mark.usefixtures("_pro_cli_absent")
+def test_progress_command_stage_start_dispatches_to_progress_reporter():
+    with patch.object(
+        sys,
+        "argv",
+        ["issue-worm", "progress", "--issue", "5", "--repo", "o/r", "--stage-start", "verifier"],
+    ), patch.object(progress_reporter, "record_stage_start") as mock_stage_start, pytest.raises(
+        SystemExit
+    ) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+    mock_stage_start.assert_called_once_with("o/r", 5, "verifier", dry_run=False)
+
+
+@pytest.mark.usefixtures("_pro_cli_absent")
+def test_progress_command_stage_done_requires_elapsed():
+    with patch.object(
+        sys,
+        "argv",
+        ["issue-worm", "progress", "--issue", "5", "--repo", "o/r", "--stage-done", "verifier"],
+    ), patch.object(progress_reporter, "record_stage_done") as mock_stage_done, pytest.raises(
+        SystemExit
+    ) as exc:
+        cli.main()
+
+    assert exc.value.code == 2
+    mock_stage_done.assert_not_called()
+
+
+@pytest.mark.usefixtures("_pro_cli_absent")
+def test_progress_command_stage_done_with_elapsed_dispatches():
+    with patch.object(
+        sys,
+        "argv",
+        [
+            "issue-worm", "progress", "--issue", "5", "--repo", "o/r",
+            "--stage-done", "verifier", "--elapsed", "12.5",
+        ],
+    ), patch.object(progress_reporter, "record_stage_done") as mock_stage_done, pytest.raises(
+        SystemExit
+    ) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+    mock_stage_done.assert_called_once_with("o/r", 5, "verifier", 12.5, dry_run=False)
+
+
+@pytest.mark.usefixtures("_pro_cli_absent")
+def test_progress_command_pr_url_dispatches_to_finish():
+    with patch.object(
+        sys,
+        "argv",
+        [
+            "issue-worm", "progress", "--issue", "5", "--repo", "o/r",
+            "--pr-url", "https://github.com/o/r/pull/9",
+        ],
+    ), patch.object(progress_reporter, "finish") as mock_finish, pytest.raises(
+        SystemExit
+    ) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+    mock_finish.assert_called_once_with(
+        "o/r", 5, pr_url="https://github.com/o/r/pull/9", dry_run=False
+    )
+
+
+@pytest.mark.usefixtures("_pro_cli_absent")
+def test_progress_command_failure_dispatches_to_finish():
+    with patch.object(
+        sys,
+        "argv",
+        [
+            "issue-worm", "progress", "--issue", "5", "--repo", "o/r",
+            "--failure", "checks failed",
+        ],
+    ), patch.object(progress_reporter, "finish") as mock_finish, pytest.raises(
+        SystemExit
+    ) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+    mock_finish.assert_called_once_with(
+        "o/r", 5, failure_detail="checks failed", dry_run=False
+    )
+
+
+@pytest.mark.usefixtures("_pro_cli_absent")
+def test_progress_command_actions_are_mutually_exclusive():
+    with patch.object(
+        sys,
+        "argv",
+        [
+            "issue-worm", "progress", "--issue", "5", "--repo", "o/r",
+            "--stage-start", "coder", "--pr-url", "https://example.com/pr/1",
+        ],
+    ), pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 2
 
 
 @pytest.mark.usefixtures("_pro_cli_absent")

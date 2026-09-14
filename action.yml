@@ -144,9 +144,32 @@ runs:
         REPO: ${{ github.repository }}
         CLOSE_ISSUE: ${{ inputs.close-issue }}
         PYTHONIOENCODING: utf-8
+        # Non-interactive CI already skips it (stdin/stdout aren't both
+        # ttys) - explicit here too, matching the build step, since this
+        # step now also calls `issue-worm progress` several times.
+        ISSUE_WORM_SKIP_UPDATE_CHECK: "1"
       run: |
         set -euo pipefail
         cd "${{ github.workspace }}"
+
+        # #345: `build` already posted the progress comment and reported
+        # its own coder stage; this step covers the two stages that run
+        # out here in bash (verifier, publish) via the `issue-worm
+        # progress` subcommand, ending with the terminal `**Result:**`
+        # line. The trap covers every failure path below in one place
+        # (a bad checkout, `cicaid publish-pr` failing, no open PR found,
+        # ...) rather than needing a `--failure` call at each `exit 1` -
+        # `finish()` is idempotent, so this never double-reports if a
+        # later line also finishes successfully. `|| true`: a progress
+        # write is best-effort and must never mask (or replace) the real
+        # failure this trap exists to report.
+        trap '
+          ec=$?
+          if [ "$ec" -ne 0 ]; then
+            issue-worm progress --issue "$ISSUE" --repo "$REPO" \
+              --failure "Action failed during commit/verify/publish (exit code $ec)" || true
+          fi
+        ' EXIT
 
         if [ -z "$(git status --porcelain)" ]; then
           echo "::error::issue-worm build reported success but left no changes to commit - nothing to open a PR for."
@@ -201,13 +224,19 @@ runs:
         # Cleans up on every exit path (success, a later step failure,
         # or this script erroring out under `set -e`), not just the one
         # explicit `rm -f` after the check below - a `publish-pr`/`gh`
-        # failure further down used to leak this file.
+        # failure further down used to leak this file. Composed with (not
+        # replacing) the failure-reporting trap above: both run, in LIFO
+        # order, on the same EXIT.
         trap 'rm -f "$checks_log"' EXIT
+        issue-worm progress --issue "$ISSUE" --repo "$REPO" --stage-start verifier || true
+        verifier_started=$SECONDS
         checks_status=0
         set +e
         cicaid run-ci-checks --all > "$checks_log" 2>&1
         checks_status=$?
         set -e
+        issue-worm progress --issue "$ISSUE" --repo "$REPO" \
+          --stage-done verifier --elapsed "$((SECONDS - verifier_started))" || true
 
         if [ "$checks_status" -eq 0 ]; then
           testing="✓ \`cicaid run-ci-checks --all\` passed."
@@ -293,6 +322,9 @@ runs:
         trap 'rm -f "$body_file"' EXIT
         printf '%s\n' "$pr_body" > "$body_file"
 
+        issue-worm progress --issue "$ISSUE" --repo "$REPO" --stage-start publish || true
+        publish_started=$SECONDS
+
         # --body-file skips publish-pr's LLM body generation entirely (no
         # LLM outside the coder). It titles the PR `[Issue #N] <title>`,
         # appends `Closes #N` to the body, and returns an already-open PR
@@ -311,6 +343,8 @@ runs:
           echo "::error::cicaid publish-pr succeeded but no open PR was found for $branch."
           exit 1
         fi
+        issue-worm progress --issue "$ISSUE" --repo "$REPO" \
+          --stage-done publish --elapsed "$((SECONDS - publish_started))" || true
 
         # publish-pr always appends `Closes #N`; strip it again when the
         # caller asked for the issue to stay open after merge.
@@ -324,3 +358,13 @@ runs:
         # label-gated issue-worm workflow. Cosmetic, so never fatal.
         gh api -X POST "repos/$REPO/issues/$pr_number/labels" -f 'labels[]=issue-worm' > /dev/null \
           || echo "::warning::Could not add the issue-worm label to PR #$pr_number."
+
+        # Terminal record (#345): a PR was opened either way (draft on a
+        # failed verifier, per issue-worm-pro#1079's chosen "always
+        # publish, mark draft on failure" behaviour) - `**Result:**` links
+        # to it regardless of `checks_status`, since a draft PR still is
+        # this run's result. The EXIT trap above never fires a competing
+        # `--failure` here: it only reports on a nonzero exit, and finish()
+        # is idempotent besides.
+        issue-worm progress --issue "$ISSUE" --repo "$REPO" \
+          --pr-url "https://github.com/$REPO/pull/$pr_number" || true

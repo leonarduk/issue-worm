@@ -202,6 +202,30 @@ too, add it to your `.gitignore`:
 - `.issue-worm/` — issue-worm's per-run bookkeeping directory (the action
   resets it defensively, so it is safe to ignore).
 
+### Live progress on the issue
+
+The action posts one comment on the issue when it starts, and edits that
+same comment as each stage finishes — coder, verifier, and publish — in
+the same format issue-worm-pro's own scheduler uses, so an issue looks
+the same whichever engine dispatched it:
+
+```
+🪱 issue-worm · done
+- [x] coder (5.1s)
+- [x] verifier (14.2s)
+- [x] publish (2.0s)
+
+**Result:** ✅ https://github.com/owner/repo/pull/42
+```
+
+Without this, the only trace of a run was ~8 lines in the Actions run
+log — there was no way to tell from the issue whether a run had started,
+was still going, failed, or which PR it opened. Every write here is
+best-effort: a GitHub API hiccup while posting or editing the comment is
+logged and never fails the build. This needs no extra configuration
+beyond `github-token`, which already has issue-comment access — see
+that input's description above.
+
 ### Known limitations
 
 - **`claude` isn't implemented as a coder source yet.** `local`, `remote`,
