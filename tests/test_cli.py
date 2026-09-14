@@ -1789,14 +1789,17 @@ def test_status_dispatches_to_run_status(monkeypatch):
 _PRO_DISPATCH_PIN_ALLOWLIST: frozenset[str] = frozenset()
 
 
-def _iter_literal_argv_lists(tree: ast.AST):
-    """Yield the list of string elements for every literal
-    `patch.object(sys, "argv", [...])` call found in `tree`."""
+def _iter_argv_assignments(tree: ast.AST):
+    """Yield the `[...]` list AST node for every `argv`-setting call found
+    in `tree`: `patch.object(sys, "argv", [...])` and `monkeypatch.setattr(
+    sys, "argv", [...])` share the same (obj, name, value) shape, so both
+    idioms - and any other `*.setattr`/`*.object` call matching it - are
+    caught the same way."""
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         func = node.func
-        if not (isinstance(func, ast.Attribute) and func.attr == "object"):
+        if not (isinstance(func, ast.Attribute) and func.attr in ("object", "setattr")):
             continue
         args = node.args
         if len(args) < 3:
@@ -1804,19 +1807,36 @@ def _iter_literal_argv_lists(tree: ast.AST):
         name_arg = args[1]
         if not (isinstance(name_arg, ast.Constant) and name_arg.value == "argv"):
             continue
-        if not isinstance(args[2], ast.List):
-            continue
-        try:
-            values = [ast.literal_eval(elt) for elt in args[2].elts]
-        except ValueError:
-            continue
-        yield values
+        if isinstance(args[2], ast.List):
+            yield args[2]
 
 
 def _drives_pro_dispatchable_command(func_source: str) -> bool:
+    """True if `func_source` sets `sys.argv` to a list whose subcommand
+    slot (index 1 - `cli.main()`'s own dispatch check is `sys.argv[1] in
+    _PRO_COMMANDS`, so only that position matters) is, or might be, a
+    token from `cli._PRO_COMMANDS`.
+
+    A non-literal element there - e.g. a `@pytest.mark.parametrize(
+    "command", ...)` argument spliced into the list - can't be statically
+    resolved to a value, so it's treated as a potential match rather than
+    silently skipped: understating this check is exactly the
+    false-confidence failure mode #227/#228 exist to close, and every
+    parametrize case actually used in this module supplies pro commands
+    (`triage`/`poll`) anyway. A non-literal element *elsewhere* in the
+    list (e.g. a `--history-path` flag's value) is irrelevant to dispatch
+    and must not trip this check, or every `history`/`status` test using a
+    `tmp_path`-derived path would be flagged.
+    """
     tree = ast.parse(func_source)
-    for argv in _iter_literal_argv_lists(tree):
-        if any(token in cli._PRO_COMMANDS for token in argv):
+    for argv_list in _iter_argv_assignments(tree):
+        if len(argv_list.elts) < 2:
+            continue
+        command_elt = argv_list.elts[1]
+        if isinstance(command_elt, ast.Constant) and isinstance(command_elt.value, str):
+            if command_elt.value in cli._PRO_COMMANDS:
+                return True
+        else:
             return True
     return False
 
@@ -1870,4 +1890,5 @@ def test_every_cli_main_test_pins_or_allowlists_pro_cli():
         "(or the _pro_cli_absent fixture), or add the test to "
         "_PRO_DISPATCH_PIN_ALLOWLIST with a comment explaining why it's safe."
     )
+
 
