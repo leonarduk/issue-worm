@@ -109,11 +109,82 @@ def _state_path(repo: str, issue_number: int) -> Path:
     return _state_dir() / f"{repo.replace('/', '_')}-{issue_number}.json"
 
 
+# Pro's scheduler claims an issue with this same label (its
+# IN_PROGRESS_LABEL), so an issue a free run is working on looks claimed
+# to both engines (#383).
+IN_PROGRESS_LABEL = "in-progress"
+
+
+def _run_url() -> str | None:
+    """URL of the GitHub Actions run this process belongs to, or None
+    outside Actions (a local `issue-worm build`). A re-run gets its own
+    `/attempts/N` URL rather than sharing attempt 1's, so each attempt
+    adopts its own announce comment and never an earlier attempt's (#383).
+    action.yml's "Announce the run on the issue" step builds the same URL
+    in bash - keep the two in step."""
+    run_id = os.environ.get("GITHUB_RUN_ID")
+    repository = os.environ.get("GITHUB_REPOSITORY")
+    if not run_id or not repository:
+        return None
+    server = (os.environ.get("GITHUB_SERVER_URL") or "https://github.com").rstrip("/")
+    url = f"{server}/{repository}/actions/runs/{run_id}"
+    attempt = os.environ.get("GITHUB_RUN_ATTEMPT")
+    if attempt and attempt != "1":
+        url += f"/attempts/{attempt}"
+    return url
+
+
+def _run_link(run_url: str) -> str:
+    # Matched verbatim (brackets and parens included) when adopting the
+    # announce comment, so run 12's link is never a substring match for
+    # run 123's, nor attempt 1's for attempt 2's.
+    return f"[Actions run]({run_url})"
+
+
+def _set_in_progress_label(repo: str, issue_number: int, present: bool) -> None:
+    """Add or remove IN_PROGRESS_LABEL. Best-effort, never raises. Adding
+    a label the repo doesn't have yet creates it; removing one the issue
+    doesn't carry is a 404, which is the normal case after action.yml's
+    own cleanup step already removed it, so only a failed add warns."""
+    endpoint = f"repos/{repo}/issues/{issue_number}/labels"
+    if present:
+        cmd = ["gh", "api", "-X", "POST", endpoint, "-f", f"labels[]={IN_PROGRESS_LABEL}"]
+    else:
+        cmd = ["gh", "api", "-X", "DELETE", f"{endpoint}/{IN_PROGRESS_LABEL}"]
+    try:
+        result = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=_GH_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        logger.warning(
+            "issue #%s: could not update the %s label",
+            issue_number,
+            IN_PROGRESS_LABEL,
+            exc_info=True,
+        )
+        return
+    if result.returncode != 0 and present:
+        logger.warning(
+            "issue #%s: could not add the %s label: %s",
+            issue_number,
+            IN_PROGRESS_LABEL,
+            result.stderr.strip(),
+        )
+
+
 @dataclass
 class _ProgressState:
     repo: str
     issue_number: int
     comment_id: int | None = None
+    # The Actions run that owns this record (None for a local run). See
+    # `_load_state` for why a record from any other run is discarded.
+    run_url: str | None = field(default_factory=_run_url)
     # Each entry: {"label": str, "elapsed": float | None}. `elapsed is None`
     # means the stage has started but not finished yet.
     stages: list = field(default_factory=list)
@@ -127,7 +198,17 @@ def _load_state(repo: str, issue_number: int) -> "_ProgressState | None":
         path = _state_path(repo, issue_number)
         if not path.exists():
             return None
-        return _ProgressState(**json.loads(path.read_text(encoding="utf-8")))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        # A record left by a different run (a persistent self-hosted
+        # runner's previous dispatch of this issue) is not this run's: its
+        # `finished` flag would turn this run's own finish() into a no-op,
+        # and its comment_id points at the old run's comment. Compared on
+        # the raw dict, not the dataclass - a pre-#383 record has no
+        # run_url key, and the field's default_factory would silently
+        # stamp it with the current run's URL.
+        if data.get("run_url") != _run_url():
+            return None
+        return _ProgressState(**data)
     except Exception:
         logger.debug(
             "%s#%s: progress state unreadable, starting fresh",
@@ -174,8 +255,12 @@ def _decode_paginated_json(text: str) -> list:
     return items
 
 
-def _find_progress_comment_id(repo: str, issue_number: int) -> int | None:
-    """Id of the most recent comment on the issue carrying PROGRESS_MARKER.
+def _find_progress_comment_id(
+    repo: str, issue_number: int, must_contain: str | None = None
+) -> int | None:
+    """Id of the most recent comment on the issue carrying PROGRESS_MARKER
+    (and `must_contain` too, when given - used to find this run's own
+    comment among earlier runs' on the same issue).
 
     cicaid-devtools' ``github_issues`` module has ``post_issue_comment`` and
     ``get_issue_comments`` (the latter returns author/body/created_at, no
@@ -208,7 +293,9 @@ def _find_progress_comment_id(repo: str, issue_number: int) -> int | None:
         matches = [
             item
             for item in items
-            if isinstance(item, dict) and PROGRESS_MARKER in (item.get("body") or "")
+            if isinstance(item, dict)
+            and PROGRESS_MARKER in (item.get("body") or "")
+            and (must_contain is None or must_contain in (item.get("body") or ""))
         ]
         if not matches:
             return None
@@ -285,6 +372,8 @@ def _status_word(state: _ProgressState) -> str:
 
 def _render(state: _ProgressState) -> str:
     lines = [PROGRESS_MARKER, f"\U0001fab1 issue-worm \u00b7 {_status_word(state)}"]
+    if state.run_url:
+        lines.append(_run_link(state.run_url))
     for stage in state.stages:
         label = stage["label"]
         elapsed = stage["elapsed"]
@@ -302,6 +391,13 @@ def _render(state: _ProgressState) -> str:
 
 def _sync(state: _ProgressState, dry_run: bool) -> None:
     body = _render(state)
+    run_link = _run_link(state.run_url) if state.run_url else None
+    if state.comment_id is None and run_link and not dry_run:
+        # action.yml posts this run's comment itself, before checkout or
+        # install (#383) - edit that one rather than posting a second.
+        state.comment_id = _find_progress_comment_id(
+            state.repo, state.issue_number, must_contain=run_link
+        )
     if state.comment_id is None:
         post_issue_comment = _load_post_issue_comment()
         if not post_issue_comment(state.repo, state.issue_number, body, dry_run=dry_run):
@@ -311,7 +407,9 @@ def _sync(state: _ProgressState, dry_run: bool) -> None:
             return
         if dry_run:
             return
-        state.comment_id = _find_progress_comment_id(state.repo, state.issue_number)
+        state.comment_id = _find_progress_comment_id(
+            state.repo, state.issue_number, must_contain=run_link
+        )
         if state.comment_id is None:
             logger.warning(
                 "issue #%s: posted progress comment but could not locate its "
@@ -329,8 +427,11 @@ def start(repo: str, issue_number: int, dry_run: bool = False) -> None:
     """Post the initial 'working' progress comment. Best-effort, never
     raises. Overwrites any prior local state for this issue number - each
     dispatch (a fresh label, a re-run) starts its own checklist from
-    scratch, matching pro's "one instance per dispatch" lifecycle."""
+    scratch, matching pro's "one instance per dispatch" lifecycle. Also
+    adds IN_PROGRESS_LABEL, which finish() removes again (#383)."""
     try:
+        if not dry_run:
+            _set_in_progress_label(repo, issue_number, True)
         state = _ProgressState(repo=repo, issue_number=issue_number)
         _sync(state, dry_run)
         _save_state(state)
@@ -426,6 +527,8 @@ def finish(
             state.terminal = "**Result:** finished"
         _sync(state, dry_run)
         _save_state(state)
+        if not dry_run:
+            _set_in_progress_label(repo, issue_number, False)
     except Exception:
         logger.warning(
             "issue #%s: could not finish progress comment",
