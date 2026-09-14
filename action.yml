@@ -167,15 +167,19 @@ runs:
         # `|| true`: a progress write is best-effort and must never mask
         # the real failure this trap exists to report.
         #
-        # A single EXIT trap, not two: a second `trap ... EXIT` *replaces*
-        # the first in bash rather than composing with it (unlike signal
-        # traps chained via `trap -p`), so the checks_log cleanup below is
-        # folded into this same function instead of installing its own
-        # trap - two separate `trap ... EXIT` calls would silently drop
-        # whichever ran first.
+        # A single EXIT trap for the whole step, not one per temp file: a
+        # second `trap ... EXIT` *replaces* the first in bash rather than
+        # composing with it (unlike signal traps chained via `trap -p`) -
+        # this bit us once already within this same step (see the PR
+        # history: an earlier revision installed a second `trap ... EXIT`
+        # for `body_file` below and silently dropped this one). Every
+        # temp file this step creates is cleaned up here, in one place,
+        # guarded with `${var:-}` since some are only assigned partway
+        # through the script - if the step exits before a given variable
+        # is set, `rm -f ""` on the empty expansion is a harmless no-op.
         _on_exit() {
           ec=$?
-          rm -f "${checks_log:-}"
+          rm -f "${checks_log:-}" "${body_file:-}"
           if [ "$ec" -ne 0 ]; then
             issue-worm progress --issue "$ISSUE" --repo "$REPO" \
               --failure "Action failed during commit/verify/publish (exit code $ec)" || true
@@ -254,27 +258,19 @@ runs:
           # under that so the rest of the body (diff list, DONE line,
           # footer, Closes #N) always has headroom too.
           #
-          # Truncated with `head -c` on the file directly (byte-exact, not
-          # `${#var}`'s character count under a UTF-8 locale vs. byte count
-          # under LC_ALL=C), then run through `iconv -c` to drop any
-          # trailing bytes that got split mid-multibyte-sequence at the cut
-          # point - a raw byte truncation can otherwise produce invalid
-          # UTF-8, which GitHub's API rejects with a 422. Falls back to the
-          # untranslated truncation when `iconv` itself isn't on PATH (not
+          # Truncated in Python, not `${#var}` (character count under a
+          # UTF-8 locale, byte count under LC_ALL=C) or `head -c` +
+          # `iconv` (an earlier revision of this step - `iconv` isn't
           # guaranteed on every self-hosted runner, unlike GitHub-hosted
-          # ones): under `set -euo pipefail` a missing `iconv` would
-          # otherwise abort this whole step, turning "checks failed, open
-          # draft PR" into "action failed, no PR at all" - the one outcome
-          # this whole verifier feature exists to avoid.
-          if [ "$(wc -c < "$checks_log")" -gt 40000 ]; then
-            if command -v iconv >/dev/null 2>&1; then
-              checks_output="$(head -c 40000 "$checks_log" | iconv -f utf-8 -t utf-8 -c)"$'\n... (truncated)'
-            else
-              checks_output="$(head -c 40000 "$checks_log")"$'\n... (truncated)'
-            fi
-          else
-            checks_output="$(cat "$checks_log")"
-          fi
+          # ones, and under `set -euo pipefail` a missing `iconv` would
+          # abort this whole step, turning "checks failed, open draft PR"
+          # into "action failed, no PR at all" - the one outcome this
+          # whole verifier feature exists to avoid). `python` is already
+          # guaranteed on PATH (actions/setup-python above), and decoding
+          # with `errors="ignore"` cleanly drops a trailing byte sequence
+          # split mid-codepoint at the cut, with no extra tool dependency
+          # and no fallback path that can itself produce invalid UTF-8.
+          checks_output="$(python -c 'import sys; data = open(sys.argv[1], "rb").read(); limit = 40000; text = (data[:limit].decode("utf-8", errors="ignore") + "\n... (truncated)") if len(data) > limit else data.decode("utf-8", errors="replace"); sys.stdout.write(text)' "$checks_log")"
           testing="$(printf '✗ `cicaid run-ci-checks --all` failed.\n\n<details><summary>Check output</summary>\n\n```\n%s\n```\n\n</details>' "$checks_output")"
         fi
 
@@ -337,8 +333,10 @@ runs:
         pr_body="$(printf '## What\n%s\n\n## Why\n%s\n\n## Approach\n%s\n\n## Testing\n%s\n\n## Checklist\n- [ ] Tests added/updated\n- [ ] Docs updated if needed\n- [ ] No breaking changes\n%s' \
           "$what_section" "$why_excerpt" "$approach" "$testing" "$pr_footer")"
 
+        # Cleaned up by `_on_exit` above, not a trap of its own here - see
+        # that function's comment for why a second `trap ... EXIT` must
+        # never be installed in this step.
         body_file="$(mktemp)"
-        trap 'rm -f "$body_file"' EXIT
         printf '%s\n' "$pr_body" > "$body_file"
 
         issue-worm progress --issue "$ISSUE" --repo "$REPO" --stage-start publish || true
