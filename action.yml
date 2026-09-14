@@ -259,9 +259,19 @@ runs:
           # under LC_ALL=C), then run through `iconv -c` to drop any
           # trailing bytes that got split mid-multibyte-sequence at the cut
           # point - a raw byte truncation can otherwise produce invalid
-          # UTF-8, which GitHub's API rejects with a 422.
+          # UTF-8, which GitHub's API rejects with a 422. Falls back to the
+          # untranslated truncation when `iconv` itself isn't on PATH (not
+          # guaranteed on every self-hosted runner, unlike GitHub-hosted
+          # ones): under `set -euo pipefail` a missing `iconv` would
+          # otherwise abort this whole step, turning "checks failed, open
+          # draft PR" into "action failed, no PR at all" - the one outcome
+          # this whole verifier feature exists to avoid.
           if [ "$(wc -c < "$checks_log")" -gt 40000 ]; then
-            checks_output="$(head -c 40000 "$checks_log" | iconv -f utf-8 -t utf-8 -c)"$'\n... (truncated)'
+            if command -v iconv >/dev/null 2>&1; then
+              checks_output="$(head -c 40000 "$checks_log" | iconv -f utf-8 -t utf-8 -c)"$'\n... (truncated)'
+            else
+              checks_output="$(head -c 40000 "$checks_log")"$'\n... (truncated)'
+            fi
           else
             checks_output="$(cat "$checks_log")"
           fi

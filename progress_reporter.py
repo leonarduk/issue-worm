@@ -71,8 +71,17 @@ def _state_dir() -> Path:
     return Path(override) if override else DEFAULT_STATE_DIR
 
 
-def _state_path(issue_number: int) -> Path:
-    return _state_dir() / f"{issue_number}.json"
+def _state_path(repo: str, issue_number: int) -> Path:
+    # Keyed on repo *and* issue number, not just the issue number: two
+    # different repos can each have their own issue #5, and without the
+    # repo in the path a run against one would read/overwrite the other's
+    # in-flight state (DeepSeek review of #359) - real for any machine
+    # that dispatches issue-worm against more than one repo, e.g. this
+    # action reused across several consumer repos on the same
+    # self-hosted runner. "/" isn't a valid path separator to keep intact
+    # here, so it's replaced the same way registry.py's task_id does
+    # (`owner_name`), rather than nesting a real subdirectory per repo.
+    return _state_dir() / f"{repo.replace('/', '_')}-{issue_number}.json"
 
 
 @dataclass
@@ -88,15 +97,16 @@ class _ProgressState:
     terminal: str | None = None
 
 
-def _load_state(issue_number: int) -> "_ProgressState | None":
+def _load_state(repo: str, issue_number: int) -> "_ProgressState | None":
     try:
-        path = _state_path(issue_number)
+        path = _state_path(repo, issue_number)
         if not path.exists():
             return None
         return _ProgressState(**json.loads(path.read_text(encoding="utf-8")))
     except Exception:
         logger.debug(
-            "issue #%s: progress state unreadable, starting fresh",
+            "%s#%s: progress state unreadable, starting fresh",
+            repo,
             issue_number,
             exc_info=True,
         )
@@ -105,12 +115,13 @@ def _load_state(issue_number: int) -> "_ProgressState | None":
 
 def _save_state(state: _ProgressState) -> None:
     try:
-        path = _state_path(state.issue_number)
+        path = _state_path(state.repo, state.issue_number)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(asdict(state)), encoding="utf-8")
     except Exception:
         logger.debug(
-            "issue #%s: could not persist progress state",
+            "%s#%s: could not persist progress state",
+            state.repo,
             state.issue_number,
             exc_info=True,
         )
@@ -312,7 +323,7 @@ def record_stage_start(repo: str, issue_number: int, label: str, dry_run: bool =
     just appears a little late, already carrying this stage.
     """
     try:
-        state = _load_state(issue_number) or _ProgressState(
+        state = _load_state(repo, issue_number) or _ProgressState(
             repo=repo, issue_number=issue_number
         )
         if state.finished:
@@ -341,7 +352,7 @@ def record_stage_done(
     checklist should still show the stage happened, even out of order.
     """
     try:
-        state = _load_state(issue_number) or _ProgressState(
+        state = _load_state(repo, issue_number) or _ProgressState(
             repo=repo, issue_number=issue_number
         )
         if state.finished:
@@ -374,7 +385,7 @@ def finish(
     idempotent - a second call (defensive code, an unexpected retry) is a
     no-op rather than overwriting an already-final record."""
     try:
-        state = _load_state(issue_number) or _ProgressState(
+        state = _load_state(repo, issue_number) or _ProgressState(
             repo=repo, issue_number=issue_number
         )
         if state.finished:

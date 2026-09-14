@@ -115,6 +115,27 @@ def test_record_stage_start_without_a_prior_start_creates_fresh_state(gh):
     assert "- [ ] verifier" in gh.body()
 
 
+def test_state_is_scoped_by_repo_not_just_issue_number(gh):
+    """Two different repos can each have their own issue #5 - without the
+    repo in the state path, a run against one would silently read/write
+    the other's in-flight state (DeepSeek review of #359, a real risk on
+    any machine that dispatches issue-worm against more than one repo)."""
+    pr.start("owner/repo-a", 5)
+    pr.record_stage_start("owner/repo-a", 5, "coder")
+    pr.record_stage_done("owner/repo-a", 5, "coder", 1.0)
+
+    repo_a_body = gh.update.call_args_list[-1].args[2]
+    assert "coder" in repo_a_body
+
+    # A fresh dispatch for a *different* repo's own issue #5 must not see
+    # repo-a's stages, and must not clobber repo-a's state file either.
+    pr.start("owner/repo-b", 5)
+
+    pr.record_stage_start("owner/repo-b", 5, "verifier")
+    assert "coder" not in gh.body()
+    assert "verifier" in gh.body()
+
+
 def test_record_stage_done_without_a_matching_start_appends_a_closed_row(gh):
     pr.start("owner/repo", 1)
 
