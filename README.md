@@ -67,7 +67,7 @@ issue-worm isn't published on PyPI. Install the latest release wheel
 directly from GitHub Releases:
 
 ```bash
-pip install https://github.com/leonarduk/issue-worm/releases/download/v0.2.3/issue_worm-0.2.3-py3-none-any.whl
+pip install https://github.com/leonarduk/issue-worm/releases/download/v0.2.6/issue_worm-0.2.6-py3-none-any.whl
 ```
 
 `scripts/bump_readme_version.py`, run by
@@ -83,7 +83,7 @@ sync with the latest tag on every release.
 |---|---|---|
 | `local` (default) | A local/self-hosted Ollama instance's `/api/generate`. | `CODER_TARGETS` (see below); optionally `CODER_OLLAMA_ENDPOINT` / `CODER_OLLAMA_MODEL` to override per role. |
 | `remote` | Any OpenAI-compatible `/v1/chat/completions` endpoint — OpenAI itself, a self-hosted vLLM/SGLang box, or an Ollama instance serving the OpenAI API. | `REMOTE_LLM_ENDPOINT` (no trailing `/v1` — that's appended automatically), `REMOTE_LLM_MODEL`, `REMOTE_LLM_API_KEY`. |
-| `cloud` | DeepSeek's API (`https://api.deepseek.com`), which is itself OpenAI-compatible, so it reuses the same `remote` client with DeepSeek's endpoint/model as the default. | `DEEPSEEK_API_KEY`; optionally `DEEPSEEK_MODEL` (default `deepseek-v4-flash`). |
+| `cloud` | DeepSeek's API (`https://api.deepseek.com`), which is itself OpenAI-compatible, so it reuses the same `remote` client with DeepSeek's endpoint/model as the default. | `DEEPSEEK_API_KEY`; optionally `DEEPSEEK_MODEL` (default `deepseek-v4-flash`) and `CODER_MAX_TOKENS` (output-token cap sent as `max_tokens`; default `32768` for `cloud`, not sent for `remote` unless set). |
 | `claude` | Not implemented by this free engine's `build` coder yet. Setting it fails fast with an explanatory error rather than silently falling back to `local`. | — |
 
 An unset `CODER_MODEL_SOURCE` defaults to `local` — today's original
@@ -151,6 +151,7 @@ full commit SHA instead.
 | `issue` | yes | Number of the issue to work. |
 | `github-token` | yes | A PAT or GitHub App token with `contents: write`, `pull-requests: write`, and `issues: read` on the target repo. A classic PAT's `repo` scope covers all three; a fine-grained PAT needs each granted separately — `issues: read` is easy to miss, since only the issue-body fetch needs it, and that runs (and fails) before the push/PR steps ever do. The built-in `secrets.GITHUB_TOKEN` is **not** sufficient either way — a PR opened (or pushed to) with it deliberately does not trigger other workflow runs, so anything gated on the PR (CI, review bots, required checks) would never fire. |
 | `license-key` | no | Reserved for the pro engine. Currently accepted and logged only — installing the pro wheel from a license key is a separate, unimplemented piece of work ([leonarduk/issue-worm-pro#584](https://github.com/leonarduk/issue-worm-pro/issues/584)). Omit it (the default) to run the free engine, which is everything the action does today. |
+| `close-issue` | no | Whether the commit message and PR body carry `Closes #N`, which makes GitHub auto-close the issue when the PR is merged. Defaults to `'true'` (issues close on merge). Set to `'false'` to keep the issue open after merge — useful when the PR addresses only part of the issue, or when the issue tracks broader work that continues after this PR. |
 
 ### `runs-on` options
 
@@ -183,12 +184,22 @@ what actually select the coder.
 3. Runs `issue-worm build <issue> --repo <owner/name> --workspace
    <checkout>`, reusing the already-checked-out, already-credentialed
    working tree instead of `build`'s normal unauthenticated fresh clone.
-4. If that produced changes, commits them to a deterministic
-   `issue-worm/issue-<N>` branch, force-pushes it (so re-labelling the
+4. If that produced changes, commits them to a `fix/issue-<N>-<slug>`
+   branch (named by cicaid's own `slugify`, so it matches what `cicaid
+   work-on-issue` would create) and force-pushes it, so re-labelling the
    issue supersedes a previous attempt rather than piling up branches —
    see [leonarduk/issue-worm-pro#582](https://github.com/leonarduk/issue-worm-pro/issues/582)'s
-   retry UX), and opens a PR with `gh pr create` (or leaves the existing
-   PR for that branch as-is if one is already open).
+   retry UX. It then opens the PR with `cicaid publish-pr --body-file`,
+   the same publisher the pro scheduler uses: a `[Issue #N] <title>`
+   title and a body with pro's `## What` / `## Why` / `## Approach` /
+   `## Testing` / `## Checklist` sections plus the logo footer, built from
+   the issue and the diff with no LLM call. The PR is labelled
+   `issue-worm`. An already-open PR for the branch is left as-is.
+
+   The commit message and PR body carry `Closes #N` by default, so
+   merging the PR closes the issue. Pass `close-issue: 'false'` to omit
+   both and leave the issue open after merge — see the
+   [`close-issue` input](#inputs) above.
 
 The action never commits its own per-run bookkeeping: it stages
 everything with `git add -A .` and then unstages `.issue-worm/` (this

@@ -36,8 +36,7 @@ The multi-agent pipeline that turns an issue into a verified PR:
 - **Orchestration** — a Coder → Verifier → Analyser retry loop
 - **Scheduling** — polling, dispatch, and label-lifecycle management across
   a repo's open issues
-- **Agents** — the coder, aider-backed coder, analyser, and triage
-  implementations
+- **Agents** — the coder, analyser, and triage implementations
 - Integration with [`cicaid-pro`](https://github.com/leonarduk/cicaid-pro)
   for the underlying LLM calls
 

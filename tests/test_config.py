@@ -8,6 +8,7 @@ from config import (
     ConfigError,
     RoleConfig,
     TargetPool,
+    _parse_coder_backend,
     _parse_coder_targets,
     get_role_env_vars,
     load_config,
@@ -204,14 +205,41 @@ def test_load_config_unknown_model_source_falls_back_to_local(monkeypatch, caplo
 
 
 def test_load_config_unknown_coder_backend_falls_back_to_native(monkeypatch, caplog):
-    """CODER_BACKEND only has two valid values (native/aider); anything
-    else must not pass through and fail confusingly downstream."""
+    """CODER_BACKEND has one valid value (native); anything else must not
+    pass through and fail confusingly downstream."""
     monkeypatch.setenv("CODER_BACKEND", "aidr")
 
     config = load_config()
 
     assert config["coder_backend"] == "native"
     assert "CODER_BACKEND='aidr'" in caplog.text
+
+
+@pytest.mark.parametrize("raw", ["aider", " aider", "Aider"])
+def test_parse_coder_backend_retired_aider_falls_back_to_native(raw, caplog):
+    """The Aider backend was removed from issue-worm-pro; an old
+    CODER_BACKEND=aider must still load, as native, and say why rather
+    than hit the generic unknown-value warning."""
+    assert _parse_coder_backend(raw) == "native"
+    assert "no longer supported" in caplog.text
+
+
+def test_parse_coder_backend_strips_whitespace(caplog):
+    """A whitespace-padded CODER_BACKEND (e.g. " native" from an env file
+    or shell quoting) is a formatting artifact, not a different backend -
+    it must parse to the stripped value without a warning, matching
+    _parse_log_level's normalization."""
+    assert _parse_coder_backend(" native") == "native"
+    assert _parse_coder_backend("native ") == "native"
+    assert _parse_coder_backend("  native  ") == "native"
+    assert "not one of" not in caplog.text
+
+
+def test_parse_coder_backend_still_rejects_invalid(caplog):
+    """Stripping whitespace must not weaken validation: a genuinely
+    invalid value still warns and falls back to 'native'."""
+    assert _parse_coder_backend("bogus") == "native"
+    assert "CODER_BACKEND='bogus'" in caplog.text
 
 
 def test_load_config_unknown_log_level_falls_back_to_info(monkeypatch, caplog):
@@ -274,9 +302,8 @@ def test_load_config_mcp_doc_lookup_enabled(monkeypatch):
     assert env_vars["MCP_TOOL_NAME"] == "lookup_docs"
     assert env_vars["MCP_TIMEOUT_SECONDS"] == "5"
     assert env_vars["MCP_MAX_DOC_CHARS"] == "1000"
-    # The API key is deliberately not carried in role_env_vars (it would be
-    # merged into the aider subprocess env); the bridge reads it from
-    # os.environ instead (issue #15).
+    # The API key is deliberately not carried in role_env_vars (secrets stay
+    # out of them); the bridge reads it from os.environ instead (issue #15).
     assert "MCP_CONTEXT7_API_KEY" not in env_vars
 
 
@@ -465,6 +492,26 @@ def test_parse_coder_targets_wrong_field_count_raises():
 
     assert "cloud:api.deepseek.com:deepseek-v4-flash" in str(exc_info.value)
     assert "4 colon-separated fields" in str(exc_info.value)
+
+
+def test_parse_coder_targets_unset_uses_defaults(monkeypatch):
+    """Regression guard for #216: an unset CODER_TARGETS must not raise.
+
+    PR #216 changed malformed CODER_TARGETS from "log and continue" to
+    "raise ConfigError". This test pins the complementary case: when the
+    variable is simply absent, parsing must fall back to the default
+    (empty list) rather than tripping the new error path.
+
+    Goes through `load_config()` - the real env-reading call site
+    (`os.getenv("CODER_TARGETS", "")` in config.py) - rather than calling
+    `_parse_coder_targets("")` directly: that direct call can't tell
+    "unset" from "explicitly set to an empty string", so it wouldn't
+    catch a regression in how the env var is actually read.
+    """
+    monkeypatch.setenv("CODER_MODEL_SOURCE", "local")
+    monkeypatch.delenv("CODER_TARGETS", raising=False)
+
+    assert load_config()["coder_targets"] == []
 
 
 def test_parse_coder_targets_non_numeric_port_raises():

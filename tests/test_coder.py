@@ -7,6 +7,7 @@ import requests
 
 from coder import (
     DEFAULT_DEEPSEEK_ENDPOINT,
+    DEFAULT_DEEPSEEK_MAX_TOKENS,
     DEFAULT_DEEPSEEK_MODEL,
     DEFAULT_OLLAMA_ENDPOINT,
     DEFAULT_OLLAMA_MODEL,
@@ -181,6 +182,7 @@ def test_remote_propose_posts_openai_chat_completions_shape(tmp_path):
     coder = RemoteOpenAICoder(
         endpoint="https://api.openai.com", model="gpt-5", api_key="sk-test"
     )
+    (tmp_path / "a.py").write_text("print(1)\n", encoding="utf-8")
     expected = "=== FILE: a.py ===\n=== MODE: FULL ===\nprint(1)\n=== END FILE ===\n"
 
     with patch(
@@ -193,7 +195,10 @@ def test_remote_propose_posts_openai_chat_completions_shape(tmp_path):
     assert called_url == "https://api.openai.com/v1/chat/completions"
     payload = mock_post.call_args[1]["json"]
     assert payload["model"] == "gpt-5"
-    assert payload["messages"] == [{"role": "user", "content": payload["messages"][0]["content"]}]
+    assert len(payload["messages"]) == 1
+    assert payload["messages"][0]["role"] == "user"
+    assert "do the thing" in payload["messages"][0]["content"]
+    assert "print(1)" in payload["messages"][0]["content"]
     assert "do the thing" in payload["messages"][0]["content"]
     headers = mock_post.call_args[1]["headers"]
     assert headers["Authorization"] == "Bearer sk-test"
@@ -464,3 +469,88 @@ def test_remote_complete_returns_empty_string_on_request_exception():
         result = coder.complete("draft me a section")
 
     assert result == ""
+
+
+# --- max_tokens / truncation (leonarduk/issue-worm run 34811134456) ----
+
+
+def test_remote_complete_omits_max_tokens_when_unset():
+    coder = RemoteOpenAICoder(endpoint="http://example.invalid", model="m")
+
+    with patch(
+        "coder.requests.post", return_value=_mock_chat_response("x")
+    ) as mock_post:
+        coder.complete("p")
+
+    assert "max_tokens" not in mock_post.call_args[1]["json"]
+
+
+def test_remote_complete_sends_max_tokens_when_set():
+    coder = RemoteOpenAICoder(
+        endpoint="http://example.invalid", model="m", max_tokens=1234
+    )
+
+    with patch(
+        "coder.requests.post", return_value=_mock_chat_response("x")
+    ) as mock_post:
+        coder.complete("p")
+
+    assert mock_post.call_args[1]["json"]["max_tokens"] == 1234
+
+
+def test_remote_complete_warns_when_output_hit_token_cap(caplog):
+    coder = RemoteOpenAICoder(
+        endpoint="http://example.invalid", model="m", max_tokens=10
+    )
+    body = {
+        "choices": [
+            {"message": {"content": "partial"}, "finish_reason": "length"}
+        ]
+    }
+
+    with patch("coder.requests.post", return_value=_mock_response(body)):
+        with caplog.at_level("WARNING", logger="coder"):
+            result = coder.complete("p")
+
+    # Still returned - parse_coder_output decides whether it is usable.
+    assert result == "partial"
+    assert "finish_reason=length" in caplog.text
+    assert "CODER_MAX_TOKENS" in caplog.text
+
+
+def test_build_coder_cloud_defaults_max_tokens(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.delenv("CODER_MAX_TOKENS", raising=False)
+
+    coder = build_coder(RoleConfig(model_source="cloud"))
+
+    assert coder.max_tokens == DEFAULT_DEEPSEEK_MAX_TOKENS
+
+
+def test_build_coder_remote_leaves_max_tokens_unset_by_default(monkeypatch):
+    _set_env_for_model_source(monkeypatch, "remote")
+    monkeypatch.delenv("CODER_MAX_TOKENS", raising=False)
+
+    coder = build_coder(RoleConfig(model_source="remote"))
+
+    assert coder.max_tokens is None
+
+
+@pytest.mark.parametrize("model_source", ["remote", "cloud"])
+def test_build_coder_reads_max_tokens_env_var(model_source, monkeypatch):
+    _set_env_for_model_source(monkeypatch, model_source)
+    monkeypatch.setenv("CODER_MAX_TOKENS", "4096")
+
+    coder = build_coder(RoleConfig(model_source=model_source))
+
+    assert coder.max_tokens == 4096
+
+
+@pytest.mark.parametrize("raw", ["0", "-5", "lots"])
+def test_build_coder_cloud_ignores_invalid_max_tokens(raw, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.setenv("CODER_MAX_TOKENS", raw)
+
+    coder = build_coder(RoleConfig(model_source="cloud"))
+
+    assert coder.max_tokens == DEFAULT_DEEPSEEK_MAX_TOKENS

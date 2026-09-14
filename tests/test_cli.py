@@ -2,6 +2,13 @@
 issue-worm-pro commands (triage/poll) delegate to the installed `pro_cli`
 module when issue-worm-pro is present, and report themselves unavailable
 rather than crashing when it isn't (#352).
+
+Environment hermeticity: `conftest.py` installs an autouse fixture that
+neutralizes `pro_cli` (via `monkeypatch.setitem(sys.modules, "pro_cli",
+None)`) for every test by default, so the build/history/status tests
+below exercise the core-only path even on a dev machine with
+`issue-worm-pro` installed editable. Tests that need pro present
+overwrite the sentinel themselves.
 """
 
 import ast
@@ -22,6 +29,9 @@ from coder import CoderConfigError
 from review import ReviewResult
 from workspace import FileChange, MalformedOutputError, WorkspaceError
 
+# The `_pro_cli_absent` fixture below is now redundant with the autouse
+# `_neutralize_pro_cli` fixture in conftest.py, but is kept for clarity
+# and to document intent at each call site.
 
 @pytest.fixture
 def _pro_cli_absent(monkeypatch):
@@ -44,6 +54,12 @@ def _pro_cli_absent(monkeypatch):
     forces it *present* the same way. Applied via
     `@pytest.mark.usefixtures("_pro_cli_absent")` rather than repeating
     the monkeypatch call in every test body below.
+
+    Note: conftest.py's autouse `_neutralize_pro_cli` fixture already
+    applies this sentinel to every test in the suite, so this fixture is
+    now belt-and-braces - it stays so the intent is visible at each
+    call site and so the suite remains correct if the autouse fixture is
+    ever removed.
     """
     monkeypatch.setitem(sys.modules, "pro_cli", None)
 
@@ -57,7 +73,11 @@ def test_core_command_reports_unavailable(command, monkeypatch, capsys):
     with issue-worm-pro installed editable alongside this repo would have
     cli.main() dispatch to the real pro_cli instead of exercising the
     "not installed" path this test means to cover - firing a live triage
-    pass or an unterminating poll loop."""
+    pass or an unterminating poll loop.
+
+    The autouse `_neutralize_pro_cli` fixture in conftest.py already
+    applies this sentinel; the explicit call here is kept so the test
+    remains correct in isolation."""
     monkeypatch.setitem(sys.modules, "pro_cli", None)
 
     with patch.object(sys, "argv", ["issue-worm", command]), pytest.raises(
@@ -76,7 +96,12 @@ def test_core_command_dispatches_to_pro_cli_when_installed(command, monkeypatch,
     """#352: pro_cli.main() re-parses the original sys.argv itself (it has
     its own full argparse setup), so this shell's placeholder subparser
     for `command` never needs to forward specific flags - it just has to
-    get out of the way."""
+    get out of the way.
+
+    Overwrites the autouse `_neutralize_pro_cli` sentinel with a MagicMock
+    so the dispatch path is exercised even on a machine where pro is
+    genuinely absent - this test must not depend on pro being installed.
+    """
     fake_pro_cli = MagicMock()
     fake_pro_cli.main.side_effect = SystemExit(0)
     monkeypatch.setitem(sys.modules, "pro_cli", fake_pro_cli)
@@ -104,6 +129,10 @@ def test_core_command_help_dispatches_before_this_shells_own_parser(command, mon
     "dispatched after parse_args() picked it out of args.command." Only
     --help (unknown to the placeholder subparser under the old design)
     actually distinguishes the two.
+
+    Overwrites the autouse `_neutralize_pro_cli` sentinel with a MagicMock
+    so the dispatch path is exercised regardless of whether pro is
+    installed on the machine running the suite.
     """
     fake_pro_cli = MagicMock()
     fake_pro_cli.main.side_effect = SystemExit(0)
@@ -127,6 +156,9 @@ def test_core_command_help_falls_back_to_this_shell_when_pro_not_installed(
     _try_import_pro_cli directly (rather than relying on `pro_cli` simply
     not being on sys.path) so this test is correct even in an environment
     where issue-worm-pro genuinely is installed alongside issue-worm."""
+    # Overrides the autouse `_neutralize_pro_cli` sentinel with an explicit
+    # "pro absent" stub - belt-and-braces, and documents intent at the
+    # call site.
     monkeypatch.setattr(cli, "_try_import_pro_cli", lambda: None)
 
     with patch.object(
@@ -147,6 +179,9 @@ def test_version_flag_wins_over_dispatch_regardless_of_abbreviation(
     must always mean "print this shell's version and exit," even combined
     with a core command and even with pro_cli installed - dispatching to
     pro here would silently print pro's version instead."""
+    # Overwrites the autouse `_neutralize_pro_cli` sentinel with a
+    # MagicMock so the "pro installed" branch is exercised even when pro
+    # is genuinely absent from the machine running the suite.
     fake_pro_cli = MagicMock()
     monkeypatch.setitem(sys.modules, "pro_cli", fake_pro_cli)
 
@@ -171,6 +206,10 @@ def test_free_only_command_never_dispatches_even_with_pro_installed(
     `build` used to be in this list. It moved out under #372: pro ships a
     fuller build, so installing pro now upgrades it the way it already
     upgrades triage/poll - see test_build_dispatches_to_pro_when_installed.
+
+    Overwrites the autouse `_neutralize_pro_cli` sentinel with a MagicMock
+    so the "pro installed but must not dispatch" branch is exercised even
+    when pro is genuinely absent from the machine running the suite.
     """
     fake_pro_cli = MagicMock()
     monkeypatch.setitem(sys.modules, "pro_cli", fake_pro_cli)
@@ -194,6 +233,9 @@ def test_check_and_prompt_runs_once_either_way(command, monkeypatch):
     same check itself. Confirms both halves of that claim: this shell's
     own check_and_prompt is skipped when dispatching, and still runs on
     the non-dispatch (pro not installed) path."""
+    # Overwrites the autouse `_neutralize_pro_cli` sentinel with a
+    # MagicMock so the dispatch branch is exercised even when pro is
+    # genuinely absent from the machine running the suite.
     fake_pro_cli = MagicMock()
     fake_pro_cli.main.side_effect = SystemExit(0)
     monkeypatch.setitem(sys.modules, "pro_cli", fake_pro_cli)
@@ -205,6 +247,9 @@ def test_check_and_prompt_runs_once_either_way(command, monkeypatch):
             cli.main()
     mock_check.assert_not_called()
 
+    # Overrides the autouse `_neutralize_pro_cli` sentinel with an
+    # explicit "pro absent" stub - belt-and-braces, and documents intent
+    # at the call site.
     monkeypatch.setattr(cli, "_try_import_pro_cli", lambda: None)
     with patch.object(
         sys, "argv", ["issue-worm", command]
@@ -272,6 +317,9 @@ def test_main_propagates_unexpected_exceptions_through_dispatch(command, monkeyp
     refactor wrapping the dispatch call *inside* main() in a swallowing
     try/except, which test_dispatch_to_pro_propagates_unexpected_exceptions
     alone would not catch."""
+    # Overwrites the autouse `_neutralize_pro_cli` sentinel with a
+    # MagicMock so the dispatch branch is exercised even when pro is
+    # genuinely absent from the machine running the suite.
     fake_pro_cli = MagicMock()
     fake_pro_cli.main.side_effect = RuntimeError("boom")
     monkeypatch.setitem(sys.modules, "pro_cli", fake_pro_cli)
@@ -287,6 +335,10 @@ def test_try_import_pro_cli_reraises_unrelated_module_not_found_error(monkeypatc
     """A ModuleNotFoundError for one of pro_cli's own missing dependencies
     must not be reported as "issue-worm-pro isn't installed" - that would
     point a real installation problem at the wrong fix."""
+    # The autouse `_neutralize_pro_cli` sentinel is irrelevant here: this
+    # test patches builtins.__import__ directly, so it exercises the
+    # "pro_cli import raises for an unrelated reason" path regardless of
+    # whether pro is installed.
 
     def _broken_import(name, *args, **kwargs):
         if name == "pro_cli":
@@ -324,6 +376,9 @@ def test_version_flag_prints_name_and_exits_zero(monkeypatch, capsys):
     """With pro not installed - forced here so this test doesn't depend on
     whether the machine running it happens to have issue-worm-pro too."""
     monkeypatch.setitem(sys.modules, "pro_cli", None)
+    # The autouse `_neutralize_pro_cli` sentinel already makes `import
+    # pro_cli` fail; the metadata_version patch below additionally forces
+    # the "pro distribution not registered" branch of _version_string.
     monkeypatch.setattr(cli, "metadata_version", MagicMock(side_effect=cli.PackageNotFoundError))
 
     with patch.object(
@@ -342,6 +397,9 @@ def test_version_flag_skips_the_update_check(monkeypatch, capsys):
     must not run check_and_prompt() (which makes a live GitHub API call
     outside of tests) before printing the version and exiting."""
     monkeypatch.setitem(sys.modules, "pro_cli", None)
+    # The autouse `_neutralize_pro_cli` sentinel already makes `import
+    # pro_cli` fail; the metadata_version patch below additionally forces
+    # the "pro distribution not registered" branch of _version_string.
     monkeypatch.setattr(cli, "metadata_version", MagicMock(side_effect=cli.PackageNotFoundError))
 
     with patch.object(
@@ -379,6 +437,9 @@ def test_version_string_does_not_import_pro_cli(monkeypatch):
     'quick, offline lookup' contract) - never via an actual `import
     pro_cli`, which would pull in its whole dependency graph just to
     answer a version check."""
+    # The autouse `_neutralize_pro_cli` sentinel already makes `import
+    # pro_cli` fail; the explicit setitem below is kept so the test
+    # remains correct in isolation.
     monkeypatch.setitem(sys.modules, "pro_cli", None)  # import pro_cli -> ImportError if attempted
     monkeypatch.setattr(cli, "metadata_version", lambda name: "1.2.3")
 
@@ -387,10 +448,79 @@ def test_version_string_does_not_import_pro_cli(monkeypatch):
     assert "issue-worm-pro 1.2.3" in out
 
 
+def test_version_string_never_imports_pro_cli_even_when_installed(monkeypatch):
+    """#195 contract: `--version` must be a quick, offline lookup.
+
+    `_try_import_pro_cli` performs a *real* ``import pro_cli`` (executing
+    its module-level code, which may include network calls, config reads,
+    or telemetry). If `_version_string` ever called it, any such
+    import-time side effect would run on every `--version` invocation -
+    silently regressing #195. This test forces `pro_cli` to be
+    *importable* (so a naive `_try_import_pro_cli`-based implementation
+    would succeed and be tempted to use it) while recording any attempt
+    to import it, then asserts none happened.
+    """
+    import builtins
+
+    imported = []
+    real_import = builtins.__import__
+
+    def _recording_import(name, *args, **kwargs):
+        if name == "pro_cli":
+            imported.append(name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _recording_import)
+    # Make pro appear installed via metadata so the pro-present branch of
+    # _version_string is the one exercised.
+    monkeypatch.setattr(cli, "metadata_version", lambda name: "1.2.3")
+
+    out = cli._version_string()
+
+    assert "issue-worm-pro 1.2.3" in out
+    assert imported == [], (
+        "_version_string imported pro_cli - #195 requires --version to be "
+        "a cheap, offline lookup that never executes pro_cli's module-level code"
+    )
+
+
+def test_version_flag_never_imports_pro_cli(monkeypatch, capsys):
+    """End-to-end guard for the same #195 contract, through `main()`'s
+    `--version` fast path: even with pro installed (metadata present),
+    running `issue-worm --version` must not import `pro_cli`."""
+    import builtins
+
+    imported = []
+    real_import = builtins.__import__
+
+    def _recording_import(name, *args, **kwargs):
+        if name == "pro_cli":
+            imported.append(name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _recording_import)
+    monkeypatch.setattr(cli, "metadata_version", lambda name: "1.2.3")
+
+    with patch.object(
+        sys, "argv", ["issue-worm", "--version"]
+    ), pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+    assert "issue-worm-pro 1.2.3" in capsys.readouterr().out
+    assert imported == [], (
+        "`issue-worm --version` imported pro_cli - #195 requires the "
+        "version path to stay offline and import-free"
+    )
+
+
 def test_version_flag_still_wins_when_combined_with_pro_dispatch(monkeypatch, capsys):
     """An exact top-level `--version` must take the fast path and exit
     before the pro-command dispatch check even runs, so it never imports
     or calls into issue-worm-pro."""
+    # Overwrites the autouse `_neutralize_pro_cli` sentinel with a
+    # MagicMock so the "pro installed" branch is exercised even when pro
+    # is genuinely absent from the machine running the suite.
     fake_pro_cli = MagicMock()
     monkeypatch.setitem(sys.modules, "pro_cli", fake_pro_cli)
 
@@ -874,6 +1004,32 @@ def test_build_reports_apply_failure_without_crashing(tmp_path, capsys):
     assert "git apply failed" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("bad_targets", ["invalid", "host:notaport", "a:b:c"])
+@pytest.mark.usefixtures("_pro_cli_absent")
+def test_main_catches_config_error_and_exits_one(
+    bad_targets, monkeypatch, capsys
+):
+    """#216: a malformed CODER_TARGETS must be caught by main()'s own
+    ConfigError handler and turned into a clean exit 1 with a message on
+    stderr - not an uncaught traceback.
+
+    Exercises the real CLI entry point end-to-end (no mocking of the
+    parsing internals), so removing the try/except in main() or changing
+    the exit code would fail this test.
+    """
+    monkeypatch.setenv("CODER_TARGETS", bad_targets)
+
+    with patch.object(
+        sys, "argv", ["issue-worm", "build", "5", "--repo", "o/r"]
+    ), pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "Config error" in err
+    assert bad_targets in err
+
+
 # --- registry wiring around `build` (#179) ------------------------------
 
 
@@ -1335,6 +1491,10 @@ def test_build_dispatches_to_pro_when_installed(monkeypatch):
     The #372 regression: `build` was left out of the dispatch set, so a pro
     user silently got this shell's single-pass heuristic build instead of
     the Coder -> Verifier -> Analyser loop both READMEs describe.
+
+    Overrides the autouse `_neutralize_pro_cli` sentinel with an explicit
+    fake pro module so the dispatch path is exercised even when pro is
+    genuinely absent from the machine running the suite.
     """
     fake_pro_cli = ModuleType("pro_cli")
     seen = []
@@ -1359,6 +1519,10 @@ def test_build_dispatch_happens_before_this_shells_parser(monkeypatch):
     Dispatch is pre-parse for exactly this reason (the flag sets differ:
     this shell has --workspace, pro doesn't). Asserting it here stops a
     future refactor from moving the check after parse_args().
+
+    Overrides the autouse `_neutralize_pro_cli` sentinel with an explicit
+    fake pro module so the dispatch path is exercised even when pro is
+    genuinely absent from the machine running the suite.
     """
     fake_pro_cli = ModuleType("pro_cli")
     fake_pro_cli.main = lambda: 0
@@ -1374,6 +1538,9 @@ def test_build_dispatch_happens_before_this_shells_parser(monkeypatch):
 
 def test_build_falls_back_to_this_shell_when_pro_absent(monkeypatch, capsys):
     """Unlike triage/poll, `build` has a free-tier implementation to use."""
+    # Overrides the autouse `_neutralize_pro_cli` sentinel with an
+    # explicit "pro absent" stub - belt-and-braces, and documents intent
+    # at the call site.
     monkeypatch.setattr(cli, "_try_import_pro_cli", lambda: None)
 
     ran = []
@@ -1756,6 +1923,9 @@ def test_status_json_reports_stale_status_for_old_heartbeat(
 
 
 def test_status_dispatches_to_run_status(monkeypatch):
+    # Overrides the autouse `_neutralize_pro_cli` sentinel with an
+    # explicit "pro absent" stub - belt-and-braces, and documents intent
+    # at the call site.
     monkeypatch.setattr(cli, "_try_import_pro_cli", lambda: None)
     with patch.object(
         sys, "argv", ["issue-worm", "status"]

@@ -734,6 +734,10 @@ def _resolve_repeated_sections(
 # models miscount them.
 _SEARCH_MARKER_RE = re.compile(r"^<{5,9} ?SEARCH[ \t]*$")
 _DIVIDER_MARKER_RE = re.compile(r"^={5,9}[ \t]*$")
+# Files where a line of "=" is legitimate content (a setext/rst heading
+# underline), so a divider-shaped line inside a REPLACE part is kept rather
+# than rejected as a second divider (#338).
+_MARKUP_SUFFIXES = (".md", ".markdown", ".rst", ".txt", ".adoc")
 _REPLACE_MARKER_RE = re.compile(r"^>{5,9} ?REPLACE[ \t]*$")
 
 # Fallbacks, in order, when a SEARCH block has no exact match. Each is
@@ -778,6 +782,19 @@ def _parse_search_replace_blocks(body: str, path: str) -> list[tuple[str, str]]:
                 raise MalformedOutputError(
                     f"MODE: EDIT section for {path!r}: block {len(blocks) + 1} "
                     "has no '>>>>>>> REPLACE' line before the next SEARCH"
+                )
+            elif _DIVIDER_MARKER_RE.match(stripped) and not path.lower().endswith(
+                _MARKUP_SUFFIXES
+            ):
+                # A block has exactly one divider. A second one inside the
+                # REPLACE part is the Coder mangling the format; taking it
+                # as content pastes a literal "=======" into the file, which
+                # only surfaces later as a bare SyntaxError (#338). Markup
+                # files are exempt: a line of "=" underlines a heading there.
+                raise MalformedOutputError(
+                    f"MODE: EDIT section for {path!r}: block {len(blocks) + 1} "
+                    "has a second '=======' divider - each block has exactly "
+                    "one, between the SEARCH and REPLACE text"
                 )
             else:
                 replace.append(line)
