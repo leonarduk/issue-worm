@@ -11,6 +11,8 @@ below exercise the core-only path even on a dev machine with
 overwrite the sentinel themselves.
 """
 
+import ast
+import inspect
 import json
 import os
 import sys
@@ -393,6 +395,7 @@ def test_no_command_prints_help_and_exits_nonzero(capsys):
 def test_version_flag_prints_name_and_exits_zero(monkeypatch, capsys):
     """With pro not installed - forced here so this test doesn't depend on
     whether the machine running it happens to have issue-worm-pro too."""
+    monkeypatch.setitem(sys.modules, "pro_cli", None)
     # The autouse `_neutralize_pro_cli` sentinel already makes `import
     # pro_cli` fail; the metadata_version patch below additionally forces
     # the "pro distribution not registered" branch of _version_string.
@@ -413,6 +416,7 @@ def test_version_flag_skips_the_update_check(monkeypatch, capsys):
     """#195: `issue-worm --version` must be a quick, offline lookup - it
     must not run check_and_prompt() (which makes a live GitHub API call
     outside of tests) before printing the version and exiting."""
+    monkeypatch.setitem(sys.modules, "pro_cli", None)
     # The autouse `_neutralize_pro_cli` sentinel already makes `import
     # pro_cli` fail; the metadata_version patch below additionally forces
     # the "pro distribution not registered" branch of _version_string.
@@ -2149,3 +2153,332 @@ def test_status_dispatches_to_run_status(monkeypatch):
 
     mock_run_status.assert_called_once()
     assert exc.value.code == 0
+
+
+# --- structural guard against the #227/#228 class of bug --------------------
+#
+# The pinned tests above (test_core_command_reports_unavailable and friends)
+# exist because cli.main() dispatches to a real, importable `pro_cli` for any
+# of `_PRO_COMMANDS` before this shell's own logic runs (#352) - a dev
+# machine with issue-worm-pro installed editable alongside this repo would
+# otherwise have those tests silently exercise the real pro dispatch (firing
+# a live triage pass or an unterminating poll loop) instead of the
+# core-only path they mean to cover. #227/#228 root-caused two rounds of
+# such tests missing the pin; this meta-test makes the class structurally
+# impossible to reintroduce by inspecting every test in this module that
+# drives `cli.main()` via a literal `sys.argv`.
+
+# Tests that legitimately invoke cli.main() with a pro-dispatchable command
+# token (e.g. as a flag *value*, not the dispatched subcommand itself) but
+# are not pro-dispatch tests, so pinning pro_cli would be a no-op. Keep this
+# list empty unless a genuine case shows up - do not add to it just to
+# silence this guard.
+_PRO_DISPATCH_PIN_ALLOWLIST: frozenset[str] = frozenset()
+
+
+def _iter_argv_assignments(tree: ast.AST):
+    """Yield the `[...]` list AST node for every `argv`-setting call found
+    in `tree`: `patch.object(sys, "argv", [...])` and `monkeypatch.setattr(
+    sys, "argv", [...])` share the same (obj, name, value) shape, so both
+    idioms - and any other `*.setattr`/`*.object` call matching it - are
+    caught the same way."""
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr in ("object", "setattr")):
+            continue
+        args = node.args
+        if len(args) < 3:
+            continue
+        name_arg = args[1]
+        if not (isinstance(name_arg, ast.Constant) and name_arg.value == "argv"):
+            continue
+        if isinstance(args[2], ast.List):
+            yield args[2]
+
+
+def _drives_pro_dispatchable_command(func_source: str) -> bool:
+    """True if `func_source` sets `sys.argv` to a list whose subcommand
+    slot (index 1 - `cli.main()`'s own dispatch check is `sys.argv[1] in
+    _PRO_COMMANDS`, so only that position matters) is, or might be, a
+    token from `cli._PRO_COMMANDS`.
+
+    A non-literal element there - e.g. a `@pytest.mark.parametrize(
+    "command", ...)` argument spliced into the list - can't be statically
+    resolved to a value, so it's treated as a potential match rather than
+    silently skipped: understating this check is exactly the
+    false-confidence failure mode #227/#228 exist to close, and every
+    parametrize case actually used in this module supplies pro commands
+    (`triage`/`poll`) anyway. A non-literal element *elsewhere* in the
+    list (e.g. a `--history-path` flag's value) is irrelevant to dispatch
+    and must not trip this check, or every `history`/`status` test using a
+    `tmp_path`-derived path would be flagged.
+    """
+    tree = ast.parse(func_source)
+    for argv_list in _iter_argv_assignments(tree):
+        if len(argv_list.elts) < 2:
+            continue
+        command_elt = argv_list.elts[1]
+        if isinstance(command_elt, ast.Constant) and isinstance(command_elt.value, str):
+            if command_elt.value in cli._PRO_COMMANDS:
+                return True
+        else:
+            return True
+    return False
+
+
+def _uses_pro_cli_absent_fixture(func) -> bool:
+    """True if `func` takes the `_pro_cli_absent` fixture as a parameter,
+    or opts into it via `@pytest.mark.usefixtures("_pro_cli_absent")` -
+    an AST/signature check, not a source-text search, so a docstring or
+    comment merely mentioning the fixture's name can't produce a false
+    positive."""
+    if "_pro_cli_absent" in inspect.signature(func).parameters:
+        return True
+    for decorator in getattr(func, "pytestmark", []):
+        if decorator.name == "usefixtures" and "_pro_cli_absent" in decorator.args:
+            return True
+    return False
+
+
+def _pins_pro_cli_via_ast(tree: ast.AST) -> bool:
+    """True if `tree` contains a real, structural pin of `pro_cli`:
+    `monkeypatch.setitem(sys.modules, "pro_cli", ...)` or
+    `monkeypatch.setattr(cli, "_try_import_pro_cli", ...)`. Deliberately
+    not a substring search over the source text - `"pro_cli"` appearing
+    in a comment, docstring, or unrelated assertion message must not
+    count, or the guard would be trivially satisfiable without actually
+    controlling anything (DeepSeek review of #336).
+
+    The second idiom is a real, independent pin, not a no-op: `cli.py`'s
+    dispatch check (`if sys.argv[1] in _PRO_COMMANDS: pro_cli =
+    _try_import_pro_cli()`) calls `_try_import_pro_cli()` directly, so
+    forcing it to return `None` short-circuits dispatch exactly like
+    neutralizing `sys.modules["pro_cli"]` does - verified by reading
+    `cli.py` (the call site is `pro_cli = _try_import_pro_cli()`), not
+    assumed.
+    """
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            continue
+        attr = node.func.attr
+        args = node.args
+        if attr == "setitem" and len(args) >= 2:
+            target, key = args[0], args[1]
+            is_sys_modules = (
+                isinstance(target, ast.Attribute)
+                and target.attr == "modules"
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "sys"
+            )
+            if is_sys_modules and isinstance(key, ast.Constant) and key.value == "pro_cli":
+                return True
+        if attr == "setattr" and len(args) >= 2:
+            target, name = args[0], args[1]
+            is_try_import = (
+                isinstance(name, ast.Constant) and name.value == "_try_import_pro_cli"
+            )
+            if is_try_import:
+                return True
+    return False
+
+
+def _pins_pro_cli(func) -> bool:
+    if _uses_pro_cli_absent_fixture(func):
+        return True
+    tree = ast.parse(inspect.getsource(func))
+    return _pins_pro_cli_via_ast(tree)
+
+
+@pytest.mark.parametrize(
+    "source, expected",
+    [
+        pytest.param(
+            'def test_x():\n'
+            '    with patch.object(sys, "argv", ["issue-worm", "triage"]):\n'
+            '        cli.main()\n',
+            True,
+            id="literal-pro-command",
+        ),
+        pytest.param(
+            'def test_x():\n'
+            '    with patch.object(sys, "argv", ["issue-worm", "history"]):\n'
+            '        cli.main()\n',
+            False,
+            id="literal-non-pro-command",
+        ),
+        pytest.param(
+            '@pytest.mark.parametrize("command", ["triage", "poll"])\n'
+            'def test_x(command):\n'
+            '    with patch.object(sys, "argv", ["issue-worm", command]):\n'
+            '        cli.main()\n',
+            True,
+            id="parametrized-command-variable",
+        ),
+        pytest.param(
+            'def test_x(monkeypatch):\n'
+            '    monkeypatch.setattr(sys, "argv", ["issue-worm", "build"])\n'
+            '    cli.main()\n',
+            True,
+            id="setattr-idiom",
+        ),
+        pytest.param(
+            'def test_x():\n'
+            '    with patch.object(sys, "argv", ["issue-worm", "history", "--history-path", history_path]):\n'
+            '        cli.main()\n',
+            False,
+            id="non-literal-flag-value-is-irrelevant",
+        ),
+    ],
+)
+def test_drives_pro_dispatchable_command_detection(source, expected):
+    """Regression test for the #336 meta-test's detection logic itself
+    (DeepSeek review of #336 correctly noted this had never been verified
+    against a synthetic case): pins down the literal, parametrized, and
+    `setattr` argv idioms it must catch, and the "non-literal but
+    irrelevant" case (a flag *value*, not the command slot) it must not
+    false-positive on."""
+    assert _drives_pro_dispatchable_command(source) is expected
+
+
+def test_pins_pro_cli_via_ast_rejects_a_bare_mention_in_a_comment():
+    """A test that merely *mentions* `pro_cli` (in a comment, docstring,
+    or assertion message) must not be treated as pinning it - only a real
+    `monkeypatch.setitem(sys.modules, "pro_cli", ...)` or
+    `monkeypatch.setattr(cli, "_try_import_pro_cli", ...)` call counts.
+    DeepSeek's review of #336 correctly flagged the original
+    substring-based check as trivially satisfiable by a comment."""
+    mentions_only = ast.parse(
+        'def test_x():\n'
+        '    # pro_cli should not be importable here\n'
+        '    assert "pro_cli" not in sys.modules\n'
+    )
+    assert _pins_pro_cli_via_ast(mentions_only) is False
+
+    real_pin = ast.parse(
+        'def test_x(monkeypatch):\n'
+        '    monkeypatch.setitem(sys.modules, "pro_cli", None)\n'
+    )
+    assert _pins_pro_cli_via_ast(real_pin) is True
+
+    real_pin_via_try_import = ast.parse(
+        'def test_x(monkeypatch):\n'
+        '    monkeypatch.setattr(cli, "_try_import_pro_cli", lambda: None)\n'
+    )
+    assert _pins_pro_cli_via_ast(real_pin_via_try_import) is True
+
+
+def _find_unguarded_pro_dispatch_tests(module, *, skip=frozenset(), allowlist=frozenset()):
+    """The audit itself: every `test_*` function defined at module scope
+    in `module` that drives `cli.main()` with a pro-dispatchable command
+    and doesn't pin/control `pro_cli`. Shared by the real meta-test below
+    and by `test_the_audit_actually_flags_an_unguarded_test`, which runs
+    it against a synthetic module to prove it isn't vacuous."""
+    module_source = inspect.getsource(module)
+    module_tree = ast.parse(module_source)
+
+    unguarded = []
+    for node in module_tree.body:
+        if not (isinstance(node, ast.FunctionDef) and node.name.startswith("test_")):
+            continue
+        if node.name in skip:
+            continue
+        func = getattr(module, node.name)
+        func_source = inspect.getsource(func)
+        if "cli.main()" not in func_source:
+            continue
+        if not _drives_pro_dispatchable_command(func_source):
+            continue
+        if node.name in allowlist:
+            continue
+        if not _pins_pro_cli(func):
+            unguarded.append(node.name)
+    return unguarded
+
+
+def test_every_cli_main_test_pins_or_allowlists_pro_cli():
+    """Every test in this module that drives `cli.main()` with a
+    pro-dispatchable command (`cli._PRO_COMMANDS`) must neutralize or
+    explicitly control `pro_cli`, or be named in
+    `_PRO_DISPATCH_PIN_ALLOWLIST` with a reason. Catches the exact class of
+    regression #227 and #228 were filed to fix, without relying on a human
+    re-running the audit by hand next time a test is added.
+
+    Note for reviewers: #227 (merged separately, now present in
+    `conftest.py`) added an autouse `_neutralize_pro_cli` fixture that
+    pins every test in this suite by default - this meta-test does not
+    depend on that fixture and is not made vacuous by it. It inspects
+    each test's own source for an explicit pin (`_pro_cli_absent`,
+    `monkeypatch.setitem(sys.modules, "pro_cli", ...)`, or
+    `monkeypatch.setattr(cli, "_try_import_pro_cli", ...)`), so it keeps
+    catching the class of regression #227/#228 were filed for even if a
+    test somehow runs without the autouse fixture applied (a different
+    test file with no `conftest.py` in scope, a future refactor that
+    narrows the fixture's scope, `pytest -p no:cacheprovider`-style
+    plugin interference, etc.) - defense in depth, not a duplicate check.
+    `test_the_audit_actually_flags_an_unguarded_test` below demonstrates
+    against a synthetic case that an unpinned test is genuinely flagged.
+    """
+    this_module = sys.modules[__name__]
+    unguarded = _find_unguarded_pro_dispatch_tests(
+        this_module,
+        skip={"test_every_cli_main_test_pins_or_allowlists_pro_cli"},
+        allowlist=_PRO_DISPATCH_PIN_ALLOWLIST,
+    )
+
+    assert not unguarded, (
+        "these tests drive cli.main() with a pro-dispatchable command "
+        f"({', '.join(cli._PRO_COMMANDS)}) but never pin or control "
+        "pro_cli, so they would silently exercise the real pro dispatch "
+        "on a machine where issue-worm-pro is installed editable: "
+        f"{unguarded}. Add monkeypatch.setitem(sys.modules, 'pro_cli', ...) "
+        "(or the _pro_cli_absent fixture), or add the test to "
+        "_PRO_DISPATCH_PIN_ALLOWLIST with a comment explaining why it's safe."
+    )
+
+
+def test_the_audit_actually_flags_an_unguarded_test():
+    """Proves the meta-test above isn't vacuous: builds a real synthetic
+    module (via `exec`, not just a source string) containing one
+    unguarded `triage`-dispatching test and one properly-pinned test,
+    then runs the exact same `_find_unguarded_pro_dispatch_tests` walk
+    against it and asserts only the unguarded one is flagged. A meta-test
+    that has never been observed to fail is not evidence it works
+    (DeepSeek review of #336) - this is that observation, kept as a
+    permanent regression test rather than a one-off manual check.
+    """
+    synthetic_source = (
+        "import sys\n"
+        "from unittest.mock import patch\n"
+        "import cli\n"
+        "import pytest\n"
+        "\n"
+        "def test_unguarded(capsys):\n"
+        "    with patch.object(sys, 'argv', ['issue-worm', 'triage']), pytest.raises(SystemExit):\n"
+        "        cli.main()\n"
+        "\n"
+        "def test_guarded(monkeypatch, capsys):\n"
+        "    monkeypatch.setitem(sys.modules, 'pro_cli', None)\n"
+        "    with patch.object(sys, 'argv', ['issue-worm', 'triage']), pytest.raises(SystemExit):\n"
+        "        cli.main()\n"
+    )
+    synthetic_module = ModuleType("_synthetic_pro_dispatch_audit_fixture")
+    synthetic_module.__file__ = "<synthetic>"
+    exec(compile(synthetic_source, "<synthetic>", "exec"), synthetic_module.__dict__)
+    # inspect.getsource needs a real file (or a linecache entry) behind the
+    # module and its functions - register one instead of writing to disk.
+    import linecache
+
+    linecache.cache["<synthetic>"] = (
+        len(synthetic_source),
+        None,
+        synthetic_source.splitlines(keepends=True),
+        "<synthetic>",
+    )
+
+    unguarded = _find_unguarded_pro_dispatch_tests(synthetic_module)
+
+    assert unguarded == ["test_unguarded"]
+
+
