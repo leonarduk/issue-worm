@@ -1841,15 +1841,136 @@ def _drives_pro_dispatchable_command(func_source: str) -> bool:
     return False
 
 
-def _pins_pro_cli(func) -> bool:
-    source = inspect.getsource(func)
-    if "_pro_cli_absent" in source:
-        return True  # usefixtures or a direct fixture-arg reference
-    if '"pro_cli"' in source or "'pro_cli'" in source:
-        return True  # e.g. monkeypatch.setitem(sys.modules, "pro_cli", ...)
-    if "_try_import_pro_cli" in source:
-        return True  # e.g. monkeypatch.setattr(cli, "_try_import_pro_cli", ...)
+def _uses_pro_cli_absent_fixture(func) -> bool:
+    """True if `func` takes the `_pro_cli_absent` fixture as a parameter,
+    or opts into it via `@pytest.mark.usefixtures("_pro_cli_absent")` -
+    an AST/signature check, not a source-text search, so a docstring or
+    comment merely mentioning the fixture's name can't produce a false
+    positive."""
+    if "_pro_cli_absent" in inspect.signature(func).parameters:
+        return True
+    for decorator in getattr(func, "pytestmark", []):
+        if decorator.name == "usefixtures" and "_pro_cli_absent" in decorator.args:
+            return True
     return False
+
+
+def _pins_pro_cli_via_ast(tree: ast.AST) -> bool:
+    """True if `tree` contains a real, structural pin of `pro_cli`:
+    `monkeypatch.setitem(sys.modules, "pro_cli", ...)` or
+    `monkeypatch.setattr(cli, "_try_import_pro_cli", ...)`. Deliberately
+    not a substring search over the source text - `"pro_cli"` appearing
+    in a comment, docstring, or unrelated assertion message must not
+    count, or the guard would be trivially satisfiable without actually
+    controlling anything (DeepSeek review of #336)."""
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            continue
+        attr = node.func.attr
+        args = node.args
+        if attr == "setitem" and len(args) >= 2:
+            target, key = args[0], args[1]
+            is_sys_modules = (
+                isinstance(target, ast.Attribute)
+                and target.attr == "modules"
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "sys"
+            )
+            if is_sys_modules and isinstance(key, ast.Constant) and key.value == "pro_cli":
+                return True
+        if attr == "setattr" and len(args) >= 2:
+            target, name = args[0], args[1]
+            is_try_import = (
+                isinstance(name, ast.Constant) and name.value == "_try_import_pro_cli"
+            )
+            if is_try_import:
+                return True
+    return False
+
+
+def _pins_pro_cli(func) -> bool:
+    if _uses_pro_cli_absent_fixture(func):
+        return True
+    tree = ast.parse(inspect.getsource(func))
+    return _pins_pro_cli_via_ast(tree)
+
+
+@pytest.mark.parametrize(
+    "source, expected",
+    [
+        pytest.param(
+            'def test_x():\n'
+            '    with patch.object(sys, "argv", ["issue-worm", "triage"]):\n'
+            '        cli.main()\n',
+            True,
+            id="literal-pro-command",
+        ),
+        pytest.param(
+            'def test_x():\n'
+            '    with patch.object(sys, "argv", ["issue-worm", "history"]):\n'
+            '        cli.main()\n',
+            False,
+            id="literal-non-pro-command",
+        ),
+        pytest.param(
+            '@pytest.mark.parametrize("command", ["triage", "poll"])\n'
+            'def test_x(command):\n'
+            '    with patch.object(sys, "argv", ["issue-worm", command]):\n'
+            '        cli.main()\n',
+            True,
+            id="parametrized-command-variable",
+        ),
+        pytest.param(
+            'def test_x(monkeypatch):\n'
+            '    monkeypatch.setattr(sys, "argv", ["issue-worm", "build"])\n'
+            '    cli.main()\n',
+            True,
+            id="setattr-idiom",
+        ),
+        pytest.param(
+            'def test_x():\n'
+            '    with patch.object(sys, "argv", ["issue-worm", "history", "--history-path", history_path]):\n'
+            '        cli.main()\n',
+            False,
+            id="non-literal-flag-value-is-irrelevant",
+        ),
+    ],
+)
+def test_drives_pro_dispatchable_command_detection(source, expected):
+    """Regression test for the #336 meta-test's detection logic itself
+    (DeepSeek review of #336 correctly noted this had never been verified
+    against a synthetic case): pins down the literal, parametrized, and
+    `setattr` argv idioms it must catch, and the "non-literal but
+    irrelevant" case (a flag *value*, not the command slot) it must not
+    false-positive on."""
+    assert _drives_pro_dispatchable_command(source) is expected
+
+
+def test_pins_pro_cli_via_ast_rejects_a_bare_mention_in_a_comment():
+    """A test that merely *mentions* `pro_cli` (in a comment, docstring,
+    or assertion message) must not be treated as pinning it - only a real
+    `monkeypatch.setitem(sys.modules, "pro_cli", ...)` or
+    `monkeypatch.setattr(cli, "_try_import_pro_cli", ...)` call counts.
+    DeepSeek's review of #336 correctly flagged the original
+    substring-based check as trivially satisfiable by a comment."""
+    mentions_only = ast.parse(
+        'def test_x():\n'
+        '    # pro_cli should not be importable here\n'
+        '    assert "pro_cli" not in sys.modules\n'
+    )
+    assert _pins_pro_cli_via_ast(mentions_only) is False
+
+    real_pin = ast.parse(
+        'def test_x(monkeypatch):\n'
+        '    monkeypatch.setitem(sys.modules, "pro_cli", None)\n'
+    )
+    assert _pins_pro_cli_via_ast(real_pin) is True
+
+    real_pin_via_try_import = ast.parse(
+        'def test_x(monkeypatch):\n'
+        '    monkeypatch.setattr(cli, "_try_import_pro_cli", lambda: None)\n'
+    )
+    assert _pins_pro_cli_via_ast(real_pin_via_try_import) is True
 
 
 def test_every_cli_main_test_pins_or_allowlists_pro_cli():
