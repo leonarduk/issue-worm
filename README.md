@@ -151,7 +151,7 @@ full commit SHA instead.
 | Input | Required | Description |
 |---|---|---|
 | `issue` | yes | Number of the issue to work. |
-| `github-token` | yes | A PAT or GitHub App token with `contents: write`, `pull-requests: write`, and `issues: read` on the target repo. A classic PAT's `repo` scope covers all three; a fine-grained PAT needs each granted separately — `issues: read` is easy to miss, since only the issue-body fetch needs it, and that runs (and fails) before the push/PR steps ever do. The built-in `secrets.GITHUB_TOKEN` is **not** sufficient either way — a PR opened (or pushed to) with it deliberately does not trigger other workflow runs, so anything gated on the PR (CI, review bots, required checks) would never fire. |
+| `github-token` | yes | A PAT or GitHub App token with `contents: write`, `pull-requests: write`, and `issues: read` on the target repo. A classic PAT's `repo` scope covers all three; a fine-grained PAT needs each granted separately — `issues: read` is easy to miss, since only the issue-body fetch needs it, and that runs (and fails) before the push/PR steps ever do. Also grant `issues: write` (included in a classic PAT's `repo` scope already) for two best-effort features that silently no-op without it instead of failing the build: self-heal persisting its drafted section back onto the issue, and the live progress comment (see below) actually being posted/edited — `issues: read` is not enough to write a comment. The built-in `secrets.GITHUB_TOKEN` is **not** sufficient either way — a PR opened (or pushed to) with it deliberately does not trigger other workflow runs, so anything gated on the PR (CI, review bots, required checks) would never fire. |
 | `license-key` | no | Reserved for the pro engine. Currently accepted and logged only — installing the pro wheel from a license key is a separate, unimplemented piece of work ([leonarduk/issue-worm-pro#584](https://github.com/leonarduk/issue-worm-pro/issues/584)). Omit it (the default) to run the free engine, which is everything the action does today. |
 
 ### `runs-on` options
@@ -222,9 +222,10 @@ Without this, the only trace of a run was ~8 lines in the Actions run
 log — there was no way to tell from the issue whether a run had started,
 was still going, failed, or which PR it opened. Every write here is
 best-effort: a GitHub API hiccup while posting or editing the comment is
-logged and never fails the build. This needs no extra configuration
-beyond `github-token`, which already has issue-comment access — see
-that input's description above.
+logged and never fails the build — that also means a `github-token`
+without `issues: write` (see that input's description above) silently
+disables this feature rather than failing the build, so a missing
+comment is worth checking that scope for.
 
 ### Known limitations
 

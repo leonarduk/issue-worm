@@ -6,6 +6,7 @@ own contract (see its module docstring) is that a real `gh` call never
 happens from a test, only from a genuine build/Action run.
 """
 
+import json
 from unittest.mock import patch
 
 import pytest
@@ -185,3 +186,75 @@ def test_dry_run_never_resolves_a_comment_id_or_updates(gh):
     assert gh.post.called
     gh.find.assert_not_called()
     gh.update.assert_not_called()
+
+
+class _FakeCompletedProcess:
+    def __init__(self, stdout="", returncode=0, stderr=""):
+        self.stdout = stdout
+        self.returncode = returncode
+        self.stderr = stderr
+
+
+def test_decode_paginated_json_concatenates_multiple_page_arrays():
+    """`gh api --paginate` writes one JSON array per page back-to-back
+    with no separator - a plain `json.loads` raises past the first page.
+    Regression test for the exact bug DeepSeek's review of #359 flagged:
+    the previous implementation used `json.loads` directly and would
+    silently stop updating the comment on any issue with more than one
+    page of comments (default page size 30)."""
+    text = '[{"id": 1}, {"id": 2}][{"id": 3}]'
+
+    assert pr._decode_paginated_json(text) == [{"id": 1}, {"id": 2}, {"id": 3}]
+
+
+def test_decode_paginated_json_handles_a_single_page():
+    assert pr._decode_paginated_json('[{"id": 1}]') == [{"id": 1}]
+
+
+def test_decode_paginated_json_handles_empty_output():
+    assert pr._decode_paginated_json("") == []
+
+
+def test_find_progress_comment_id_across_multiple_pages(monkeypatch):
+    """End-to-end: `_find_progress_comment_id` must find the marker
+    comment even when it's on a later page than the first, which is where
+    it actually lives on a long-running issue (comments are oldest-first,
+    and the progress comment is posted well after the issue was opened)."""
+    page_1 = [{"id": 10, "created_at": "2026-01-01T00:00:00Z", "body": "unrelated"}]
+    page_2 = [
+        {
+            "id": 11,
+            "created_at": "2026-01-02T00:00:00Z",
+            "body": f"{pr.PROGRESS_MARKER}\nsome progress",
+        }
+    ]
+    stdout = json.dumps(page_1) + json.dumps(page_2)
+
+    monkeypatch.setattr(
+        pr.subprocess,
+        "run",
+        lambda *a, **k: _FakeCompletedProcess(stdout=stdout, returncode=0),
+    )
+
+    assert pr._find_progress_comment_id("owner/repo", 1) == 11
+
+
+def test_find_progress_comment_id_returns_none_on_a_failed_gh_call(monkeypatch):
+    monkeypatch.setattr(
+        pr.subprocess,
+        "run",
+        lambda *a, **k: _FakeCompletedProcess(returncode=1, stderr="boom"),
+    )
+
+    assert pr._find_progress_comment_id("owner/repo", 1) is None
+
+
+def test_find_progress_comment_id_returns_none_when_no_comment_matches(monkeypatch):
+    stdout = json.dumps(
+        [{"id": 1, "created_at": "2026-01-01T00:00:00Z", "body": "unrelated"}]
+    )
+    monkeypatch.setattr(
+        pr.subprocess, "run", lambda *a, **k: _FakeCompletedProcess(stdout=stdout)
+    )
+
+    assert pr._find_progress_comment_id("owner/repo", 1) is None

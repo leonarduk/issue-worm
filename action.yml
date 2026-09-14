@@ -29,11 +29,14 @@ inputs:
       issue body below, and this action fails there first (before either
       of the other two is ever exercised) if it's absent. Grant
       `issues: write` too (already included in a classic PAT's `repo`
-      scope) if you want the self-heal path (`cli._self_heal_scope`, for
-      an issue missing `## Implementation notes`) to persist its drafted
-      section back onto the issue - without it, self-heal still lets the
-      build proceed, it just can't save the draft anywhere but this run's
-      own memory. Required - the
+      scope) for two best-effort features that silently no-op without it
+      rather than failing the build: the self-heal path
+      (`cli._self_heal_scope`, for an issue missing `## Implementation
+      notes`) persisting its drafted section back onto the issue instead
+      of only keeping it in this run's own memory, and the live progress
+      comment (#345) actually being posted/edited on the issue at all -
+      posting or editing any comment needs `issues: write`, not
+      `issues: read`. Required - the
       built-in `secrets.GITHUB_TOKEN` is NOT enough: pull requests (and
       pushes) made with the default token deliberately do not trigger
       other workflow runs, so any CI configured to run on the PR (tests,
@@ -156,20 +159,29 @@ runs:
         # its own coder stage; this step covers the two stages that run
         # out here in bash (verifier, publish) via the `issue-worm
         # progress` subcommand, ending with the terminal `**Result:**`
-        # line. The trap covers every failure path below in one place
-        # (a bad checkout, `cicaid publish-pr` failing, no open PR found,
-        # ...) rather than needing a `--failure` call at each `exit 1` -
-        # `finish()` is idempotent, so this never double-reports if a
-        # later line also finishes successfully. `|| true`: a progress
-        # write is best-effort and must never mask (or replace) the real
-        # failure this trap exists to report.
-        trap '
+        # line. `_on_exit` reports a failure for every failure path below
+        # in one place (a bad checkout, `cicaid publish-pr` failing, no
+        # open PR found, ...) rather than needing a `--failure` call at
+        # each `exit 1` - `finish()` is idempotent, so this never
+        # double-reports if a later line also finishes successfully.
+        # `|| true`: a progress write is best-effort and must never mask
+        # the real failure this trap exists to report.
+        #
+        # A single EXIT trap, not two: a second `trap ... EXIT` *replaces*
+        # the first in bash rather than composing with it (unlike signal
+        # traps chained via `trap -p`), so the checks_log cleanup below is
+        # folded into this same function instead of installing its own
+        # trap - two separate `trap ... EXIT` calls would silently drop
+        # whichever ran first.
+        _on_exit() {
           ec=$?
+          rm -f "${checks_log:-}"
           if [ "$ec" -ne 0 ]; then
             issue-worm progress --issue "$ISSUE" --repo "$REPO" \
               --failure "Action failed during commit/verify/publish (exit code $ec)" || true
           fi
-        ' EXIT
+        }
+        trap _on_exit EXIT
 
         if [ -z "$(git status --porcelain)" ]; then
           echo "::error::issue-worm build reported success but left no changes to commit - nothing to open a PR for."
@@ -220,14 +232,11 @@ runs:
         # "coder is the only LLM" constraint. A pass opens a normal PR with a
         # short summary under ## Testing; a failure opens a draft PR with the
         # failing output under ## Testing (issue-worm-pro#1079).
+        # Cleaned up by `_on_exit` (above) on every exit path - success, a
+        # later step failure, or this script erroring out under `set -e` -
+        # not just a one-off `rm -f` after the check below, which used to
+        # leak this file on a `publish-pr`/`gh` failure further down.
         checks_log="$(mktemp)"
-        # Cleans up on every exit path (success, a later step failure,
-        # or this script erroring out under `set -e`), not just the one
-        # explicit `rm -f` after the check below - a `publish-pr`/`gh`
-        # failure further down used to leak this file. Composed with (not
-        # replacing) the failure-reporting trap above: both run, in LIFO
-        # order, on the same EXIT.
-        trap 'rm -f "$checks_log"' EXIT
         issue-worm progress --issue "$ISSUE" --repo "$REPO" --stage-start verifier || true
         verifier_started=$SECONDS
         checks_status=0

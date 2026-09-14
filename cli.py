@@ -622,6 +622,9 @@ def _run_progress(args) -> int:
     if args.stage_done is not None and args.elapsed is None:
         print("✗ --stage-done requires --elapsed", file=sys.stderr)
         return 2
+    if args.stage_done is None and args.elapsed is not None:
+        print("✗ --elapsed is only valid together with --stage-done", file=sys.stderr)
+        return 2
     if args.stage_start is not None:
         progress_reporter.record_stage_start(
             args.repo, args.issue, args.stage_start, dry_run=args.dry_run

@@ -116,6 +116,28 @@ def _save_state(state: _ProgressState) -> None:
         )
 
 
+def _decode_paginated_json(text: str) -> list:
+    """Decode the concatenated JSON arrays `gh api --paginate` emits - one
+    page is one JSON array, and pages are written back-to-back with no
+    separator, so a plain `json.loads` fails on anything past the first
+    page. Mirrors issue-worm-pro's `cicaid_bridge._decode_paginated_json`.
+    Raises `json.JSONDecodeError` on malformed input, same as `json.loads`
+    - callers here already wrap every use in a broad `except Exception`.
+    """
+    items: list = []
+    decoder = json.JSONDecoder()
+    pos = 0
+    while pos < len(text):
+        while pos < len(text) and text[pos].isspace():
+            pos += 1
+        if pos >= len(text):
+            break
+        page, end = decoder.raw_decode(text, pos)
+        items.extend(page)
+        pos = end
+    return items
+
+
 def _find_progress_comment_id(repo: str, issue_number: int) -> int | None:
     """Id of the most recent comment on the issue carrying PROGRESS_MARKER.
 
@@ -123,7 +145,11 @@ def _find_progress_comment_id(repo: str, issue_number: int) -> int | None:
     ``get_issue_comments`` (the latter returns author/body/created_at, no
     id) but no way to *find* a specific comment's id for editing later, so
     this goes straight to `gh api`, the same way issue-worm-pro's
-    `cicaid_bridge.find_issue_comment_id` does.
+    `cicaid_bridge.find_issue_comment_id` does. `--paginate`, not a single
+    page: the comments endpoint returns oldest-first, so on an issue with
+    a long history the progress comment (posted well after the issue was
+    opened) can easily be past the default 30-per-page cutoff - the most
+    recent page, not the first, is where it usually lives.
     """
     try:
         result = subprocess.run(
@@ -142,7 +168,7 @@ def _find_progress_comment_id(repo: str, issue_number: int) -> int | None:
                 result.stderr.strip(),
             )
             return None
-        items = json.loads(result.stdout)
+        items = _decode_paginated_json(result.stdout)
         matches = [
             item
             for item in items
