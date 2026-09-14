@@ -198,6 +198,11 @@ runs:
         # short summary under ## Testing; a failure opens a draft PR with the
         # failing output under ## Testing (issue-worm-pro#1079).
         checks_log="$(mktemp)"
+        # Cleans up on every exit path (success, a later step failure,
+        # or this script erroring out under `set -e`), not just the one
+        # explicit `rm -f` after the check below - a `publish-pr`/`gh`
+        # failure further down used to leak this file.
+        trap 'rm -f "$checks_log"' EXIT
         checks_status=0
         set +e
         cicaid run-ci-checks --all > "$checks_log" 2>&1
@@ -207,15 +212,23 @@ runs:
         if [ "$checks_status" -eq 0 ]; then
           testing="✓ \`cicaid run-ci-checks --all\` passed."
         else
-          checks_output="$(cat "$checks_log")"
           # GitHub PR bodies cap at 65536 chars; keep the check output well
-          # under that so the rest of the body always fits.
-          if [ "${#checks_output}" -gt 60000 ]; then
-            checks_output="${checks_output:0:60000}"$'\n... (truncated)'
+          # under that so the rest of the body (diff list, DONE line,
+          # footer, Closes #N) always has headroom too.
+          #
+          # Truncated with `head -c` on the file directly (byte-exact, not
+          # `${#var}`'s character count under a UTF-8 locale vs. byte count
+          # under LC_ALL=C), then run through `iconv -c` to drop any
+          # trailing bytes that got split mid-multibyte-sequence at the cut
+          # point - a raw byte truncation can otherwise produce invalid
+          # UTF-8, which GitHub's API rejects with a 422.
+          if [ "$(wc -c < "$checks_log")" -gt 40000 ]; then
+            checks_output="$(head -c 40000 "$checks_log" | iconv -f utf-8 -t utf-8 -c)"$'\n... (truncated)'
+          else
+            checks_output="$(cat "$checks_log")"
           fi
           testing="$(printf '✗ `cicaid run-ci-checks --all` failed.\n\n<details><summary>Check output</summary>\n\n```\n%s\n```\n\n</details>' "$checks_output")"
         fi
-        rm -f "$checks_log"
 
         changed_files="$(git diff --name-only "$base_commit" HEAD | sed 's/^/- /')"
 
