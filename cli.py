@@ -646,6 +646,13 @@ def _version_string() -> str:
     `_try_import_pro_cli` performs a real ``import pro_cli`` (executing
     its module-level code), so it must never be called from here - the
     metadata lookup below is the only pro probe this path may use.
+
+    #222 audit result: this function has never called `_try_import_pro_cli`
+    - it already satisfies #222's "already a cheap probe" branch, so no
+    functional change was needed there, only this note plus the regression
+    tests in `tests/test_cli.py` (`test_version_string_never_imports_pro_cli_even_when_installed`,
+    `test_version_flag_never_imports_pro_cli`) that patch `builtins.__import__`
+    to prove no `pro_cli` import happens even with pro's metadata present.
     """
     version = installed_version() or "unknown (source checkout)"
     try:
