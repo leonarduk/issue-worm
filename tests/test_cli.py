@@ -1862,7 +1862,16 @@ def _pins_pro_cli_via_ast(tree: ast.AST) -> bool:
     not a substring search over the source text - `"pro_cli"` appearing
     in a comment, docstring, or unrelated assertion message must not
     count, or the guard would be trivially satisfiable without actually
-    controlling anything (DeepSeek review of #336)."""
+    controlling anything (DeepSeek review of #336).
+
+    The second idiom is a real, independent pin, not a no-op: `cli.py`'s
+    dispatch check (`if sys.argv[1] in _PRO_COMMANDS: pro_cli =
+    _try_import_pro_cli()`) calls `_try_import_pro_cli()` directly, so
+    forcing it to return `None` short-circuits dispatch exactly like
+    neutralizing `sys.modules["pro_cli"]` does - verified by reading
+    `cli.py` (the call site is `pro_cli = _try_import_pro_cli()`), not
+    assumed.
+    """
     for node in ast.walk(tree):
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
             continue
@@ -1973,6 +1982,34 @@ def test_pins_pro_cli_via_ast_rejects_a_bare_mention_in_a_comment():
     assert _pins_pro_cli_via_ast(real_pin_via_try_import) is True
 
 
+def _find_unguarded_pro_dispatch_tests(module, *, skip=frozenset(), allowlist=frozenset()):
+    """The audit itself: every `test_*` function defined at module scope
+    in `module` that drives `cli.main()` with a pro-dispatchable command
+    and doesn't pin/control `pro_cli`. Shared by the real meta-test below
+    and by `test_the_audit_actually_flags_an_unguarded_test`, which runs
+    it against a synthetic module to prove it isn't vacuous."""
+    module_source = inspect.getsource(module)
+    module_tree = ast.parse(module_source)
+
+    unguarded = []
+    for node in module_tree.body:
+        if not (isinstance(node, ast.FunctionDef) and node.name.startswith("test_")):
+            continue
+        if node.name in skip:
+            continue
+        func = getattr(module, node.name)
+        func_source = inspect.getsource(func)
+        if "cli.main()" not in func_source:
+            continue
+        if not _drives_pro_dispatchable_command(func_source):
+            continue
+        if node.name in allowlist:
+            continue
+        if not _pins_pro_cli(func):
+            unguarded.append(node.name)
+    return unguarded
+
+
 def test_every_cli_main_test_pins_or_allowlists_pro_cli():
     """Every test in this module that drives `cli.main()` with a
     pro-dispatchable command (`cli._PRO_COMMANDS`) must neutralize or
@@ -1980,27 +2017,22 @@ def test_every_cli_main_test_pins_or_allowlists_pro_cli():
     `_PRO_DISPATCH_PIN_ALLOWLIST` with a reason. Catches the exact class of
     regression #227 and #228 were filed to fix, without relying on a human
     re-running the audit by hand next time a test is added.
+
+    Note for reviewers: this file does not define an autouse `pro_cli`
+    fixture (no `conftest.py` exists in this PR - that's #227's separate
+    change), so `_pro_cli_absent` here is strictly opt-in via
+    `@pytest.mark.usefixtures("_pro_cli_absent")` on each test that needs
+    it. This guard is therefore not vacuous: a test lacking that marker
+    (or an equivalent `monkeypatch.setitem`/`monkeypatch.setattr` call)
+    genuinely fails it, as `test_the_audit_actually_flags_an_unguarded_test`
+    below demonstrates against a synthetic case.
     """
     this_module = sys.modules[__name__]
-    module_source = inspect.getsource(this_module)
-    module_tree = ast.parse(module_source)
-
-    unguarded = []
-    for node in module_tree.body:
-        if not (isinstance(node, ast.FunctionDef) and node.name.startswith("test_")):
-            continue
-        if node.name == "test_every_cli_main_test_pins_or_allowlists_pro_cli":
-            continue
-        func = getattr(this_module, node.name)
-        func_source = inspect.getsource(func)
-        if "cli.main()" not in func_source:
-            continue
-        if not _drives_pro_dispatchable_command(func_source):
-            continue
-        if node.name in _PRO_DISPATCH_PIN_ALLOWLIST:
-            continue
-        if not _pins_pro_cli(func):
-            unguarded.append(node.name)
+    unguarded = _find_unguarded_pro_dispatch_tests(
+        this_module,
+        skip={"test_every_cli_main_test_pins_or_allowlists_pro_cli"},
+        allowlist=_PRO_DISPATCH_PIN_ALLOWLIST,
+    )
 
     assert not unguarded, (
         "these tests drive cli.main() with a pro-dispatchable command "
@@ -2011,5 +2043,49 @@ def test_every_cli_main_test_pins_or_allowlists_pro_cli():
         "(or the _pro_cli_absent fixture), or add the test to "
         "_PRO_DISPATCH_PIN_ALLOWLIST with a comment explaining why it's safe."
     )
+
+
+def test_the_audit_actually_flags_an_unguarded_test():
+    """Proves the meta-test above isn't vacuous: builds a real synthetic
+    module (via `exec`, not just a source string) containing one
+    unguarded `triage`-dispatching test and one properly-pinned test,
+    then runs the exact same `_find_unguarded_pro_dispatch_tests` walk
+    against it and asserts only the unguarded one is flagged. A meta-test
+    that has never been observed to fail is not evidence it works
+    (DeepSeek review of #336) - this is that observation, kept as a
+    permanent regression test rather than a one-off manual check.
+    """
+    synthetic_source = (
+        "import sys\n"
+        "from unittest.mock import patch\n"
+        "import cli\n"
+        "import pytest\n"
+        "\n"
+        "def test_unguarded(capsys):\n"
+        "    with patch.object(sys, 'argv', ['issue-worm', 'triage']), pytest.raises(SystemExit):\n"
+        "        cli.main()\n"
+        "\n"
+        "def test_guarded(monkeypatch, capsys):\n"
+        "    monkeypatch.setitem(sys.modules, 'pro_cli', None)\n"
+        "    with patch.object(sys, 'argv', ['issue-worm', 'triage']), pytest.raises(SystemExit):\n"
+        "        cli.main()\n"
+    )
+    synthetic_module = ModuleType("_synthetic_pro_dispatch_audit_fixture")
+    synthetic_module.__file__ = "<synthetic>"
+    exec(compile(synthetic_source, "<synthetic>", "exec"), synthetic_module.__dict__)
+    # inspect.getsource needs a real file (or a linecache entry) behind the
+    # module and its functions - register one instead of writing to disk.
+    import linecache
+
+    linecache.cache["<synthetic>"] = (
+        len(synthetic_source),
+        None,
+        synthetic_source.splitlines(keepends=True),
+        "<synthetic>",
+    )
+
+    unguarded = _find_unguarded_pro_dispatch_tests(synthetic_module)
+
+    assert unguarded == ["test_unguarded"]
 
 
