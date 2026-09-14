@@ -2188,14 +2188,20 @@ def test_every_cli_main_test_pins_or_allowlists_pro_cli():
     regression #227 and #228 were filed to fix, without relying on a human
     re-running the audit by hand next time a test is added.
 
-    Note for reviewers: this file does not define an autouse `pro_cli`
-    fixture (no `conftest.py` exists in this PR - that's #227's separate
-    change), so `_pro_cli_absent` here is strictly opt-in via
-    `@pytest.mark.usefixtures("_pro_cli_absent")` on each test that needs
-    it. This guard is therefore not vacuous: a test lacking that marker
-    (or an equivalent `monkeypatch.setitem`/`monkeypatch.setattr` call)
-    genuinely fails it, as `test_the_audit_actually_flags_an_unguarded_test`
-    below demonstrates against a synthetic case.
+    Note for reviewers: #227 (merged separately, now present in
+    `conftest.py`) added an autouse `_neutralize_pro_cli` fixture that
+    pins every test in this suite by default - this meta-test does not
+    depend on that fixture and is not made vacuous by it. It inspects
+    each test's own source for an explicit pin (`_pro_cli_absent`,
+    `monkeypatch.setitem(sys.modules, "pro_cli", ...)`, or
+    `monkeypatch.setattr(cli, "_try_import_pro_cli", ...)`), so it keeps
+    catching the class of regression #227/#228 were filed for even if a
+    test somehow runs without the autouse fixture applied (a different
+    test file with no `conftest.py` in scope, a future refactor that
+    narrows the fixture's scope, `pytest -p no:cacheprovider`-style
+    plugin interference, etc.) - defense in depth, not a duplicate check.
+    `test_the_audit_actually_flags_an_unguarded_test` below demonstrates
+    against a synthetic case that an unpinned test is genuinely flagged.
     """
     this_module = sys.modules[__name__]
     unguarded = _find_unguarded_pro_dispatch_tests(
