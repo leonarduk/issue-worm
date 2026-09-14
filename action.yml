@@ -39,7 +39,7 @@ inputs:
       other workflow runs, so any CI configured to run on the PR (tests,
       review bots, required checks) would silently never fire. A PAT or
       App token does trigger them. This same token also authenticates the
-      `git push` and `gh pr create` steps below and is used to fetch the
+      `git push` and `cicaid publish-pr` steps below and is used to fetch the
       issue body (higher rate limit; required at all for a private repo).
     required: true
   license-key:
@@ -53,10 +53,11 @@ inputs:
     default: ''
   close-issue:
     description: >-
-      Whether to include a `Closes #N` trailer in the commit message body.
-      Note: `cicaid publish-pr` always appends a `Closes #N` line to the PR
-      body, so the issue will close on merge regardless of this input. This
-      input only controls the commit message trailer. Defaults to 'true'.
+      Whether the commit message and PR body carry `Closes #N`, which makes
+      GitHub auto-close the issue when the PR is merged. Set to 'false' to
+      keep the issue open after merge - useful when the PR only addresses
+      part of the issue, or when the issue tracks broader work that
+      continues after this PR. Defaults to 'true' (issues close on merge).
     required: false
     default: 'true'
 
@@ -135,10 +136,14 @@ runs:
           --repo "${{ github.repository }}" \
           --workspace "${{ github.workspace }}"
 
-    - name: Publish the PR via cicaid
+    - name: Commit, push, and publish the PR via cicaid
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
+        ISSUE: ${{ inputs.issue }}
+        REPO: ${{ github.repository }}
+        CLOSE_ISSUE: ${{ inputs.close-issue }}
+        PYTHONIOENCODING: utf-8
       run: |
         set -euo pipefail
         cd "${{ github.workspace }}"
@@ -148,50 +153,46 @@ runs:
           exit 1
         fi
 
-        # Fetch the issue title and body once; both the branch slug and the
-        # PR body are built from them mechanically.
-        issue_title="$(gh issue view "${{ inputs.issue }}" --repo "${{ github.repository }}" --json title -q .title)"
-        issue_body="$(gh issue view "${{ inputs.issue }}" --repo "${{ github.repository }}" --json body -q .body || true)"
+        # The title is required (it names the branch); the body only feeds
+        # the PR text, so a failure there degrades instead of aborting.
+        issue_title="$(gh issue view "$ISSUE" --repo "$REPO" --json title -q .title)"
+        issue_body="$(gh issue view "$ISSUE" --repo "$REPO" --json body -q .body || true)"
 
-        # Slug rule mirrors cicaid work-on-issue's branch naming:
-        # lower-case, non-alphanumeric runs -> hyphens, trim, cap length.
-        slugify() {
-          local input="$1"
-          local slug
-          slug="$(printf '%s' "$input" \
-            | tr '[:upper:]' '[:lower:]' \
-            | sed -E 's/[^a-z0-9]+/-/g' \
-            | sed -E 's/^-+//' \
-            | sed -E 's/-+$//' \
-            | cut -c1-50)"
-          slug="$(printf '%s' "$slug" | sed -E 's/-+$//')"
-          if [ -z "$slug" ]; then
-            slug="issue-${{ inputs.issue }}"
-          fi
-          printf '%s' "$slug"
-        }
-
-        branch="fix/issue-${{ inputs.issue }}-$(slugify "$issue_title")"
+        # cicaid's own slugify rather than a port of it, so this is exactly
+        # the branch `cicaid work-on-issue` (and so the pro path) would use.
+        slug="$(python -c 'import sys; from cicaid_devtools.work_on_issue import slugify; print(slugify(sys.argv[1]))' "$issue_title")"
+        branch="fix/issue-${ISSUE}-${slug}"
 
         git config user.name "issue-worm[bot]"
         git config user.email "issue-worm[bot]@users.noreply.github.com"
-        # -B resets the branch if it somehow already exists locally;
-        # cicaid publish-pr handles the remote force-push on retry.
+        base_commit="$(git rev-parse HEAD)"
         git checkout -B "$branch"
 
-        # Keep this run's bookkeeping out of the commit. .git/info/exclude
-        # is local to this checkout and never committed.
+        # Keep this run's .issue-worm/ bookkeeping out of the commit AND out
+        # of publish-pr's sight: publish-pr stages everything in
+        # `git diff --name-only HEAD` when the tree is dirty, which would
+        # commit a tracked .issue-worm file the reset below unstaged.
+        # exclude hides it untracked, skip-worktree hides it tracked.
         mkdir -p .git/info
-        if ! grep -qxF '.issue-worm/' .git/info/exclude 2>/dev/null; then
-          echo '.issue-worm/' >> .git/info/exclude
-        fi
-
+        grep -qxF '.issue-worm/' .git/info/exclude 2>/dev/null || echo '.issue-worm/' >> .git/info/exclude
         git add -A .
-        # Unstage any tracked .issue-worm modifications as well - exclude
-        # only prevents staging untracked/ignored paths.
-        git reset -- .issue-worm
+        git reset -q -- .issue-worm
+        git ls-files -z -- .issue-worm | xargs -0 -r git update-index --skip-worktree
 
-        changed_files="$(git diff --cached --name-only | sed 's/^/- /')"
+        commit_args=(-m "issue-worm: apply changes for #${ISSUE}")
+        if [ "$CLOSE_ISSUE" = "true" ]; then
+          commit_args+=(-m "Closes #${ISSUE}")
+        fi
+        git commit -q "${commit_args[@]}"
+
+        # Commit and force-push here, not in publish-pr: it refuses a branch
+        # with no commits ahead of the base (checked before it commits) and
+        # pushes without --force, which would break re-labelling the issue
+        # as "try again" (issue-worm-pro#582). It then finds a clean,
+        # already-pushed branch and only opens (or finds) the PR.
+        git push -q --force -u origin "$branch"
+
+        changed_files="$(git diff --name-only "$base_commit" HEAD | sed 's/^/- /')"
 
         # Extract the DONE: line from the issue's ## Implementation notes
         # section (same scoping as review.py).
@@ -220,9 +221,11 @@ runs:
           }
           !f { print }
         ')"
-        why_excerpt="$(printf '%s' "$why_excerpt" | cut -c1-500)"
-        if [ "${#why_excerpt}" -eq 500 ]; then
-          why_excerpt="${why_excerpt}..."
+        if [ "${#why_excerpt}" -gt 500 ]; then
+          why_excerpt="${why_excerpt:0:500}..."
+        fi
+        if [ -z "$why_excerpt" ]; then
+          why_excerpt="See #${ISSUE}."
         fi
 
         what_section=""
@@ -246,24 +249,36 @@ runs:
         # Logo footer, matching issue-worm-pro's scheduler._pr_footer().
         pr_footer="$(printf '\n\n---\n<p align="center"><img src="https://github.com/leonarduk/issue-worm/raw/main/docs/logo.jpg" width="48" alt="issue-worm logo" /><br/><sub>🐛 Opened automatically by <a href="https://github.com/leonarduk/issue-worm">issue-worm</a></sub></p>')"
 
-        pr_body="$(printf '## What\n%s\n\n## Why\n%s\n\n## Approach\n%s\n\n## Testing\n%s\n\n## Checklist\n- [ ] Tests added or updated\n- [ ] Documentation updated\n- [ ] No breaking changes\n%s' \
+        pr_body="$(printf '## What\n%s\n\n## Why\n%s\n\n## Approach\n%s\n\n## Testing\n%s\n\n## Checklist\n- [ ] Tests added/updated\n- [ ] Docs updated if needed\n- [ ] No breaking changes\n%s' \
           "$what_section" "$why_excerpt" "$approach" "$testing" "$pr_footer")"
 
         body_file="$(mktemp)"
+        trap 'rm -f "$body_file"' EXIT
         printf '%s\n' "$pr_body" > "$body_file"
 
-        if [ "${{ inputs.close-issue }}" = "true" ]; then
-          commit_msg="issue-worm: apply changes for #${{ inputs.issue }}"$'\n\n'"Closes #${{ inputs.issue }}"
-        else
-          commit_msg="issue-worm: apply changes for #${{ inputs.issue }}"
+        # --body-file skips publish-pr's LLM body generation entirely (no
+        # LLM outside the coder). It titles the PR `[Issue #N] <title>`,
+        # appends `Closes #N` to the body, and returns an already-open PR
+        # for this branch instead of opening a second one.
+        cicaid publish-pr --body-file "$body_file"
+
+        # REST, not `gh pr view`/`gh pr edit`: their GraphQL queries need
+        # read:org, which a repo-scoped PAT doesn't have.
+        pr_number="$(gh api -X GET "repos/$REPO/pulls" -f head="${REPO%%/*}:$branch" -f state=open -q '.[0].number')"
+        if [ -z "$pr_number" ]; then
+          echo "::error::cicaid publish-pr succeeded but no open PR was found for $branch."
+          exit 1
         fi
 
-        # cicaid publish-pr does the commit, push, and gh pr create/update.
-        # --body-file and -m skip its LLM generation entirely (no LLM
-        # outside the coder). It derives the PR title ([Issue #N] <title>)
-        # from the branch name and appends Closes #N to the body.
-        cicaid publish-pr --body-file "$body_file" -m "$commit_msg"
+        # publish-pr always appends `Closes #N`; strip it again when the
+        # caller asked for the issue to stay open after merge.
+        if [ "$CLOSE_ISSUE" != "true" ]; then
+          gh api "repos/$REPO/pulls/$pr_number" -q .body | { grep -vxF "Closes #${ISSUE}" || true; } > "$body_file"
+          gh api -X PATCH "repos/$REPO/pulls/$pr_number" -F body=@"$body_file" > /dev/null
+        fi
 
-        # Add pro's PR_AUTHOR_LABEL to the PR (new or existing).
-        pr_number="$(gh pr view "$branch" --repo "${{ github.repository }}" --json number -q .number)"
-        gh pr edit "$pr_number" --repo "${{ github.repository }}" --add-label issue-worm
+        # Pro's PR_AUTHOR_LABEL. Labelling a PR fires `pull_request:
+        # labeled`, not `issues: labeled`, so this can't re-trigger a
+        # label-gated issue-worm workflow. Cosmetic, so never fatal.
+        gh api -X POST "repos/$REPO/issues/$pr_number/labels" -f 'labels[]=issue-worm' > /dev/null \
+          || echo "::warning::Could not add the issue-worm label to PR #$pr_number."
