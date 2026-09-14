@@ -4,6 +4,8 @@ module when issue-worm-pro is present, and report themselves unavailable
 rather than crashing when it isn't (#352).
 """
 
+import ast
+import inspect
 import json
 import os
 import sys
@@ -1764,3 +1766,108 @@ def test_status_dispatches_to_run_status(monkeypatch):
 
     mock_run_status.assert_called_once()
     assert exc.value.code == 0
+
+
+# --- structural guard against the #227/#228 class of bug --------------------
+#
+# The pinned tests above (test_core_command_reports_unavailable and friends)
+# exist because cli.main() dispatches to a real, importable `pro_cli` for any
+# of `_PRO_COMMANDS` before this shell's own logic runs (#352) - a dev
+# machine with issue-worm-pro installed editable alongside this repo would
+# otherwise have those tests silently exercise the real pro dispatch (firing
+# a live triage pass or an unterminating poll loop) instead of the
+# core-only path they mean to cover. #227/#228 root-caused two rounds of
+# such tests missing the pin; this meta-test makes the class structurally
+# impossible to reintroduce by inspecting every test in this module that
+# drives `cli.main()` via a literal `sys.argv`.
+
+# Tests that legitimately invoke cli.main() with a pro-dispatchable command
+# token (e.g. as a flag *value*, not the dispatched subcommand itself) but
+# are not pro-dispatch tests, so pinning pro_cli would be a no-op. Keep this
+# list empty unless a genuine case shows up - do not add to it just to
+# silence this guard.
+_PRO_DISPATCH_PIN_ALLOWLIST: frozenset[str] = frozenset()
+
+
+def _iter_literal_argv_lists(tree: ast.AST):
+    """Yield the list of string elements for every literal
+    `patch.object(sys, "argv", [...])` call found in `tree`."""
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr == "object"):
+            continue
+        args = node.args
+        if len(args) < 3:
+            continue
+        name_arg = args[1]
+        if not (isinstance(name_arg, ast.Constant) and name_arg.value == "argv"):
+            continue
+        if not isinstance(args[2], ast.List):
+            continue
+        try:
+            values = [ast.literal_eval(elt) for elt in args[2].elts]
+        except ValueError:
+            continue
+        yield values
+
+
+def _drives_pro_dispatchable_command(func_source: str) -> bool:
+    tree = ast.parse(func_source)
+    for argv in _iter_literal_argv_lists(tree):
+        if any(token in cli._PRO_COMMANDS for token in argv):
+            return True
+    return False
+
+
+def _pins_pro_cli(func) -> bool:
+    source = inspect.getsource(func)
+    if "_pro_cli_absent" in source:
+        return True  # usefixtures or a direct fixture-arg reference
+    if '"pro_cli"' in source or "'pro_cli'" in source:
+        return True  # e.g. monkeypatch.setitem(sys.modules, "pro_cli", ...)
+    if "_try_import_pro_cli" in source:
+        return True  # e.g. monkeypatch.setattr(cli, "_try_import_pro_cli", ...)
+    return False
+
+
+def test_every_cli_main_test_pins_or_allowlists_pro_cli():
+    """Every test in this module that drives `cli.main()` with a
+    pro-dispatchable command (`cli._PRO_COMMANDS`) must neutralize or
+    explicitly control `pro_cli`, or be named in
+    `_PRO_DISPATCH_PIN_ALLOWLIST` with a reason. Catches the exact class of
+    regression #227 and #228 were filed to fix, without relying on a human
+    re-running the audit by hand next time a test is added.
+    """
+    this_module = sys.modules[__name__]
+    module_source = inspect.getsource(this_module)
+    module_tree = ast.parse(module_source)
+
+    unguarded = []
+    for node in module_tree.body:
+        if not (isinstance(node, ast.FunctionDef) and node.name.startswith("test_")):
+            continue
+        if node.name == "test_every_cli_main_test_pins_or_allowlists_pro_cli":
+            continue
+        func = getattr(this_module, node.name)
+        func_source = inspect.getsource(func)
+        if "cli.main()" not in func_source:
+            continue
+        if not _drives_pro_dispatchable_command(func_source):
+            continue
+        if node.name in _PRO_DISPATCH_PIN_ALLOWLIST:
+            continue
+        if not _pins_pro_cli(func):
+            unguarded.append(node.name)
+
+    assert not unguarded, (
+        "these tests drive cli.main() with a pro-dispatchable command "
+        f"({', '.join(cli._PRO_COMMANDS)}) but never pin or control "
+        "pro_cli, so they would silently exercise the real pro dispatch "
+        "on a machine where issue-worm-pro is installed editable: "
+        f"{unguarded}. Add monkeypatch.setitem(sys.modules, 'pro_cli', ...) "
+        "(or the _pro_cli_absent fixture), or add the test to "
+        "_PRO_DISPATCH_PIN_ALLOWLIST with a comment explaining why it's safe."
+    )
+
