@@ -474,10 +474,17 @@ def test_parse_coder_targets_unset_uses_defaults(monkeypatch):
     "raise ConfigError". This test pins the complementary case: when the
     variable is simply absent, parsing must fall back to the default
     (empty list) rather than tripping the new error path.
+
+    Goes through `load_config()` - the real env-reading call site
+    (`os.getenv("CODER_TARGETS", "")` in config.py) - rather than calling
+    `_parse_coder_targets("")` directly: that direct call can't tell
+    "unset" from "explicitly set to an empty string", so it wouldn't
+    catch a regression in how the env var is actually read.
     """
+    monkeypatch.setenv("CODER_MODEL_SOURCE", "local")
     monkeypatch.delenv("CODER_TARGETS", raising=False)
 
-    assert _parse_coder_targets("") == []
+    assert load_config()["coder_targets"] == []
 
 
 def test_parse_coder_targets_non_numeric_port_raises():
