@@ -16,6 +16,12 @@ def test_valid_commands_matches_known_cli_subcommands():
         "build",
         "poll",
         "status",
+        # Internal (#345): updates an issue's live progress comment from
+        # the Action's own shell steps. Not documented in README.md as a
+        # user-facing command - see its own --help text - so it is
+        # deliberately absent from doc/CLI-drift's *referenced* set
+        # without failing that check.
+        "progress",
     }
 
 

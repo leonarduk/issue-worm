@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError
@@ -22,6 +23,7 @@ from pathlib import Path
 
 import requests
 
+import progress_reporter
 from config import ConfigError, load_config
 from coder import CoderConfigError, build_coder
 from history import DEFAULT_HISTORY_PATH, get_run, load_runs, record_run
@@ -353,7 +355,9 @@ def _run_build(args, config: dict) -> int:
     Coder if the issue isn't scoped yet - see `_self_heal_scope`) + local
     Ollama coder, writing changes straight to the working tree. No
     verifier/retry loop, no scheduler — matches the free shell's scope
-    (#2).
+    (#2). The GitHub Action wraps this command with a single
+    `cicaid run-ci-checks --all` verifier stage before publishing, but that
+    is not part of this CLI command itself.
     """
     issue_numbers = list(args.issues) + list(args.issue or [])
     if not issue_numbers:
@@ -398,6 +402,19 @@ def _run_build(args, config: dict) -> int:
         print(f"  DONE: {review.done}")
         return 0
 
+    # From here on the issue is genuinely claimed and dispatched (#345) -
+    # post the live progress comment pro's own dispatch posts, in the same
+    # format, so a free-tier run is no longer invisible from the issue
+    # thread. Never posted for a dry run (nothing was actually claimed) or
+    # for the "not ready"/"fetch failed" returns above (this run never got
+    # as far as attempting the work).
+    progress_reporter.start(args.repo, issue_number)
+
+    def _fail(message: str, code: int = 1) -> int:
+        print(f"✗ {message}", file=sys.stderr)
+        progress_reporter.finish(args.repo, issue_number, failure_detail=message)
+        return code
+
     # config's "workspace_root" defaults to "." (today's cwd) — fine for a
     # repo-in-place run of triage/poll (issue-worm-pro's territory), but
     # `ensure_base_clone` reuses *any* existing git checkout at that path
@@ -415,8 +432,7 @@ def _run_build(args, config: dict) -> int:
     try:
         repo_path = ensure_base_clone(workspace_root, args.repo)
     except Exception as exc:  # noqa: BLE001 - report, don't crash the CLI
-        print(f"✗ Could not prepare workspace: {exc}", file=sys.stderr)
-        return 1
+        return _fail(f"Could not prepare workspace: {exc}")
 
     # task id/workspace are only known once ensure_base_clone succeeds, so
     # the run is registered here rather than at the top of _run_build -
@@ -444,17 +460,17 @@ def _run_build(args, config: dict) -> int:
         try:
             coder = build_coder(coder_config)
         except CoderConfigError as exc:
-            print(f"✗ {exc}", file=sys.stderr)
-            return 1
+            return _fail(str(exc))
         task = f"FILES: {', '.join(review.files)}\nDONE: {review.done}\n\n{body}"
         heartbeat(task_id, phase="coder")
+        progress_reporter.record_stage_start(args.repo, issue_number, "coder")
+        coder_started = time.monotonic()
         output = coder.propose(repo_path, task, review.files)
+        progress_reporter.record_stage_done(
+            args.repo, issue_number, "coder", time.monotonic() - coder_started
+        )
         if not output:
-            print(
-                "✗ The Coder produced no output — is Ollama reachable?",
-                file=sys.stderr,
-            )
-            return 1
+            return _fail("The Coder produced no output — is Ollama reachable?")
 
         heartbeat(task_id, phase="apply")
         try:
@@ -462,8 +478,7 @@ def _run_build(args, config: dict) -> int:
             for change in changes:
                 apply_file_change(repo_path, change)
         except (MalformedOutputError, WorkspaceError, OSError) as exc:
-            print(f"✗ {exc}", file=sys.stderr)
-            return 1
+            return _fail(str(exc))
 
         print(f"✓ Applied changes to {len(changes)} file(s) in {repo_path}:")
         for change in changes:
@@ -591,6 +606,48 @@ def _load_registry_records() -> list[dict]:
     disk.
     """
     return list_runs()
+
+
+def _run_progress(args) -> int:
+    """`progress`: update the live progress comment from outside `build`
+    (#345). `build` itself already calls `progress_reporter.start`/
+    `record_stage_start`/`record_stage_done`/`finish` directly for the
+    coder stage and for any failure inside `build` - this subcommand
+    exists only so the GitHub Action's own shell steps (the verifier and
+    the publish step, both bash, both outside `build`'s process) can
+    append to and close out the same comment.
+
+    Every underlying call is best-effort (see progress_reporter.py's
+    module docstring - a GitHub failure here logs a warning and never
+    raises), so this always exits 0 on a well-formed invocation; the
+    mutually-exclusive-group/--elapsed checks below are the only way this
+    can fail, and that failure is a wiring bug in the caller (the Action
+    itself), not a live GitHub hiccup - worth surfacing loudly rather
+    than swallowing.
+    """
+    if args.stage_done is not None and args.elapsed is None:
+        print("✗ --stage-done requires --elapsed", file=sys.stderr)
+        return 2
+    if args.stage_done is None and args.elapsed is not None:
+        print("✗ --elapsed is only valid together with --stage-done", file=sys.stderr)
+        return 2
+    if args.stage_start is not None:
+        progress_reporter.record_stage_start(
+            args.repo, args.issue, args.stage_start, dry_run=args.dry_run
+        )
+    elif args.stage_done is not None:
+        progress_reporter.record_stage_done(
+            args.repo, args.issue, args.stage_done, args.elapsed, dry_run=args.dry_run
+        )
+    elif args.pr_url is not None:
+        progress_reporter.finish(
+            args.repo, args.issue, pr_url=args.pr_url, dry_run=args.dry_run
+        )
+    else:
+        progress_reporter.finish(
+            args.repo, args.issue, failure_detail=args.failure, dry_run=args.dry_run
+        )
+    return 0
 
 
 def _run_status(args) -> int:
@@ -740,7 +797,8 @@ def _build_parser() -> argparse.ArgumentParser:
     build_parser = subparsers.add_parser(
         "build",
         help="Heuristic review + local Ollama coder, single pass "
-        "(no verifier/retry loop — that needs issue-worm-pro)",
+        "(the GitHub Action adds a cicaid run-ci-checks verifier before publishing; "
+        "no retry loop — that needs issue-worm-pro)",
     )
     build_parser.add_argument("issues", nargs="*", type=int, metavar="ISSUE")
     build_parser.add_argument("--repo", help="owner/name of the target GitHub repo")
@@ -767,6 +825,36 @@ def _build_parser() -> argparse.ArgumentParser:
     poll_parser.add_argument("--repo")
     poll_parser.add_argument("--issue", action="append", type=int)
     poll_parser.add_argument("--interval", type=int, default=60)
+
+    progress_parser = subparsers.add_parser(
+        "progress",
+        help="Internal: update an issue's live progress comment (#345). "
+        "`build` already calls this for the coder stage itself - this "
+        "subcommand exists so the GitHub Action's own shell steps "
+        "(verifier, publish) can record the stages that run outside `build`. "
+        "Not meant for interactive use.",
+    )
+    progress_parser.add_argument("--issue", type=int, required=True)
+    progress_parser.add_argument("--repo", required=True, help="owner/name")
+    progress_parser.add_argument(
+        "--dry-run", action="store_true", help="Log what would be sent; make no GitHub write"
+    )
+    progress_action = progress_parser.add_mutually_exclusive_group(required=True)
+    progress_action.add_argument(
+        "--stage-start", metavar="LABEL", help="Open a checklist row for LABEL"
+    )
+    progress_action.add_argument(
+        "--stage-done", metavar="LABEL", help="Close LABEL's row (needs --elapsed)"
+    )
+    progress_action.add_argument(
+        "--pr-url", metavar="URL", help="Finish successfully with this PR link"
+    )
+    progress_action.add_argument(
+        "--failure", metavar="DETAIL", help="Finish with this failure reason"
+    )
+    progress_parser.add_argument(
+        "--elapsed", type=float, help="Seconds elapsed; required with --stage-done"
+    )
 
     return parser
 
@@ -898,6 +986,9 @@ def main():
 
     elif args.command == "status":
         sys.exit(_run_status(args))
+
+    elif args.command == "progress":
+        sys.exit(_run_progress(args))
     else:
         parser.print_help()
         sys.exit(1)

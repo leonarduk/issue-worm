@@ -46,7 +46,9 @@ and a real PR opened end to end — see
   configured (see [Coder configuration](#coder-configuration) below). No
   verifier/retry loop, no scheduler. **With issue-worm-pro installed this
   command runs pro's pipeline instead**, so the behaviour described here
-  is what you get on the free tier alone.
+  is what you get on the free tier alone. The GitHub Action wraps this
+  command with a single `cicaid run-ci-checks --all` verifier before
+  publishing, but the `build` command itself does not run those checks.
 - `issue-worm history` — list or inspect past runs recorded by the
   pipeline.
 - `issue-worm status` — show runs currently in progress (from the run
@@ -149,9 +151,8 @@ full commit SHA instead.
 | Input | Required | Description |
 |---|---|---|
 | `issue` | yes | Number of the issue to work. |
-| `github-token` | yes | A PAT or GitHub App token with `contents: write`, `pull-requests: write`, and `issues: read` on the target repo. A classic PAT's `repo` scope covers all three; a fine-grained PAT needs each granted separately — `issues: read` is easy to miss, since only the issue-body fetch needs it, and that runs (and fails) before the push/PR steps ever do. The built-in `secrets.GITHUB_TOKEN` is **not** sufficient either way — a PR opened (or pushed to) with it deliberately does not trigger other workflow runs, so anything gated on the PR (CI, review bots, required checks) would never fire. |
+| `github-token` | yes | A PAT or GitHub App token with `contents: write`, `pull-requests: write`, and `issues: read` on the target repo. A classic PAT's `repo` scope covers all three; a fine-grained PAT needs each granted separately — `issues: read` is easy to miss, since only the issue-body fetch needs it, and that runs (and fails) before the push/PR steps ever do. Also grant `issues: write` (included in a classic PAT's `repo` scope already) for two best-effort features that silently no-op without it instead of failing the build: self-heal persisting its drafted section back onto the issue, and the live progress comment (see below) actually being posted/edited — `issues: read` is not enough to write a comment. The built-in `secrets.GITHUB_TOKEN` is **not** sufficient either way — a PR opened (or pushed to) with it deliberately does not trigger other workflow runs, so anything gated on the PR (CI, review bots, required checks) would never fire. |
 | `license-key` | no | Reserved for the pro engine. Currently accepted and logged only — installing the pro wheel from a license key is a separate, unimplemented piece of work ([leonarduk/issue-worm-pro#584](https://github.com/leonarduk/issue-worm-pro/issues/584)). Omit it (the default) to run the free engine, which is everything the action does today. |
-| `close-issue` | no | Whether the commit message and PR body carry `Closes #N`, which makes GitHub auto-close the issue when the PR is merged. Defaults to `'true'` (issues close on merge). Set to `'false'` to keep the issue open after merge — useful when the PR addresses only part of the issue, or when the issue tracks broader work that continues after this PR. |
 
 ### `runs-on` options
 
@@ -184,22 +185,12 @@ what actually select the coder.
 3. Runs `issue-worm build <issue> --repo <owner/name> --workspace
    <checkout>`, reusing the already-checked-out, already-credentialed
    working tree instead of `build`'s normal unauthenticated fresh clone.
-4. If that produced changes, commits them to a `fix/issue-<N>-<slug>`
-   branch (named by cicaid's own `slugify`, so it matches what `cicaid
-   work-on-issue` would create) and force-pushes it, so re-labelling the
+4. If that produced changes, commits them to a deterministic
+   `issue-worm/issue-<N>` branch, force-pushes it (so re-labelling the
    issue supersedes a previous attempt rather than piling up branches —
    see [leonarduk/issue-worm-pro#582](https://github.com/leonarduk/issue-worm-pro/issues/582)'s
-   retry UX. It then opens the PR with `cicaid publish-pr --body-file`,
-   the same publisher the pro scheduler uses: a `[Issue #N] <title>`
-   title and a body with pro's `## What` / `## Why` / `## Approach` /
-   `## Testing` / `## Checklist` sections plus the logo footer, built from
-   the issue and the diff with no LLM call. The PR is labelled
-   `issue-worm`. An already-open PR for the branch is left as-is.
-
-   The commit message and PR body carry `Closes #N` by default, so
-   merging the PR closes the issue. Pass `close-issue: 'false'` to omit
-   both and leave the issue open after merge — see the
-   [`close-issue` input](#inputs) above.
+   retry UX), and opens a PR with `gh pr create` (or leaves the existing
+   PR for that branch as-is if one is already open).
 
 The action never commits its own per-run bookkeeping: it stages
 everything with `git add -A .` and then unstages `.issue-worm/` (this
@@ -210,6 +201,31 @@ too, add it to your `.gitignore`:
 
 - `.issue-worm/` — issue-worm's per-run bookkeeping directory (the action
   resets it defensively, so it is safe to ignore).
+
+### Live progress on the issue
+
+The action posts one comment on the issue when it starts, and edits that
+same comment as each stage finishes — coder, verifier, and publish — in
+the same format issue-worm-pro's own scheduler uses, so an issue looks
+the same whichever engine dispatched it:
+
+```
+🪱 issue-worm · done
+- [x] coder (5.1s)
+- [x] verifier (14.2s)
+- [x] publish (2.0s)
+
+**Result:** ✅ https://github.com/owner/repo/pull/42
+```
+
+Without this, the only trace of a run was ~8 lines in the Actions run
+log — there was no way to tell from the issue whether a run had started,
+was still going, failed, or which PR it opened. Every write here is
+best-effort: a GitHub API hiccup while posting or editing the comment is
+logged and never fails the build — that also means a `github-token`
+without `issues: write` (see that input's description above) silently
+disables this feature rather than failing the build, so a missing
+comment is worth checking that scope for.
 
 ### Known limitations
 
