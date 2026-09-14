@@ -33,7 +33,7 @@ The scheduled workflow (.github/workflows/update-dependencies.yml) uses
 again without ``--check`` on its own branch to rewrite the pins.
 
 Adapted from issue-worm-pro's script of the same name, which tracks the same
-two pins across that repo's own files (plus aider-chat).
+two pins across that repo's own files.
 """
 
 from __future__ import annotations
