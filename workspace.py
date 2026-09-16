@@ -169,6 +169,23 @@ class MalformedOutputError(ValueError):
 MALFORMED_OUTPUT_ERROR_PREFIX = "malformed coder output:"
 APPLY_FAILED_ERROR_PREFIX = "apply failed:"
 
+# WorkspaceResult.category: a small, stable vocabulary for *why* an attempt
+# failed, so a failure can be recorded and later fed back into a prompt
+# ("this issue failed before because X") without re-parsing free-form
+# `error`/`failure_detail` text. issue-worm-pro's scheduler/orchestrator
+# reuse these same constants for its own failure sites (revision-bound-
+# exhausted, review-rejected, coder-unreachable, timeout) rather than
+# defining a second vocabulary, so a category means the same thing however
+# the run was dispatched. Deliberately plain strings, not an Enum, so pro
+# can be ahead or behind this package's pin without an import breaking.
+CATEGORY_OUTPUT_SHAPE = "output_shape"
+CATEGORY_TEST_FAILURE = "test_failure"
+CATEGORY_TIMEOUT = "timeout"
+CATEGORY_REVISION_BOUND_EXHAUSTED = "revision_bound_exhausted"
+CATEGORY_REVIEW_REJECTED = "review_rejected"
+CATEGORY_CODER_UNREACHABLE = "coder_unreachable"
+CATEGORY_UNKNOWN = "unknown"
+
 
 @dataclass
 class FileChange:
@@ -191,6 +208,11 @@ class WorkspaceResult:
     test_output: str = ""
     diff_output: str = ""
     error: str | None = None
+    # One of the CATEGORY_* constants above when success is False, None
+    # otherwise. Set alongside `error` at each failure return below -
+    # `error` stays the human-readable detail, `category` is what a caller
+    # like history.record_run/cli.py's _fail groups and feeds back on.
+    category: str | None = None
     # One entry per recovery step that was needed to parse or apply this
     # attempt (see FileChange.recovery and apply_file_change's ladder), in
     # the form "<path>: <what>". Empty when the Coder's output parsed and
@@ -1847,7 +1869,11 @@ def run_revision_attempt(
         try:
             changes = parse_coder_output(coder_output, declared_files)
         except MalformedOutputError as exc:
-            return WorkspaceResult(success=False, error=f"{MALFORMED_OUTPUT_ERROR_PREFIX} {exc}")
+            return WorkspaceResult(
+                success=False,
+                error=f"{MALFORMED_OUTPUT_ERROR_PREFIX} {exc}",
+                category=CATEGORY_OUTPUT_SHAPE,
+            )
 
         recovery = [
             f"{change.path}: {change.recovery}" for change in changes if change.recovery
@@ -1861,6 +1887,7 @@ def run_revision_attempt(
             return WorkspaceResult(
                 success=False,
                 error=f"{APPLY_FAILED_ERROR_PREFIX} {exc}",
+                category=CATEGORY_OUTPUT_SHAPE,
                 recovery=recovery,
             )
 
@@ -1877,6 +1904,7 @@ def run_revision_attempt(
                 test_output=test_output,
                 diff_output=diff_output,
                 error="CI checks failed",
+                category=CATEGORY_TEST_FAILURE,
                 recovery=recovery,
             )
 

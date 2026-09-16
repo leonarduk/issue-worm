@@ -1471,6 +1471,7 @@ def test_build_records_failed_run_to_history(tmp_path, _state_dir):
     assert len(records) == 1
     assert records[0]["status"] == "failed"
     assert records[0]["task_id"] == "o_r-5"
+    assert records[0]["failure_category"] == "coder_unreachable"
 
 
 @pytest.mark.usefixtures("_pro_cli_absent")
@@ -1494,6 +1495,7 @@ def test_build_records_failed_run_when_build_coder_raises_config_error(tmp_path,
     records = _read_history_records(tmp_path)
     assert len(records) == 1
     assert records[0]["status"] == "failed"
+    assert records[0]["failure_category"] == "coder_unreachable"
 
 
 @pytest.mark.usefixtures("_pro_cli_absent")

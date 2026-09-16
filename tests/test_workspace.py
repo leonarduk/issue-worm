@@ -13,6 +13,8 @@ from unittest.mock import patch
 import pytest
 
 from workspace import (
+    CATEGORY_OUTPUT_SHAPE,
+    CATEGORY_TEST_FAILURE,
     DEFAULT_CI_TIMEOUT,
     DEFAULT_GIT_TIMEOUT,
     CLONE_TIMEOUT,
@@ -612,6 +614,7 @@ def test_run_revision_attempt_rolls_back_on_malformed_output(repo):
 
     assert result.success is False
     assert "malformed" in result.error
+    assert result.category == CATEGORY_OUTPUT_SHAPE
     assert get_current_commit(repo) == start
     assert (Path(repo) / "a.py").read_text() == "value = 1\n"
 
@@ -627,6 +630,7 @@ def test_run_revision_attempt_rolls_back_on_apply_failure(repo):
 
     assert result.success is False
     assert "apply failed" in result.error
+    assert result.category == CATEGORY_OUTPUT_SHAPE
     assert get_current_commit(repo) == start
     assert (Path(repo) / "a.py").read_text() == "value = 1\n"
 
@@ -670,6 +674,7 @@ def test_run_revision_attempt_rolls_back_on_ci_failure(repo):
 
     assert result.success is False
     assert result.error == "CI checks failed"
+    assert result.category == CATEGORY_TEST_FAILURE
     assert "AssertionError" in result.test_output
     assert get_current_commit(repo) == start
     assert (Path(repo) / "a.py").read_text() == "value = 1\n"
