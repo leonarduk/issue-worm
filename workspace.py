@@ -53,6 +53,7 @@ import shutil
 import subprocess
 import tempfile
 import sys
+import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
@@ -1777,6 +1778,134 @@ def _reject_base_environment_kwarg(func_name: str, kwargs: dict) -> None:
         )
 
 
+# run_ci_checks below runs the project's own test/lint suite (`cicaid
+# run-ci-checks --all` by default). That suite never touches a brand-new
+# GitHub Actions workflow step - so a diff that only adds/edits a
+# `.github/workflows/*.yml` step whose own shell command is simply wrong
+# (e.g. a grep pattern that doesn't match the repo's real file contents)
+# sails through verification as a passing attempt: "CI passed" is true
+# only because nothing ran the new step at all. The helpers below close
+# that gap for the common case - a step added wholesale in one diff hunk -
+# by extracting the new step's `run:` shell body from the diff and
+# actually executing it against the repo before the attempt is accepted.
+WORKFLOW_STEP_TIMEOUT = 120.0
+
+_WORKFLOW_DIFF_PATH_RE = re.compile(r"^\.github/workflows/.+\.ya?ml$")
+_RUN_BLOCK_RE = re.compile(r"^(\s*)(?:-\s*)?run:\s*[|>][+-]?\s*$")
+_RUN_INLINE_RE = re.compile(r"^(\s*)(?:-\s*)?run:\s*(\S.*)$")
+
+
+def _iter_diff_files(diff_output: str) -> list[tuple[str, list[str]]]:
+    """Split a unified diff (as produced by :func:`get_working_diff`) into
+    ``(path, lines)`` per file, where ``lines`` are that file's hunk lines
+    (including the leading +/-/space marker)."""
+    files: list[tuple[str, list[str]]] = []
+    current_path: str | None = None
+    current_lines: list[str] = []
+    for line in diff_output.splitlines():
+        if line.startswith("diff --git "):
+            if current_path is not None:
+                files.append((current_path, current_lines))
+            current_path, current_lines = None, []
+        elif line.startswith("+++ b/"):
+            current_path = line[len("+++ b/") :]
+        elif current_path is not None:
+            current_lines.append(line)
+    if current_path is not None:
+        files.append((current_path, current_lines))
+    return files
+
+
+def _extract_new_workflow_run_scripts(diff_output: str) -> list[tuple[str, str]]:
+    """Shell scripts from ``run:`` steps newly added to a
+    ``.github/workflows/*.yml`` file in ``diff_output``.
+
+    Only lines this diff actually *adds* are considered, so a step that
+    already existed and is untouched is never re-executed - just the new
+    or rewritten step(s) a Coder attempt just introduced.
+    """
+    scripts: list[tuple[str, str]] = []
+    for path, lines in _iter_diff_files(diff_output):
+        if not _WORKFLOW_DIFF_PATH_RE.match(path):
+            continue
+        added = [ln[1:] for ln in lines if ln.startswith("+") and not ln.startswith("+++")]
+        i = 0
+        while i < len(added):
+            line = added[i]
+            block_match = _RUN_BLOCK_RE.match(line)
+            if block_match:
+                indent = len(block_match.group(1))
+                i += 1
+                body_lines = []
+                while i < len(added) and (
+                    added[i].strip() == "" or len(added[i]) - len(added[i].lstrip()) > indent
+                ):
+                    body_lines.append(added[i])
+                    i += 1
+                script = textwrap.dedent("\n".join(body_lines)).strip("\n")
+                if script.strip():
+                    scripts.append((path, script))
+                continue
+            inline_match = _RUN_INLINE_RE.match(line)
+            if inline_match and inline_match.group(2)[0] not in "|>":
+                scripts.append((path, inline_match.group(2)))
+            i += 1
+    return scripts
+
+
+def _run_new_workflow_step_scripts(
+    repo_path: str,
+    diff_output: str,
+    extra_env: dict[str, str] | None,
+    timeout: float,
+) -> tuple[bool, str]:
+    """Execute every newly-added workflow ``run:`` step found in
+    ``diff_output`` against ``repo_path``, in the same sandboxed
+    environment :func:`run_ci_checks` uses.
+
+    Returns ``(True, "")`` when there is nothing new to check. A step's
+    non-zero exit is reported the same way a failing test is - the
+    Verifier treats it as a normal failed attempt, so the Coder sees the
+    real failure output on the next revision instead of the check being
+    silently trusted.
+    """
+    scripts = _extract_new_workflow_run_scripts(diff_output)
+    if not scripts:
+        return True, ""
+    all_passed = True
+    output_parts: list[str] = []
+    with tempfile.TemporaryDirectory(
+        prefix="issue-worm-ci-home-", ignore_cleanup_errors=True
+    ) as home:
+        env = _non_interactive_env(ci_check_env(repo_path, extra_env, home=home))
+        for path, script in scripts:
+            try:
+                result = subprocess.run(
+                    ["bash", "-eo", "pipefail", "-c", script],
+                    cwd=repo_path,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    env=env,
+                    timeout=timeout,
+                )
+            except OSError as exc:
+                all_passed = False
+                output_parts.append(f"[{path}] failed to execute new workflow step: {exc}")
+                continue
+            except subprocess.TimeoutExpired:
+                all_passed = False
+                output_parts.append(f"[{path}] new workflow step timed out after {timeout}s")
+                continue
+            status = "passed" if result.returncode == 0 else "FAILED"
+            output_parts.append(
+                f"[{path}] new workflow step {status}:\n{result.stdout}{result.stderr}"
+            )
+            if result.returncode != 0:
+                all_passed = False
+    return all_passed, "\n".join(output_parts)
+
+
 def run_ci_checks(
     repo_path: str,
     command: list[str] | None = None,
@@ -1904,6 +2033,20 @@ def run_revision_attempt(
                 test_output=test_output,
                 diff_output=diff_output,
                 error="CI checks failed",
+                category=CATEGORY_TEST_FAILURE,
+                recovery=recovery,
+            )
+
+        workflow_passed, workflow_output = _run_new_workflow_step_scripts(
+            repo_path, diff_output, extra_env, WORKFLOW_STEP_TIMEOUT
+        )
+        if not workflow_passed:
+            combined_output = "\n\n".join(part for part in (test_output, workflow_output) if part)
+            return WorkspaceResult(
+                success=False,
+                test_output=combined_output,
+                diff_output=diff_output,
+                error="newly added GitHub Actions workflow step failed when run against the repo",
                 category=CATEGORY_TEST_FAILURE,
                 recovery=recovery,
             )

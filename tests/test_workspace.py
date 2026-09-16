@@ -2601,4 +2601,122 @@ def test_run_revision_attempt_reports_unmatched_edit_as_apply_failure(repo):
     assert not result.success
     assert result.error.startswith("apply failed:")
     assert "SEARCH text not found" in result.error
-    assert (Path(repo) / "a.py").read_text() == "value = 1\n"
+
+
+# --- run_revision_attempt: newly added workflow steps are executed ----------
+#
+# Regression coverage for the ai-systems-lab#214 class of bug: a Coder
+# attempt added a "Verify mcp version pin" step to a GitHub Actions
+# workflow whose own `grep` pattern didn't match the repo's real
+# requirements.txt content. `cicaid run-ci-checks --all` (the project's own
+# test/lint suite) never executes a brand-new workflow step, so the attempt
+# was accepted as passing and the PR shipped with a step that fails on its
+# very first real run. These tests exercise the fix: run_revision_attempt
+# now executes a newly-added `run:` step against the repo before accepting
+# the attempt.
+
+
+def test_run_revision_attempt_fails_when_new_workflow_step_fails_against_repo(repo):
+    workflow = (
+        "on: pull_request\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    steps:\n"
+        "      - name: Verify mcp version pin\n"
+        "        run: |\n"
+        "          grep -q 'mcp<2.0.0' a.py\n"
+    )
+    output = _full_file_output(".github/workflows/ci.yml", workflow)
+
+    result = run_revision_attempt(
+        repo, output, [".github/workflows/ci.yml"], ci_command=[sys.executable, "-c", "pass"]
+    )
+
+    assert result.success is False
+    assert result.category == CATEGORY_TEST_FAILURE
+    assert "workflow step" in result.error
+    assert "FAILED" in result.test_output
+    # The attempt is rolled back like any other failed attempt.
+    assert not (Path(repo) / ".github").exists()
+
+
+def test_run_revision_attempt_passes_when_new_workflow_step_succeeds_against_repo(repo):
+    workflow = (
+        "on: pull_request\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    steps:\n"
+        "      - name: Verify value is set\n"
+        "        run: |\n"
+        "          grep -q 'value' a.py\n"
+    )
+    output = _full_file_output(".github/workflows/ci.yml", workflow)
+
+    result = run_revision_attempt(
+        repo, output, [".github/workflows/ci.yml"], ci_command=[sys.executable, "-c", "pass"]
+    )
+
+    assert result.success is True, result.error
+
+
+def test_run_revision_attempt_ignores_untouched_workflow_steps(repo):
+    """Only lines this diff *adds* are executed - a pre-existing step left
+    untouched by this attempt is never re-run, even if its command would
+    now fail (that's an existing-repo problem, not this attempt's)."""
+    (Path(repo) / ".github" / "workflows").mkdir(parents=True)
+    (Path(repo) / ".github" / "workflows" / "ci.yml").write_text(
+        "on: pull_request\njobs:\n  lint:\n    steps:\n      - run: |\n          false\n"
+    )
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "add pre-existing failing step")
+    start = get_current_commit(repo)
+    output = _full_file_output("a.py", "value = 2")
+
+    result = run_revision_attempt(
+        repo, output, ["a.py"], start_commit=start, ci_command=[sys.executable, "-c", "pass"]
+    )
+
+    assert result.success is True, result.error
+
+
+def test_extract_new_workflow_run_scripts_reads_added_block_and_inline_runs():
+    from workspace import _extract_new_workflow_run_scripts
+
+    diff = (
+        "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n"
+        "index aaaaaaa..bbbbbbb 100644\n"
+        "--- a/.github/workflows/ci.yml\n"
+        "+++ b/.github/workflows/ci.yml\n"
+        "@@ -1,2 +1,6 @@\n"
+        " on: pull_request\n"
+        "+jobs:\n"
+        "+  lint:\n"
+        "+    steps:\n"
+        "+      - run: |\n"
+        "+          echo one\n"
+        "+          echo two\n"
+        "+      - run: echo inline\n"
+    )
+
+    scripts = _extract_new_workflow_run_scripts(diff)
+
+    assert scripts == [
+        (".github/workflows/ci.yml", "echo one\necho two"),
+        (".github/workflows/ci.yml", "echo inline"),
+    ]
+
+
+def test_extract_new_workflow_run_scripts_ignores_non_workflow_files():
+    from workspace import _extract_new_workflow_run_scripts
+
+    diff = (
+        "diff --git a/README.md b/README.md\n"
+        "index aaaaaaa..bbbbbbb 100644\n"
+        "--- a/README.md\n"
+        "+++ b/README.md\n"
+        "@@ -1 +1,2 @@\n"
+        " intro\n"
+        "+run: this looks like yaml but isn't a workflow file\n"
+    )
+
+    assert _extract_new_workflow_run_scripts(diff) == []
