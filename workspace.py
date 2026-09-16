@@ -1567,7 +1567,8 @@ WORM_GITIGNORE_PATTERNS = ("/.issue-worm/", ".env")
 def ensure_gitignored(
     repo_path: str, patterns: tuple[str, ...] = WORM_GITIGNORE_PATTERNS
 ) -> None:
-    """Append any of `patterns` missing from `repo_path`'s .gitignore.
+    """Append any of `patterns` missing from `repo_path`'s local, untracked
+    ``.git/info/exclude`` — never the tracked ``.gitignore``.
 
     A repo-in-place WORKSPACE_ROOT — the private-repo setup documented in
     :func:`ensure_base_clone`, and the Scheduler's own default of "." — is
@@ -1577,20 +1578,45 @@ def ensure_gitignored(
     has the Scheduler skip the pass every single time: a self-inflicted
     lockout that previously took a manual .gitignore edit to clear.
 
-    Best-effort: a .gitignore that can't be read or written is logged and
-    left alone rather than failing the caller's pass over it.
+    An earlier version of this function wrote to the tracked ``.gitignore``
+    instead. That edit was itself an uncommitted change, so it was wiped
+    the moment :func:`refresh_to_main`'s ``git reset --hard`` ran — turning
+    the very lockout this function exists to prevent into one that
+    reappears on the *second* dispatch of every pass, forever, because
+    ``ensure_gitignored`` only runs once per pass while the bookkeeping
+    files it's supposed to hide get rewritten after every dispatch.
+    ``.git/info/exclude`` is local to this checkout and untouched by
+    ``git reset``/``checkout``/``clean``, and — being untracked itself —
+    never shows up in ``git status`` for :func:`_workspace_is_dirty` to
+    trip on, so nothing needs to commit it.
+
+    Best-effort: resolved via ``git rev-parse --git-path info/exclude`` so
+    it works whether ``.git`` is an ordinary directory or (in a worktree)
+    a file pointing elsewhere. If ``repo_path`` isn't a git checkout at all
+    (or the exclude file can't be read/written), this is logged and left
+    alone rather than failing the caller's pass over it.
     """
-    gitignore_path = Path(repo_path) / ".gitignore"
+    result = _run_git(
+        repo_path, "rev-parse", "--git-path", "info/exclude", check=False
+    )
+    if result.returncode != 0:
+        logger.warning(
+            "Could not resolve .git/info/exclude under %s (%s); leaving "
+            "it untouched",
+            repo_path,
+            result.stderr.strip(),
+        )
+        return
+    exclude_path = Path(repo_path) / result.stdout.strip()
     try:
+        exclude_path.parent.mkdir(parents=True, exist_ok=True)
         existing = (
-            gitignore_path.read_text(encoding="utf-8")
-            if gitignore_path.exists()
-            else ""
+            exclude_path.read_text(encoding="utf-8") if exclude_path.exists() else ""
         )
     except OSError as exc:
         logger.warning(
-            "Could not read %s (%s); leaving .gitignore untouched",
-            gitignore_path,
+            "Could not read %s (%s); leaving it untouched",
+            exclude_path,
             exc,
         )
         return
@@ -1600,13 +1626,13 @@ def ensure_gitignored(
         return
     prefix = "\n" if existing and not existing.endswith("\n") else ""
     try:
-        with gitignore_path.open("a", encoding="utf-8") as f:
+        with exclude_path.open("a", encoding="utf-8") as f:
             f.write(prefix + "\n".join(missing) + "\n")
     except OSError as exc:
         logger.warning(
-            "Could not add %s to %s (%s); leaving .gitignore untouched",
+            "Could not add %s to %s (%s); leaving it untouched",
             missing,
-            gitignore_path,
+            exclude_path,
             exc,
         )
 
