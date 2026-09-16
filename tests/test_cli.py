@@ -1432,6 +1432,7 @@ def test_build_records_completed_run_to_history(tmp_path, _state_dir):
     assert record["source"] == "cli"
     assert record["status"] == "completed"
     assert record["description"] == "it works"
+    assert record["failure_category"] is None
     assert "type" not in record
 
     # The fields mirroring issue-worm-pro's TaskRun (its #509), which the
@@ -1502,7 +1503,11 @@ def test_build_records_failed_run_when_build_coder_raises_config_error(tmp_path,
 def test_build_records_failed_run_to_history_on_exception(tmp_path, _state_dir):
     """A crash mid-build (e.g. the Coder erroring) is still recorded as
     failed, and the original exception still propagates - matching the
-    registry's own `finish(..., "failed")` behaviour on the same path."""
+    registry's own `finish(..., "failed")` behaviour on the same path.
+
+    This crash never goes through `_fail()`, so it's also the path that
+    pins `failure_category`'s fallback to "unknown" rather than silently
+    recording None for a failed run (#400 review)."""
     ready = ReviewResult(ready=True, files=["a.py"], done="it works")
     with patch.object(
         sys, "argv", ["issue-worm", "build", "5", "--repo", "o/r"]
@@ -1518,6 +1523,7 @@ def test_build_records_failed_run_to_history_on_exception(tmp_path, _state_dir):
     records = _read_history_records(tmp_path)
     assert len(records) == 1
     assert records[0]["status"] == "failed"
+    assert records[0]["failure_category"] == "unknown"
 
 
 @pytest.mark.usefixtures("_pro_cli_absent")

@@ -33,6 +33,7 @@ from version_checker import PACKAGE_NAME, check_and_prompt, installed_version
 from workspace import (
     CATEGORY_CODER_UNREACHABLE,
     CATEGORY_OUTPUT_SHAPE,
+    CATEGORY_UNKNOWN,
     FileChange,
     MalformedOutputError,
     WorkspaceError,
@@ -543,7 +544,15 @@ def _run_build(args, config: dict) -> int:
                     finished_at=datetime.now(timezone.utc).isoformat(),
                     workspace=repo_path,
                     command="build",
-                    failure_category=None if success else failure_category,
+                    # A failed run always gets *some* category, even when
+                    # the failure never went through _fail() - e.g. an
+                    # uncaught exception mid-build (see
+                    # test_build_records_failed_run_to_history_on_exception)
+                    # - so a failed history line never silently reads as
+                    # "no category" (DeepSeek review on #400).
+                    failure_category=(
+                        None if success else (failure_category or CATEGORY_UNKNOWN)
+                    ),
                 ),
                 history_path=history_path,
             )
