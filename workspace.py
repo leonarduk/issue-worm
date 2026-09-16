@@ -1785,14 +1785,31 @@ def _reject_base_environment_kwarg(func_name: str, kwargs: dict) -> None:
 # (e.g. a grep pattern that doesn't match the repo's real file contents)
 # sails through verification as a passing attempt: "CI passed" is true
 # only because nothing ran the new step at all. The helpers below close
-# that gap for the common case - a step added wholesale in one diff hunk -
-# by extracting the new step's `run:` shell body from the diff and
-# actually executing it against the repo before the attempt is accepted.
+# that gap by extracting each `run:` step this diff touched - added
+# wholesale, or an existing step whose body/shell was edited - from the
+# diff's post-apply content and actually executing it against the repo
+# before the attempt is accepted.
 WORKFLOW_STEP_TIMEOUT = 120.0
 
 _WORKFLOW_DIFF_PATH_RE = re.compile(r"^\.github/workflows/.+\.ya?ml$")
 _RUN_BLOCK_RE = re.compile(r"^(\s*)(?:-\s*)?run:\s*[|>][+-]?\s*$")
 _RUN_INLINE_RE = re.compile(r"^(\s*)(?:-\s*)?run:\s*(\S.*)$")
+_STEP_START_RE = re.compile(r"^(\s*)-\s")
+_SHELL_RE = re.compile(r"^\s*shell:\s*(\S+)\s*$")
+
+# Commands used to execute an extracted step body, keyed by its `shell:`
+# value (GitHub Actions default, unset, is bash on Linux runners - the
+# environment this pipeline actually targets). A shell with no entry here
+# (pwsh, powershell, cmd, a custom `shell:` template, ...) is skipped
+# rather than run under the wrong interpreter, which would just produce a
+# false rejection unrelated to the step's own correctness.
+_SHELL_COMMANDS: dict[str | None, list[str]] = {
+    None: ["bash", "-eo", "pipefail", "-c"],
+    "bash": ["bash", "-eo", "pipefail", "-c"],
+    "sh": ["sh", "-e", "-c"],
+    "python": [sys.executable, "-c"],
+    "python3": [sys.executable, "-c"],
+}
 
 
 def _iter_diff_files(diff_output: str) -> list[tuple[str, list[str]]]:
@@ -1816,39 +1833,97 @@ def _iter_diff_files(diff_output: str) -> list[tuple[str, list[str]]]:
     return files
 
 
-def _extract_new_workflow_run_scripts(diff_output: str) -> list[tuple[str, str]]:
-    """Shell scripts from ``run:`` steps newly added to a
-    ``.github/workflows/*.yml`` file in ``diff_output``.
+def _post_apply_lines(hunk_lines: list[str]) -> list[tuple[str, bool]]:
+    """``(text, touched)`` for a file's content as it reads *after* this
+    diff applies: removed (``-``) lines are dropped, and each surviving
+    line is tagged with whether this diff added it (vs. surrounding
+    unchanged context the diff carries for readability)."""
+    result: list[tuple[str, bool]] = []
+    for line in hunk_lines:
+        if line.startswith("+++") or line.startswith("---") or line.startswith("@@"):
+            continue
+        if line.startswith("+"):
+            result.append((line[1:], True))
+        elif line.startswith(" "):
+            result.append((line[1:], False))
+        # '-' (removed) and '\ No newline at end of file' lines: dropped.
+    return result
 
-    Only lines this diff actually *adds* are considered, so a step that
-    already existed and is untouched is never re-executed - just the new
-    or rewritten step(s) a Coder attempt just introduced.
+
+def _step_shell(lines: list[tuple[str, bool]], run_index: int) -> str | None:
+    """The `shell:` value declared on the same step as ``lines[run_index]``
+    (the step's ``run:`` key), or ``None`` if it doesn't set one -
+    ``shell:`` may appear before or after ``run:`` in the step mapping."""
+    run_text = lines[run_index][0]
+    run_indent = len(run_text) - len(run_text.lstrip())
+
+    start = 0
+    dash_indent = run_indent
+    for k in range(run_index, -1, -1):
+        text = lines[k][0]
+        indent = len(text) - len(text.lstrip())
+        if _STEP_START_RE.match(text) and indent <= run_indent:
+            start, dash_indent = k, indent
+            break
+
+    end = len(lines)
+    for k in range(start + 1, len(lines)):
+        text = lines[k][0]
+        indent = len(text) - len(text.lstrip())
+        if _STEP_START_RE.match(text) and indent <= dash_indent:
+            end = k
+            break
+
+    for k in range(start, end):
+        match = _SHELL_RE.match(lines[k][0])
+        if match:
+            return match.group(1)
+    return None
+
+
+def _extract_new_workflow_run_scripts(
+    diff_output: str,
+) -> list[tuple[str, str, str | None]]:
+    """``(path, script, shell)`` for each ``run:`` step this diff touched
+    in a ``.github/workflows/*.yml`` file - added wholesale, or an
+    existing step whose body or ``shell:`` this diff edited.
+
+    A step is only included when at least one line of it (its ``run:``
+    key, its body, or its ``shell:`` key) is a line this diff actually
+    *adds* - an untouched step that merely sits near a real change (and so
+    appears as surrounding context) is never re-executed.
     """
-    scripts: list[tuple[str, str]] = []
-    for path, lines in _iter_diff_files(diff_output):
+    scripts: list[tuple[str, str, str | None]] = []
+    for path, hunk_lines in _iter_diff_files(diff_output):
         if not _WORKFLOW_DIFF_PATH_RE.match(path):
             continue
-        added = [ln[1:] for ln in lines if ln.startswith("+") and not ln.startswith("+++")]
+        lines = _post_apply_lines(hunk_lines)
         i = 0
-        while i < len(added):
-            line = added[i]
-            block_match = _RUN_BLOCK_RE.match(line)
+        while i < len(lines):
+            text, touched = lines[i]
+            block_match = _RUN_BLOCK_RE.match(text)
             if block_match:
                 indent = len(block_match.group(1))
+                step_touched = touched
                 i += 1
                 body_lines = []
-                while i < len(added) and (
-                    added[i].strip() == "" or len(added[i]) - len(added[i].lstrip()) > indent
-                ):
-                    body_lines.append(added[i])
-                    i += 1
+                while i < len(lines):
+                    btext, btouched = lines[i]
+                    if btext.strip() == "" or len(btext) - len(btext.lstrip()) > indent:
+                        body_lines.append(btext)
+                        step_touched = step_touched or btouched
+                        i += 1
+                    else:
+                        break
                 script = textwrap.dedent("\n".join(body_lines)).strip("\n")
-                if script.strip():
-                    scripts.append((path, script))
+                if step_touched and script.strip():
+                    shell = _step_shell(lines, i - len(body_lines) - 1)
+                    scripts.append((path, script, shell))
                 continue
-            inline_match = _RUN_INLINE_RE.match(line)
-            if inline_match and inline_match.group(2)[0] not in "|>":
-                scripts.append((path, inline_match.group(2)))
+            inline_match = _RUN_INLINE_RE.match(text)
+            if inline_match and touched:
+                shell = _step_shell(lines, i)
+                scripts.append((path, inline_match.group(2), shell))
             i += 1
     return scripts
 
@@ -1859,15 +1934,19 @@ def _run_new_workflow_step_scripts(
     extra_env: dict[str, str] | None,
     timeout: float,
 ) -> tuple[bool, str]:
-    """Execute every newly-added workflow ``run:`` step found in
-    ``diff_output`` against ``repo_path``, in the same sandboxed
+    """Execute every workflow ``run:`` step this diff touched, found in
+    ``diff_output``, against ``repo_path``, in the same sandboxed
     environment :func:`run_ci_checks` uses.
 
-    Returns ``(True, "")`` when there is nothing new to check. A step's
+    Returns ``(True, "")`` when there is nothing to check. A step's
     non-zero exit is reported the same way a failing test is - the
     Verifier treats it as a normal failed attempt, so the Coder sees the
     real failure output on the next revision instead of the check being
-    silently trusted.
+    silently trusted. A step under a ``shell:`` this helper can't run
+    (anything but bash/sh/python - see :data:`_SHELL_COMMANDS`) is noted
+    but does not fail the attempt: running it under the wrong interpreter
+    would produce a false rejection unrelated to the step's own
+    correctness.
     """
     scripts = _extract_new_workflow_run_scripts(diff_output)
     if not scripts:
@@ -1878,10 +1957,17 @@ def _run_new_workflow_step_scripts(
         prefix="issue-worm-ci-home-", ignore_cleanup_errors=True
     ) as home:
         env = _non_interactive_env(ci_check_env(repo_path, extra_env, home=home))
-        for path, script in scripts:
+        for path, script, shell in scripts:
+            command = _SHELL_COMMANDS.get(shell)
+            if command is None:
+                output_parts.append(
+                    f"[{path}] skipped new/changed workflow step: "
+                    f"unsupported shell {shell!r}"
+                )
+                continue
             try:
                 result = subprocess.run(
-                    ["bash", "-eo", "pipefail", "-c", script],
+                    [*command, script],
                     cwd=repo_path,
                     capture_output=True,
                     text=True,

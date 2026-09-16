@@ -2660,7 +2660,7 @@ def test_run_revision_attempt_passes_when_new_workflow_step_succeeds_against_rep
 
 
 def test_run_revision_attempt_ignores_untouched_workflow_steps(repo):
-    """Only lines this diff *adds* are executed - a pre-existing step left
+    """Only lines this diff touches are executed - a pre-existing step left
     untouched by this attempt is never re-run, even if its command would
     now fail (that's an existing-repo problem, not this attempt's)."""
     (Path(repo) / ".github" / "workflows").mkdir(parents=True)
@@ -2677,6 +2677,84 @@ def test_run_revision_attempt_ignores_untouched_workflow_steps(repo):
     )
 
     assert result.success is True, result.error
+
+
+def test_run_revision_attempt_executes_edited_run_body_under_unchanged_run_key(repo):
+    """A step whose `run:` key is unchanged context and only its body was
+    edited must still be detected and executed - not just a step added
+    wholesale in one hunk."""
+    workflow_path = ".github/workflows/ci.yml"
+    (Path(repo) / ".github" / "workflows").mkdir(parents=True)
+    (Path(repo) / workflow_path).write_text(
+        "on: pull_request\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    steps:\n"
+        "      - name: Sanity check\n"
+        "        run: |\n"
+        "          true\n"
+    )
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "add workflow with passing step")
+    start = get_current_commit(repo)
+
+    old_content = (Path(repo) / workflow_path).read_text()
+    new_content = old_content.replace("          true\n", "          false\n")
+    diff = _make_diff(repo, old_content, new_content, path=workflow_path)
+    output = _diff_output(workflow_path, diff)
+
+    result = run_revision_attempt(
+        repo,
+        output,
+        [workflow_path],
+        start_commit=start,
+        ci_command=[sys.executable, "-c", "pass"],
+    )
+
+    assert result.success is False
+    assert result.category == CATEGORY_TEST_FAILURE
+    assert "workflow step" in result.error
+
+
+def test_run_revision_attempt_skips_new_step_with_unsupported_shell(repo):
+    """A step under a `shell:` this helper doesn't know how to run (pwsh,
+    here) must not be force-executed under bash - that would just be a
+    false rejection unrelated to the step's own correctness."""
+    workflow = (
+        "on: pull_request\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    steps:\n"
+        "      - name: Windows only check\n"
+        "        shell: pwsh\n"
+        "        run: |\n"
+        "          Write-Host 'not valid bash'\n"
+    )
+    output = _full_file_output(".github/workflows/ci.yml", workflow)
+
+    result = run_revision_attempt(
+        repo, output, [".github/workflows/ci.yml"], ci_command=[sys.executable, "-c", "pass"]
+    )
+
+    assert result.success is True, result.error
+
+
+def test_run_revision_attempt_reports_combined_ci_and_workflow_output_on_workflow_failure(repo):
+    workflow = (
+        "on: pull_request\njobs:\n  lint:\n    steps:\n      - run: |\n          false\n"
+    )
+    output = _full_file_output(".github/workflows/ci.yml", workflow)
+
+    result = run_revision_attempt(
+        repo,
+        output,
+        [".github/workflows/ci.yml"],
+        ci_command=[sys.executable, "-c", "print('ci passed marker')"],
+    )
+
+    assert result.success is False
+    assert "ci passed marker" in result.test_output
+    assert "FAILED" in result.test_output
 
 
 def test_extract_new_workflow_run_scripts_reads_added_block_and_inline_runs():
@@ -2701,9 +2779,33 @@ def test_extract_new_workflow_run_scripts_reads_added_block_and_inline_runs():
     scripts = _extract_new_workflow_run_scripts(diff)
 
     assert scripts == [
-        (".github/workflows/ci.yml", "echo one\necho two"),
-        (".github/workflows/ci.yml", "echo inline"),
+        (".github/workflows/ci.yml", "echo one\necho two", None),
+        (".github/workflows/ci.yml", "echo inline", None),
     ]
+
+
+def test_extract_new_workflow_run_scripts_reads_shell_key(repo):
+    from workspace import _extract_new_workflow_run_scripts
+
+    diff = (
+        "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n"
+        "index aaaaaaa..bbbbbbb 100644\n"
+        "--- a/.github/workflows/ci.yml\n"
+        "+++ b/.github/workflows/ci.yml\n"
+        "@@ -1,2 +1,6 @@\n"
+        " on: pull_request\n"
+        "+jobs:\n"
+        "+  lint:\n"
+        "+    steps:\n"
+        "+      - name: Windows check\n"
+        "+        shell: pwsh\n"
+        "+        run: |\n"
+        "+          Write-Host hi\n"
+    )
+
+    scripts = _extract_new_workflow_run_scripts(diff)
+
+    assert scripts == [(".github/workflows/ci.yml", "Write-Host hi", "pwsh")]
 
 
 def test_extract_new_workflow_run_scripts_ignores_non_workflow_files():
