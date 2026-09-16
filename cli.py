@@ -31,6 +31,9 @@ from registry import finish, heartbeat, list_runs, register
 from review import ReviewResult, draft_implementation_notes, review_issue
 from version_checker import PACKAGE_NAME, check_and_prompt, installed_version
 from workspace import (
+    CATEGORY_CODER_UNREACHABLE,
+    CATEGORY_OUTPUT_SHAPE,
+    CATEGORY_UNKNOWN,
     FileChange,
     MalformedOutputError,
     WorkspaceError,
@@ -348,6 +351,13 @@ class _FreeBuildRun:
     finished_at: str | None = None
     workspace: str | None = None
     command: str | None = None
+    # One of workspace.py's CATEGORY_* constants, set when status is
+    # "failed" (None on success or for history lines written before this
+    # field existed - #399). Mirrors the field issue-worm-pro's TaskRun
+    # gains in its own #1337, same name, so a free- and pro-recorded
+    # failure group identically wherever history.load_runs()'s dicts are
+    # read back (a future retry's "this issue failed before because X").
+    failure_category: str | None = None
 
 
 def _run_build(args, config: dict) -> int:
@@ -410,7 +420,16 @@ def _run_build(args, config: dict) -> int:
     # as far as attempting the work).
     progress_reporter.start(args.repo, issue_number)
 
-    def _fail(message: str, code: int = 1) -> int:
+    # Set by _fail() below and read back by the try/finally's record_run()
+    # call, so a failed build's history line carries *why* it failed
+    # (one of workspace.CATEGORY_*) alongside the free-text failure_detail
+    # GitHub comment - a caller like a future dispatch can filter/group on
+    # this without re-parsing prose (#399).
+    failure_category: str | None = None
+
+    def _fail(message: str, code: int = 1, category: str | None = None) -> int:
+        nonlocal failure_category
+        failure_category = category
         print(f"✗ {message}", file=sys.stderr)
         progress_reporter.finish(args.repo, issue_number, failure_detail=message)
         return code
@@ -460,7 +479,7 @@ def _run_build(args, config: dict) -> int:
         try:
             coder = build_coder(coder_config)
         except CoderConfigError as exc:
-            return _fail(str(exc))
+            return _fail(str(exc), category=CATEGORY_CODER_UNREACHABLE)
         task = f"FILES: {', '.join(review.files)}\nDONE: {review.done}\n\n{body}"
         heartbeat(task_id, phase="coder")
         progress_reporter.record_stage_start(args.repo, issue_number, "coder")
@@ -470,7 +489,10 @@ def _run_build(args, config: dict) -> int:
             args.repo, issue_number, "coder", time.monotonic() - coder_started
         )
         if not output:
-            return _fail("The Coder produced no output — is Ollama reachable?")
+            return _fail(
+                "The Coder produced no output — is Ollama reachable?",
+                category=CATEGORY_CODER_UNREACHABLE,
+            )
 
         heartbeat(task_id, phase="apply")
         try:
@@ -478,7 +500,7 @@ def _run_build(args, config: dict) -> int:
             for change in changes:
                 apply_file_change(repo_path, change)
         except (MalformedOutputError, WorkspaceError, OSError) as exc:
-            return _fail(str(exc))
+            return _fail(str(exc), category=CATEGORY_OUTPUT_SHAPE)
 
         print(f"✓ Applied changes to {len(changes)} file(s) in {repo_path}:")
         for change in changes:
@@ -522,6 +544,15 @@ def _run_build(args, config: dict) -> int:
                     finished_at=datetime.now(timezone.utc).isoformat(),
                     workspace=repo_path,
                     command="build",
+                    # A failed run always gets *some* category, even when
+                    # the failure never went through _fail() - e.g. an
+                    # uncaught exception mid-build (see
+                    # test_build_records_failed_run_to_history_on_exception)
+                    # - so a failed history line never silently reads as
+                    # "no category" (DeepSeek review on #400).
+                    failure_category=(
+                        None if success else (failure_category or CATEGORY_UNKNOWN)
+                    ),
                 ),
                 history_path=history_path,
             )
