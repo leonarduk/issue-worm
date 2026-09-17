@@ -84,6 +84,7 @@ sync with the latest tag on every release.
 | `CODER_MODEL_SOURCE` | Talks to | Required env vars |
 |---|---|---|
 | `local` (default) | A local/self-hosted Ollama instance's `/api/generate`. | `CODER_TARGETS` (see below); optionally `CODER_OLLAMA_ENDPOINT` / `CODER_OLLAMA_MODEL` to override per role. |
+| `lmstudio` | A local [LM Studio](https://lmstudio.ai) server's OpenAI-compatible `/v1/chat/completions` — the same client as `remote`, with local defaults and no API key. | None. Optionally `LMSTUDIO_ENDPOINT` (default `http://localhost:1234`, no trailing `/v1`) and `LMSTUDIO_MODEL` (default: the first model LM Studio's `/v1/models` reports, preferring one whose name contains `coder`). |
 | `remote` | Any OpenAI-compatible `/v1/chat/completions` endpoint — OpenAI itself, a self-hosted vLLM/SGLang box, or an Ollama instance serving the OpenAI API. | `REMOTE_LLM_ENDPOINT` (no trailing `/v1` — that's appended automatically), `REMOTE_LLM_MODEL`, `REMOTE_LLM_API_KEY`. |
 | `cloud` | DeepSeek's API (`https://api.deepseek.com`), which is itself OpenAI-compatible, so it reuses the same `remote` client with DeepSeek's endpoint/model as the default. | `DEEPSEEK_API_KEY`; optionally `DEEPSEEK_MODEL` (default `deepseek-v4-flash`) and `CODER_MAX_TOKENS` (output-token cap sent as `max_tokens`; default `32768` for `cloud`, not sent for `remote` unless set). |
 | `claude` | Not implemented by this free engine's `build` coder yet. Setting it fails fast with an explanatory error rather than silently falling back to `local`. | — |
@@ -92,7 +93,13 @@ An unset `CODER_MODEL_SOURCE` defaults to `local` — today's original
 behaviour, unchanged. Setting `remote` or `cloud` without its required env
 var(s) fails the build immediately with a message naming the missing
 variable, rather than constructing a coder that talks to an endpoint that
-isn't there.
+isn't there. `lmstudio` needs no variables at all, but fails the same way
+when no model can be resolved (LM Studio not running, or nothing loaded).
+
+`local` and `lmstudio` are the two fully-local options — the code never
+leaves the machine and there is no per-token cost. They use the same env
+var names as `cicaid-pro`'s reviewer side, so one `.env` configures both
+(see `.env-example-local` / `.env-example-lmstudio` in `issue-worm-pro`).
 
 This is what makes `remote`/`cloud` usable on a GitHub-hosted runner,
 which has no local Ollama reachable — see the Action's `runs-on` options
