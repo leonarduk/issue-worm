@@ -1841,6 +1841,14 @@ _VAR_ASSIGN_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=", re.M
 _VAR_LOOP_RE = re.compile(r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\b")
 _VAR_READ_RE = re.compile(r"\bread\s+(?:-\S+\s+)*([A-Za-z_][A-Za-z0-9_]*)")
 
+# The python equivalent of a `$VAR` reference: `os.environ["X"]`,
+# `os.environ.get("X")` and `os.getenv("X")`. A trailing comma means the
+# call supplies its own default, so an unset name is not a problem there.
+_PY_ENV_READ_RE = re.compile(
+    r"""os\.(?:environ\s*\[\s*|environ\s*\.\s*get\s*\(\s*|getenv\s*\(\s*)"""
+    r"""(?P<q>['"])(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?P=q)\s*(?P<default>,)?"""
+)
+
 # Names the shell itself provides, so a reference to one is not evidence
 # the step needs Actions context we can't supply.
 _SHELL_PROVIDED_VARS = frozenset(
@@ -1860,8 +1868,16 @@ def _unsupported_step_context(
     if _ACTIONS_EXPRESSION_RE.search(script):
         return "it uses a ${{ }} expression the Actions runtime would expand"
     if shell in ("python", "python3"):
-        # `$VAR` isn't syntax in a python body; the expression check above
-        # is the only Actions-context question that applies to one.
+        # `$VAR` isn't syntax in a python body, but a python step reads the
+        # same Actions variables through `os.environ` - and unset,
+        # `os.environ["GITHUB_OUTPUT"]` is a KeyError, so the step fails
+        # for a reason that has nothing to do with what it checks. The
+        # `.get`/`getenv` forms that pass a default handle absence
+        # themselves, so they are not evidence of missing context.
+        for match in _PY_ENV_READ_RE.finditer(script):
+            name = match.group("name")
+            if name not in env and not match.group("default"):
+                return f"it reads os.environ[{name!r}], which this sandbox does not define"
         return None
     defined = (
         set(env)

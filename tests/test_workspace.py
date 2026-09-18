@@ -3121,6 +3121,17 @@ def test_run_revision_attempt_reports_every_step_when_one_of_several_fails(repo)
         # expanded by Actions before python ever runs.
         ("import os\nprint('$NOT_A_SHELL_VAR')", "python", None),
         ("print('${{ github.sha }}')", "python", "expression"),
+        # ... but a python step reads the same Actions vars via os.environ,
+        # where an unset name is a KeyError rather than an empty string.
+        ('import os\nprint(os.environ["GITHUB_OUTPUT"])', "python", "GITHUB_OUTPUT"),
+        ("import os\nprint(os.environ['GITHUB_ENV'])", "python3", "GITHUB_ENV"),
+        ('import os\nprint(os.getenv("GITHUB_SHA"))', "python", "GITHUB_SHA"),
+        ('import os\nprint(os.environ.get("GITHUB_REF"))', "python", "GITHUB_REF"),
+        # A supplied default means the step handles absence itself.
+        ('import os\nprint(os.getenv("NOPE", "fallback"))', "python", None),
+        ('import os\nprint(os.environ.get("NOPE", None))', "python", None),
+        # Defined here, so judgeable.
+        ('import os\nprint(os.environ["PATH"])', "python", None),
     ],
 )
 def test_unsupported_step_context(script, shell, expected):
@@ -3132,6 +3143,60 @@ def test_unsupported_step_context(script, shell, expected):
         assert reason is None
     else:
         assert reason is not None and expected in reason
+
+
+
+def test_run_revision_attempt_skips_python_step_reading_actions_env(repo):
+    """A python step reads Actions variables through `os.environ`, not
+    `$VAR`. Unset, `os.environ["GITHUB_OUTPUT"]` raises KeyError, so the
+    step fails for a reason unrelated to what it checks - the same false
+    rejection the shell-side variable check already avoids."""
+    workflow = (
+        "on: pull_request\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    steps:\n"
+        "      - name: Publish a value\n"
+        "        shell: python\n"
+        "        run: |\n"
+        "          import os\n"
+        '          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:\n'
+        '              fh.write("found=yes\\n")\n'
+    )
+    output = _full_file_output(".github/workflows/ci.yml", workflow)
+
+    result = run_revision_attempt(
+        repo, output, [".github/workflows/ci.yml"], ci_command=[sys.executable, "-c", "pass"]
+    )
+
+    assert result.success is True, result.error
+
+
+def test_run_revision_attempt_still_runs_python_step_checking_the_repo(repo):
+    """The python skip stays narrow: a step that only reads the repo needs
+    no Actions context, so it runs - and is rejected when its check is
+    wrong."""
+    workflow = (
+        "on: pull_request\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    steps:\n"
+        "      - name: Verify pin\n"
+        "        shell: python\n"
+        "        run: |\n"
+        "          import pathlib, sys\n"
+        "          if 'mcp<2.0.0' not in pathlib.Path('a.py').read_text():\n"
+        "              sys.exit(1)\n"
+    )
+    output = _full_file_output(".github/workflows/ci.yml", workflow)
+
+    result = run_revision_attempt(
+        repo, output, [".github/workflows/ci.yml"], ci_command=[sys.executable, "-c", "pass"]
+    )
+
+    assert result.success is False
+    assert result.category == CATEGORY_TEST_FAILURE
+    assert "workflow step" in result.error
 
 
 def test_extract_new_workflow_run_scripts_ignores_non_workflow_files():
