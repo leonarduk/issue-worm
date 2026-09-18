@@ -3130,6 +3130,16 @@ def test_run_revision_attempt_reports_every_step_when_one_of_several_fails(repo)
         # A supplied default means the step handles absence itself.
         ('import os\nprint(os.getenv("NOPE", "fallback"))', "python", None),
         ('import os\nprint(os.environ.get("NOPE", None))', "python", None),
+        # ... but a *trailing* comma supplies nothing, so it still raises.
+        ('import os\nprint(os.environ.get("NOPE",))', "python", "NOPE"),
+        ('import os\nprint(os.environ.get("NOPE", ))', "python", "NOPE"),
+        # A known, deliberate false skip: `$VAR` inside single quotes does
+        # not expand in bash, so this step is judgeable and is skipped
+        # anyway. Erring towards a skip is the safe direction - stripping
+        # quoted spans by regex would mis-span on an unbalanced apostrophe
+        # and turn this into a false *rejection*. Pinned so the behaviour
+        # is a decision rather than a surprise.
+        ("grep -q '$WANTED' a.py", "bash", "WANTED"),
         # Defined here, so judgeable.
         ('import os\nprint(os.environ["PATH"])', "python", None),
     ],
@@ -3197,6 +3207,42 @@ def test_run_revision_attempt_still_runs_python_step_checking_the_repo(repo):
     assert result.success is False
     assert result.category == CATEGORY_TEST_FAILURE
     assert "workflow step" in result.error
+
+
+
+def test_extract_new_workflow_run_scripts_keeps_diff_markers_in_a_heredoc(repo):
+    """A `run: |` body is free to contain lines that look like diff headers
+    - a heredoc writing out a patch is the obvious case. They are only
+    ambiguous at column zero, and a block body is always indented, so the
+    diff marker is `+` and the body survives whole."""
+    from workspace import _extract_new_workflow_run_scripts
+
+    body = [
+        "cat <<'EOF' > patch.txt",
+        "--- a/old",
+        "+++ b/new",
+        "@@ -1 +1 @@",
+        "-gone",
+        "+added",
+        "EOF",
+        "test -s patch.txt",
+    ]
+    diff = (
+        "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n"
+        "index aaaaaaa..bbbbbbb 100644\n"
+        "--- a/.github/workflows/ci.yml\n"
+        "+++ b/.github/workflows/ci.yml\n"
+        "@@ -1,2 +1,12 @@\n"
+        " on: pull_request\n"
+        "+jobs:\n"
+        "+  lint:\n"
+        "+    steps:\n"
+        "+      - run: |\n"
+    ) + "".join(f"+          {line}\n" for line in body)
+
+    scripts = _extract_new_workflow_run_scripts(diff)
+
+    assert scripts == [(".github/workflows/ci.yml", "\n".join(body), None)]
 
 
 def test_extract_new_workflow_run_scripts_ignores_non_workflow_files():

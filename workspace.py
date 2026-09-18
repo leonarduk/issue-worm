@@ -1846,7 +1846,9 @@ _VAR_READ_RE = re.compile(r"\bread\s+(?:-\S+\s+)*([A-Za-z_][A-Za-z0-9_]*)")
 # call supplies its own default, so an unset name is not a problem there.
 _PY_ENV_READ_RE = re.compile(
     r"""os\.(?:environ\s*\[\s*|environ\s*\.\s*get\s*\(\s*|getenv\s*\(\s*)"""
-    r"""(?P<q>['"])(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?P=q)\s*(?P<default>,)?"""
+    # A comma only supplies a default when something follows it:
+    # `os.environ.get("X",)` is a trailing comma, which means no default.
+    r"""(?P<q>['"])(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?P=q)\s*(?P<default>,(?!\s*\)))?"""
 )
 
 # Names the shell itself provides, so a reference to one is not evidence
