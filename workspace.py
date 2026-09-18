@@ -1795,7 +1795,12 @@ _WORKFLOW_DIFF_PATH_RE = re.compile(r"^\.github/workflows/.+\.ya?ml$")
 _RUN_BLOCK_RE = re.compile(r"^(\s*)(?:-\s*)?run:\s*[|>][+-]?\s*$")
 _RUN_INLINE_RE = re.compile(r"^(\s*)(?:-\s*)?run:\s*(\S.*)$")
 _STEP_START_RE = re.compile(r"^(\s*)-\s")
-_SHELL_RE = re.compile(r"^\s*shell:\s*(\S+)\s*$")
+# `shell:` may be the step's first key, in which case it sits on the
+# `- ` line itself - so it allows the same optional dash the two
+# `run:` patterns above do. Without it such a step reads as having no
+# `shell:` at all and its body runs under bash, which is the false
+# rejection the unsupported-shell skip exists to avoid.
+_SHELL_RE = re.compile(r"^\s*(?:-\s*)?shell:\s*(\S+)\s*$")
 
 # Commands used to execute an extracted step body, keyed by its `shell:`
 # value (GitHub Actions default, unset, is bash on Linux runners - the

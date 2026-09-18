@@ -2808,6 +2808,81 @@ def test_extract_new_workflow_run_scripts_reads_shell_key(repo):
     assert scripts == [(".github/workflows/ci.yml", "Write-Host hi", "pwsh")]
 
 
+def test_extract_new_workflow_run_scripts_reads_shell_key_on_inline_run(repo):
+    """`shell:` is a key on the step, not on the `run:` block, so a
+    one-line `run:` carries it just as a block body does."""
+    from workspace import _extract_new_workflow_run_scripts
+
+    diff = (
+        "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n"
+        "index aaaaaaa..bbbbbbb 100644\n"
+        "--- a/.github/workflows/ci.yml\n"
+        "+++ b/.github/workflows/ci.yml\n"
+        "@@ -1,2 +1,5 @@\n"
+        " on: pull_request\n"
+        "+jobs:\n"
+        "+  lint:\n"
+        "+    steps:\n"
+        "+      - shell: python\n"
+        "+        run: print('hi')\n"
+    )
+
+    scripts = _extract_new_workflow_run_scripts(diff)
+
+    assert scripts == [(".github/workflows/ci.yml", "print('hi')", "python")]
+
+
+def test_run_revision_attempt_skips_unsupported_shell_declared_first(repo):
+    """The step's `shell:` must be found wherever it sits in the mapping.
+    Missed on the `- ` line, a pwsh step reads as having no `shell:` and
+    its body is run under bash, failing for a reason that has nothing to
+    do with the step - the false rejection the skip exists to avoid."""
+    workflow = (
+        "on: pull_request\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    steps:\n"
+        "      - shell: pwsh\n"
+        "        run: |\n"
+        "          Write-Host hi\n"
+    )
+    output = _full_file_output(".github/workflows/ci.yml", workflow)
+
+    result = run_revision_attempt(
+        repo, output, [".github/workflows/ci.yml"], ci_command=[sys.executable, "-c", "pass"]
+    )
+
+    assert result.success is True, result.error
+
+
+def test_run_revision_attempt_runs_step_under_sh_shell(repo):
+    """`sh` is one of the shells this helper can run (:data:`_SHELL_COMMANDS`),
+    so a step declaring it is executed rather than skipped - and a wrong
+    check under it rejects the attempt like any other."""
+    workflow = (
+        "on: pull_request\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    steps:\n"
+        "      - name: Check the pin\n"
+        "        shell: sh\n"
+        "        run: |\n"
+        "          echo sh-step-marker\n"
+        "          grep -q 'mcp<2.0.0' a.py\n"
+    )
+    output = _full_file_output(".github/workflows/ci.yml", workflow)
+
+    result = run_revision_attempt(
+        repo, output, [".github/workflows/ci.yml"], ci_command=[sys.executable, "-c", "pass"]
+    )
+
+    assert result.success is False
+    assert result.category == CATEGORY_TEST_FAILURE
+    assert "workflow step" in result.error
+    # Actually ran under sh, rather than being skipped as an unsupported shell.
+    assert "sh-step-marker" in result.test_output
+
+
 # --- steps this sandbox can't fairly judge are skipped, not failed -----
 #
 # An extracted body runs as a plain shell script with none of the Actions
