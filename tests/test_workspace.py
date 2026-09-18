@@ -3113,6 +3113,17 @@ def test_run_revision_attempt_reports_every_step_when_one_of_several_fails(repo)
         ("export FOO=bar\necho $FOO", "bash", None),
         ("for f in *.py; do echo $f; done", "sh", None),
         ("read -r LINE < a.py\necho $LINE", "bash", None),
+        # A parameter expansion carrying a fallback handles an unset name
+        # itself, exactly as a two-argument os.environ.get does.
+        ('echo "${WANTED:-none}"', "bash", None),
+        ('echo "${WANTED:=none}"', "bash", None),
+        ('echo "${WANTED:+set}"', "bash", None),
+        ('echo "${WANTED-none}"', "bash", None),
+        # ... but `:?` is deliberately fatal when unset, and a plain
+        # reference has no fallback at all.
+        ('echo "${WANTED:?must be set}"', "bash", "WANTED"),
+        ('echo "${WANTED?msg}"', "bash", "WANTED"),
+        ('echo "${WANTED}"', "bash", "WANTED"),
         # A declaration builtin still declares, with or without flags of
         # its own, and an inline `FOO=bar cmd` prefix is an assignment too.
         ("local FOO=bar\necho $FOO", "bash", None),
@@ -3348,6 +3359,58 @@ def test_extract_new_workflow_run_scripts_follows_a_renamed_workflow(repo):
     scripts = _extract_new_workflow_run_scripts(diff)
 
     assert scripts == [(".github/workflows/ci.yml", "echo renamed-step", None)]
+
+
+
+def test_extract_new_workflow_run_scripts_ignores_shell_key_inside_with(repo):
+    """`shell:` nested under `with:` is an input to the action being
+    invoked, not this step's interpreter. Reading it would skip a step
+    that actually runs under the default bash."""
+    from workspace import _extract_new_workflow_run_scripts
+
+    diff = (
+        "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n"
+        "index aaaaaaa..bbbbbbb 100644\n"
+        "--- a/.github/workflows/ci.yml\n"
+        "+++ b/.github/workflows/ci.yml\n"
+        "@@ -1,2 +1,8 @@\n"
+        " on: pull_request\n"
+        "+jobs:\n"
+        "+  lint:\n"
+        "+    steps:\n"
+        "+      - uses: actions/setup-python@v5\n"
+        "+        with:\n"
+        "+          shell: pwsh\n"
+        "+        run: echo hi\n"
+    )
+
+    scripts = _extract_new_workflow_run_scripts(diff)
+
+    assert scripts == [(".github/workflows/ci.yml", "echo hi", None)]
+
+
+def test_run_revision_attempt_runs_step_whose_var_has_a_default(repo):
+    """A step supplying its own fallback needs no Actions context, so it
+    runs - and is still rejected when its check is wrong against the
+    repo."""
+    workflow = (
+        "on: pull_request\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    steps:\n"
+        "      - name: Verify pin\n"
+        "        run: |\n"
+        '          grep -q "${WANTED:-mcp<2.0.0}" a.py\n'
+    )
+    output = _full_file_output(".github/workflows/ci.yml", workflow)
+
+    result = run_revision_attempt(
+        repo, output, [".github/workflows/ci.yml"], ci_command=[sys.executable, "-c", "pass"]
+    )
+
+    assert result.success is False
+    assert result.category == CATEGORY_TEST_FAILURE
+    assert "workflow step" in result.error
 
 
 def test_extract_new_workflow_run_scripts_ignores_non_workflow_files():

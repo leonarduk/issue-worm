@@ -1836,7 +1836,15 @@ _SHELL_COMMANDS: dict[str | None, list[str]] = {
 # skipped and noted, the same way an unsupported `shell:` is - a false
 # rejection would send the Coder off fixing a step that was correct.
 _ACTIONS_EXPRESSION_RE = re.compile(r"\$\{\{")
-_VAR_REF_RE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\b")
+# `${VAR:-default}` and its `:=`/`:+` siblings (and the colon-less forms)
+# supply their own fallback, so the step handles an unset name itself -
+# the same reason a two-argument `os.environ.get` does not count as
+# needing context. `${VAR:?msg}` is deliberately fatal when unset, so it
+# still counts, as does a plain `$VAR` or `${VAR}`.
+_VAR_REF_RE = re.compile(
+    r"\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)(?P<op>:?[-=+])?[^}]*\}"
+    r"|(?P<bare>[A-Za-z_][A-Za-z0-9_]*)\b)"
+)
 # `FOO=bar` at the start of a line, whether bare, as an inline prefix to a
 # command, or behind any of the declaration builtins (which may carry
 # flags of their own, as in `declare -r FOO=bar`).
@@ -1905,7 +1913,15 @@ def _unsupported_step_context(
             for name in match.group("names").split()
         }
     )
-    missing = [name for name in _VAR_REF_RE.findall(script) if name not in defined]
+    missing = [
+        name
+        for match in _VAR_REF_RE.finditer(script)
+        # A braced reference carrying a default operator supplies its own
+        # value, so it is not evidence of missing context.
+        if not match.group("op")
+        for name in [match.group("braced") or match.group("bare")]
+        if name not in defined
+    ]
     if missing:
         return f"it reads ${missing[0]}, which this sandbox does not define"
     return None
@@ -1973,8 +1989,18 @@ def _step_shell(lines: list[tuple[str, bool]], run_index: int) -> str | None:
             end = k
             break
 
+    # Only the step's *own* keys count. A `shell:` nested under `with:`
+    # belongs to the action being invoked, not to this step, and reading
+    # it would skip a step that actually runs under the default shell.
+    dash_text = lines[start][0]
+    after_dash = dash_text.find("-", dash_indent) + 1
+    key_indent = after_dash + len(dash_text[after_dash:]) - len(dash_text[after_dash:].lstrip())
+
     for k in range(start, end):
-        match = _SHELL_RE.match(lines[k][0])
+        text = lines[k][0]
+        if k != start and len(text) - len(text.lstrip()) != key_indent:
+            continue
+        match = _SHELL_RE.match(text)
         if match:
             return match.group(1)
     return None
