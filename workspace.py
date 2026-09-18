@@ -1967,7 +1967,15 @@ def _extract_new_workflow_run_scripts(
             text, touched = lines[i]
             block_match = _RUN_BLOCK_RE.match(text)
             if block_match:
-                indent = len(block_match.group(1))
+                # The block body is what is indented past the `run:` key -
+                # which is not the same as past the start of the line when
+                # `run:` is the step's first key, because the `- ` sits in
+                # between. Measuring from the line start there treats the
+                # step's own sibling keys (`env:`, `shell:`,
+                # `working-directory:`, ...) as body lines and appends them
+                # to the script, so a correct step fails on `env: command
+                # not found` - a false rejection.
+                indent = text.index("run:")
                 step_touched = touched
                 i += 1
                 body_lines = []

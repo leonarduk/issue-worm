@@ -2832,6 +2832,84 @@ def test_extract_new_workflow_run_scripts_reads_shell_key_on_inline_run(repo):
     assert scripts == [(".github/workflows/ci.yml", "print('hi')", "python")]
 
 
+def test_extract_new_workflow_run_scripts_stops_block_at_sibling_keys(repo):
+    """A `run: |` block ends where the step's other keys begin. When `run:`
+    is the step's first key the `- ` shifts it two columns right of the
+    line start, so measuring the body from the line start swallows `env:`
+    and friends into the script - and bash then fails the step on `env:
+    command not found`, a false rejection of a correct step."""
+    from workspace import _extract_new_workflow_run_scripts
+
+    diff = (
+        "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n"
+        "index aaaaaaa..bbbbbbb 100644\n"
+        "--- a/.github/workflows/ci.yml\n"
+        "+++ b/.github/workflows/ci.yml\n"
+        "@@ -1,2 +1,9 @@\n"
+        " on: pull_request\n"
+        "+jobs:\n"
+        "+  lint:\n"
+        "+    steps:\n"
+        "+      - run: |\n"
+        "+          make build\n"
+        "+        env:\n"
+        "+          FOO: bar\n"
+        "+        working-directory: src\n"
+    )
+
+    scripts = _extract_new_workflow_run_scripts(diff)
+
+    assert scripts == [(".github/workflows/ci.yml", "make build", None)]
+
+
+def test_extract_new_workflow_run_scripts_reads_shell_after_dash_line_run(repo):
+    """Same shape, with `shell:` as the trailing sibling key: it belongs to
+    the step, not to the script."""
+    from workspace import _extract_new_workflow_run_scripts
+
+    diff = (
+        "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n"
+        "index aaaaaaa..bbbbbbb 100644\n"
+        "--- a/.github/workflows/ci.yml\n"
+        "+++ b/.github/workflows/ci.yml\n"
+        "@@ -1,2 +1,7 @@\n"
+        " on: pull_request\n"
+        "+jobs:\n"
+        "+  lint:\n"
+        "+    steps:\n"
+        "+      - run: |\n"
+        "+          print('hi')\n"
+        "+        shell: python\n"
+    )
+
+    scripts = _extract_new_workflow_run_scripts(diff)
+
+    assert scripts == [(".github/workflows/ci.yml", "print('hi')", "python")]
+
+
+def test_run_revision_attempt_accepts_step_with_sibling_env_key(repo):
+    """End to end: the step's own check passes against the repo, so the
+    attempt is accepted - the trailing `env:` key must not be run as part
+    of the script."""
+    workflow = (
+        "on: pull_request\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    steps:\n"
+        "      - run: |\n"
+        "          grep -q 'value' a.py\n"
+        "        env:\n"
+        "          FOO: bar\n"
+    )
+    output = _full_file_output(".github/workflows/ci.yml", workflow)
+
+    result = run_revision_attempt(
+        repo, output, [".github/workflows/ci.yml"], ci_command=[sys.executable, "-c", "pass"]
+    )
+
+    assert result.success is True, result.error
+
+
 def test_run_revision_attempt_skips_unsupported_shell_declared_first(repo):
     """The step's `shell:` must be found wherever it sits in the mapping.
     Missed on the `- ` line, a pwsh step reads as having no `shell:` and
