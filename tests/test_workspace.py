@@ -3259,6 +3259,97 @@ def test_extract_new_workflow_run_scripts_keeps_diff_markers_in_a_heredoc(repo):
     assert scripts == [(".github/workflows/ci.yml", "\n".join(body), None)]
 
 
+
+# --- hunks stay attached to the file they came from -------------------
+#
+# `_iter_diff_files` keys off `+++ b/<path>`, which a rename with no
+# content change, a mode-only change and a deletion (`+++ /dev/null`) all
+# lack. The `diff --git` line resets the current path, so none of them can
+# leak their lines into the next file - but the whole feature gates on
+# path, so a mis-attribution would either run a step from a file that is
+# not a workflow or drop a real one. Pinned here rather than argued.
+
+
+def _mixed_diff(decoy_run):
+    """A workflow file preceded by the three header shapes that carry no
+    `+++ b/` line of their own."""
+    return (
+        "diff --git a/old_name.py b/new_name.py\n"
+        "similarity index 100%\n"
+        "rename from old_name.py\n"
+        "rename to new_name.py\n"
+        "diff --git a/perm.sh b/perm.sh\n"
+        "old mode 100644\n"
+        "new mode 100755\n"
+        "diff --git a/gone.py b/gone.py\n"
+        "deleted file mode 100644\n"
+        "index 1234567..0000000\n"
+        "--- a/gone.py\n"
+        "+++ /dev/null\n"
+        "@@ -1,2 +0,0 @@\n"
+        f"-{decoy_run}\n"
+        "-value = 1\n"
+        "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n"
+        "index aaaaaaa..bbbbbbb 100644\n"
+        "--- a/.github/workflows/ci.yml\n"
+        "+++ b/.github/workflows/ci.yml\n"
+        "@@ -1,2 +1,6 @@\n"
+        " on: pull_request\n"
+        "+jobs:\n"
+        "+  lint:\n"
+        "+    steps:\n"
+        "+      - run: echo real-step\n"
+    )
+
+
+def test_iter_diff_files_keeps_hunks_with_their_own_file():
+    from workspace import _iter_diff_files
+
+    files = _iter_diff_files(_mixed_diff("      - run: echo decoy"))
+
+    # The three headerless entries contribute no file at all, and the
+    # workflow carries only its own six hunk lines.
+    assert [path for path, _ in files] == [".github/workflows/ci.yml"]
+    assert len(files[0][1]) == 6
+    assert not any("decoy" in line for line in files[0][1])
+
+
+def test_extract_new_workflow_run_scripts_ignores_a_deleted_files_steps():
+    """A `run:` line that a diff *removes* from another file must not be
+    picked up as a step of the workflow that follows it."""
+    from workspace import _extract_new_workflow_run_scripts
+
+    scripts = _extract_new_workflow_run_scripts(_mixed_diff("      - run: echo decoy"))
+
+    assert scripts == [(".github/workflows/ci.yml", "echo real-step", None)]
+
+
+def test_extract_new_workflow_run_scripts_follows_a_renamed_workflow(repo):
+    """A renamed workflow whose body also changed is attributed to its new
+    path, which is what decides whether it is a workflow at all."""
+    from workspace import _extract_new_workflow_run_scripts
+
+    diff = (
+        "diff --git a/.github/workflows/old.yml b/.github/workflows/ci.yml\n"
+        "similarity index 60%\n"
+        "rename from .github/workflows/old.yml\n"
+        "rename to .github/workflows/ci.yml\n"
+        "index aaaaaaa..bbbbbbb 100644\n"
+        "--- a/.github/workflows/old.yml\n"
+        "+++ b/.github/workflows/ci.yml\n"
+        "@@ -1,2 +1,6 @@\n"
+        " on: pull_request\n"
+        "+jobs:\n"
+        "+  lint:\n"
+        "+    steps:\n"
+        "+      - run: echo renamed-step\n"
+    )
+
+    scripts = _extract_new_workflow_run_scripts(diff)
+
+    assert scripts == [(".github/workflows/ci.yml", "echo renamed-step", None)]
+
+
 def test_extract_new_workflow_run_scripts_ignores_non_workflow_files():
     from workspace import _extract_new_workflow_run_scripts
 
