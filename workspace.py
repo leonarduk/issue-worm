@@ -1837,9 +1837,22 @@ _SHELL_COMMANDS: dict[str | None, list[str]] = {
 # rejection would send the Coder off fixing a step that was correct.
 _ACTIONS_EXPRESSION_RE = re.compile(r"\$\{\{")
 _VAR_REF_RE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\b")
-_VAR_ASSIGN_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=", re.MULTILINE)
+# `FOO=bar` at the start of a line, whether bare, as an inline prefix to a
+# command, or behind any of the declaration builtins (which may carry
+# flags of their own, as in `declare -r FOO=bar`).
+_VAR_ASSIGN_RE = re.compile(
+    r"^\s*(?:(?:export|local|declare|readonly|typeset)\s+(?:-\S+\s+)*)?"
+    r"([A-Za-z_][A-Za-z0-9_]*)=",
+    re.MULTILINE,
+)
 _VAR_LOOP_RE = re.compile(r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\b")
-_VAR_READ_RE = re.compile(r"\bread\s+(?:-\S+\s+)*([A-Za-z_][A-Za-z0-9_]*)")
+# `read` assigns every name after its options, not just the first. Options
+# that take an argument (`-p "Enter: "`, `-d ''`) must not have that
+# argument mistaken for one of the names.
+_VAR_READ_RE = re.compile(
+    r"""\bread\s+(?:-\S+\s+(?:"[^"]*"\s+|'[^']*'\s+)?)*"""
+    r"""(?P<names>[A-Za-z_][A-Za-z0-9_]*(?:\s+[A-Za-z_][A-Za-z0-9_]*)*)"""
+)
 
 # The python equivalent of a `$VAR` reference: `os.environ["X"]`,
 # `os.environ.get("X")` and `os.getenv("X")`. A trailing comma means the
@@ -1886,7 +1899,11 @@ def _unsupported_step_context(
         | _SHELL_PROVIDED_VARS
         | set(_VAR_ASSIGN_RE.findall(script))
         | set(_VAR_LOOP_RE.findall(script))
-        | set(_VAR_READ_RE.findall(script))
+        | {
+            name
+            for match in _VAR_READ_RE.finditer(script)
+            for name in match.group("names").split()
+        }
     )
     missing = [name for name in _VAR_REF_RE.findall(script) if name not in defined]
     if missing:

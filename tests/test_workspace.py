@@ -3113,6 +3113,20 @@ def test_run_revision_attempt_reports_every_step_when_one_of_several_fails(repo)
         ("export FOO=bar\necho $FOO", "bash", None),
         ("for f in *.py; do echo $f; done", "sh", None),
         ("read -r LINE < a.py\necho $LINE", "bash", None),
+        # A declaration builtin still declares, with or without flags of
+        # its own, and an inline `FOO=bar cmd` prefix is an assignment too.
+        ("local FOO=bar\necho $FOO", "bash", None),
+        ("declare -r FOO=bar\necho $FOO", "bash", None),
+        ("readonly FOO=bar\necho $FOO", "bash", None),
+        ("typeset FOO=bar\necho $FOO", "bash", None),
+        ("FOO=bar make test\necho $FOO", "bash", None),
+        # `read` assigns every name after its options, and an option's own
+        # argument is not one of them.
+        ("read A B C < a.py\necho $A $B $C", "bash", None),
+        ('read -p "Enter: " VAR\necho $VAR', "bash", None),
+        # ... but only the names it actually assigns.
+        ("local FOO=bar\necho $OTHER", "bash", "OTHER"),
+        ('read -p "Enter: " VAR\necho $NOPE', "bash", "NOPE"),
         # Needs Actions context this sandbox can't supply.
         ("echo ${{ github.sha }}", None, "expression"),
         ("echo x >> $GITHUB_OUTPUT", None, "GITHUB_OUTPUT"),
