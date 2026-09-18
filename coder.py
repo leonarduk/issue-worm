@@ -17,13 +17,15 @@ raise, any failure is logged and reported back as `""`):
   `/api/generate` (`CODER_MODEL_SOURCE=local`).
 - `RemoteOpenAICoder` — talks to any OpenAI-compatible
   `/v1/chat/completions` endpoint (`CODER_MODEL_SOURCE=remote`, or
-  `=cloud` for the DeepSeek default — see `build_coder`).
+  `=cloud` for the DeepSeek default, or `=lmstudio` for a local LM Studio
+  server — see `build_coder`).
 
 `build_coder` is the factory that picks between them (and the
 not-yet-implemented `claude` source) based on a role's `model_source`,
-reading `REMOTE_LLM_ENDPOINT` / `REMOTE_LLM_MODEL` / `REMOTE_LLM_API_KEY`
-or `DEEPSEEK_API_KEY` / `DEEPSEEK_MODEL` from the environment — see
-`.env-example-openai` / `.env-example-deepseek` in issue-worm-pro for the
+reading `REMOTE_LLM_ENDPOINT` / `REMOTE_LLM_MODEL` / `REMOTE_LLM_API_KEY`,
+`DEEPSEEK_API_KEY` / `DEEPSEEK_MODEL`, or `LMSTUDIO_ENDPOINT` /
+`LMSTUDIO_MODEL` from the environment — see `.env-example-openai` /
+`.env-example-deepseek` / `.env-example-lmstudio` in issue-worm-pro for the
 env vars these are meant to match.
 """
 
@@ -61,6 +63,17 @@ DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
 # a FULL rewrite of several large files and stays well under DeepSeek
 # V4's documented output ceiling. Overridable via CODER_MAX_TOKENS.
 DEFAULT_DEEPSEEK_MAX_TOKENS = 32768
+
+# LM Studio serves an OpenAI-compatible API on this machine, so
+# CODER_MODEL_SOURCE=lmstudio reuses RemoteOpenAICoder with local defaults
+# and no API key, for the same reason `cloud` does with DeepSeek's. The
+# env var names deliberately match cicaid-pro's `lmstudio_common`, so one
+# .env configures both the coder here and the reviewer there (#410).
+DEFAULT_LMSTUDIO_ENDPOINT = "http://localhost:1234"
+# Seconds to wait on /v1/models when LMSTUDIO_MODEL is unset. Short on
+# purpose: it's a startup-time lookup against a server on localhost, and
+# build_coder runs before any of the build's real work.
+LMSTUDIO_MODEL_LOOKUP_TIMEOUT_SECONDS = 5
 
 
 class LocalOllamaCoder:
@@ -223,6 +236,36 @@ class CoderConfigError(ValueError):
     """
 
 
+def _discover_lmstudio_model(endpoint: str) -> str:
+    """Return a model id from LM Studio's `/v1/models`, or "" if the server
+    is unreachable or has nothing to offer.
+
+    Mirrors cicaid-pro's `lmstudio_common.get_lmstudio_model`, preference
+    for a name containing "coder" included: both tiers must resolve the
+    same server to the same model, or a build's coder and its reviewer
+    silently end up on different ones.
+    """
+    url = f"{endpoint}/v1/models"
+    try:
+        response = requests.get(url, timeout=LMSTUDIO_MODEL_LOOKUP_TIMEOUT_SECONDS)
+        response.raise_for_status()
+        models = [
+            entry["id"]
+            for entry in (response.json().get("data") or [])
+            if isinstance(entry, dict) and entry.get("id")
+        ]
+    except (requests.RequestException, ValueError, AttributeError, TypeError):
+        # Caller turns an empty result into an actionable CoderConfigError
+        # naming the endpoint, so this only needs to record the cause.
+        logger.warning("LM Studio model lookup at %s failed", url, exc_info=True)
+        return ""
+
+    for name in models:
+        if "coder" in name.lower():
+            return name
+    return models[0] if models else ""
+
+
 def build_coder(role_config) -> Coder:
     """Construct the right Coder for a role's configured model_source.
 
@@ -234,10 +277,12 @@ def build_coder(role_config) -> Coder:
         A Coder ready to call `.propose(...)`.
 
     Raises:
-        CoderConfigError: `model_source` is unknown, or is `remote`/`cloud`
-            without the environment variables it needs (see
-            `.env-example-openai` / `.env-example-deepseek` in
-            issue-worm-pro) — or is `claude`, not implemented here yet.
+        CoderConfigError: `model_source` is unknown, or is
+            `remote`/`cloud`/`lmstudio` without the environment variables
+            (or, for `lmstudio`, the reachable server) it needs (see
+            `.env-example-openai` / `.env-example-deepseek` /
+            `.env-example-lmstudio` in issue-worm-pro) — or is `claude`,
+            not implemented here yet.
     """
     model_source = getattr(role_config, "model_source", "local")
     # Global, not role-prefixed - one HTTP timeout for whichever coder this
@@ -257,6 +302,34 @@ def build_coder(role_config) -> Coder:
             endpoint=getattr(role_config, "ollama_endpoint", None),
             model=getattr(role_config, "ollama_model", None),
             timeout=timeout,
+        )
+
+    if model_source == "lmstudio":
+        # Unlike `remote`, the zero-config case is the normal one here: the
+        # local server has a well-known port, needs no API key, and can name
+        # its own model — so only an unreachable/empty server is an error.
+        endpoint = (
+            os.getenv("LMSTUDIO_ENDPOINT") or DEFAULT_LMSTUDIO_ENDPOINT
+        ).rstrip("/")
+        model = os.getenv("LMSTUDIO_MODEL") or _discover_lmstudio_model(endpoint)
+        if not model:
+            raise CoderConfigError(
+                f"CODER_MODEL_SOURCE=lmstudio found no model at {endpoint}: "
+                "LMSTUDIO_MODEL is not set and /v1/models is unreachable or "
+                "empty. Start LM Studio and load a model, set LMSTUDIO_MODEL, "
+                "or point LMSTUDIO_ENDPOINT at the right server (no trailing "
+                "/v1) — see issue-worm-pro's .env-example-lmstudio."
+            )
+        # No api_key: LM Studio's local server ignores Authorization, and
+        # RemoteOpenAICoder omits the header entirely when it is falsy.
+        # No default max_tokens either, matching `remote` — LM Studio's own
+        # default is the loaded model's context, not a small provider cap.
+        return RemoteOpenAICoder(
+            endpoint=endpoint,
+            model=model,
+            api_key=None,
+            timeout=timeout,
+            max_tokens=max_tokens_override,
         )
 
     if model_source == "remote":
@@ -318,12 +391,14 @@ def build_coder(role_config) -> Coder:
         raise CoderConfigError(
             "CODER_MODEL_SOURCE=claude is not implemented by the free "
             "engine's build coder (issue-worm-pro#590) — use 'local', "
-            "'remote', or 'cloud', or run this issue through issue-worm-pro."
+            "'lmstudio', 'remote', or 'cloud', or run this issue through "
+            "issue-worm-pro."
         )
 
     raise CoderConfigError(
         f"CODER_MODEL_SOURCE={model_source!r} is not a supported coder "
-        "target; expected one of 'local', 'remote', 'cloud', or 'claude'."
+        "target; expected one of 'local', 'lmstudio', 'remote', 'cloud', or "
+        "'claude'."
     )
 
 

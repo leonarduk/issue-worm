@@ -9,6 +9,7 @@ from coder import (
     DEFAULT_DEEPSEEK_ENDPOINT,
     DEFAULT_DEEPSEEK_MAX_TOKENS,
     DEFAULT_DEEPSEEK_MODEL,
+    DEFAULT_LMSTUDIO_ENDPOINT,
     DEFAULT_OLLAMA_ENDPOINT,
     DEFAULT_OLLAMA_MODEL,
     REQUEST_TIMEOUT_SECONDS,
@@ -375,17 +376,115 @@ def test_build_coder_cloud_reads_deepseek_endpoint_env_var(monkeypatch):
     assert coder.endpoint == "https://deepseek.internal.example"
 
 
+def _lmstudio_models_response(*model_ids):
+    """A `/v1/models` body in LM Studio's (OpenAI-compatible) shape."""
+    return _mock_response({"data": [{"id": model_id} for model_id in model_ids]})
+
+
+def test_build_coder_lmstudio_uses_local_defaults(monkeypatch):
+    """The zero-config case: LM Studio's own port, no API key, and no
+    `/v1/models` lookup once LMSTUDIO_MODEL says which model to use."""
+    monkeypatch.delenv("LMSTUDIO_ENDPOINT", raising=False)
+    monkeypatch.setenv("LMSTUDIO_MODEL", "qwen2.5-coder-14b-instruct")
+
+    with patch("coder.requests.get") as mock_get:
+        coder = build_coder(RoleConfig(model_source="lmstudio"))
+
+    assert isinstance(coder, RemoteOpenAICoder)
+    assert coder.endpoint == DEFAULT_LMSTUDIO_ENDPOINT
+    assert coder.model == "qwen2.5-coder-14b-instruct"
+    assert not coder.api_key
+    mock_get.assert_not_called()
+
+
+def test_build_coder_lmstudio_reads_endpoint_env_var(monkeypatch):
+    """A trailing slash is stripped so the `/v1/...` paths built from this
+    endpoint don't end up doubled."""
+    monkeypatch.setenv("LMSTUDIO_ENDPOINT", "http://gpu-box:1234/")
+    monkeypatch.setenv("LMSTUDIO_MODEL", "qwen2.5-coder-7b-instruct")
+
+    coder = build_coder(RoleConfig(model_source="lmstudio"))
+
+    assert coder.endpoint == "http://gpu-box:1234"
+
+
+def test_build_coder_lmstudio_discovers_model_preferring_coder(monkeypatch):
+    """With no LMSTUDIO_MODEL, the model is read from the server - and a
+    coder model wins, matching cicaid-pro's get_lmstudio_model so both
+    tiers resolve the same server to the same model."""
+    monkeypatch.delenv("LMSTUDIO_MODEL", raising=False)
+    monkeypatch.delenv("LMSTUDIO_ENDPOINT", raising=False)
+
+    with patch(
+        "coder.requests.get",
+        return_value=_lmstudio_models_response("tinyllama-1.1b", "qwen2.5-coder-7b"),
+    ) as mock_get:
+        coder = build_coder(RoleConfig(model_source="lmstudio"))
+
+    assert coder.model == "qwen2.5-coder-7b"
+    assert mock_get.call_args.args[0] == f"{DEFAULT_LMSTUDIO_ENDPOINT}/v1/models"
+
+
+def test_build_coder_lmstudio_discovery_falls_back_to_first_model(monkeypatch):
+    monkeypatch.delenv("LMSTUDIO_MODEL", raising=False)
+
+    with patch(
+        "coder.requests.get",
+        return_value=_lmstudio_models_response("mistral-7b", "tinyllama-1.1b"),
+    ):
+        coder = build_coder(RoleConfig(model_source="lmstudio"))
+
+    assert coder.model == "mistral-7b"
+
+
+def test_build_coder_lmstudio_unreachable_server_raises(monkeypatch):
+    """No model and no server is a configuration problem, not a runtime
+    one: fail the build with the endpoint named rather than return a coder
+    whose every request will 404."""
+    monkeypatch.delenv("LMSTUDIO_MODEL", raising=False)
+    monkeypatch.setenv("LMSTUDIO_ENDPOINT", "http://localhost:9999")
+
+    with patch("coder.requests.get", side_effect=requests.ConnectionError("refused")):
+        with pytest.raises(CoderConfigError, match="http://localhost:9999"):
+            build_coder(RoleConfig(model_source="lmstudio"))
+
+
+def test_build_coder_lmstudio_no_loaded_models_raises(monkeypatch):
+    monkeypatch.delenv("LMSTUDIO_MODEL", raising=False)
+
+    with patch("coder.requests.get", return_value=_lmstudio_models_response()):
+        with pytest.raises(CoderConfigError, match="LMSTUDIO_MODEL"):
+            build_coder(RoleConfig(model_source="lmstudio"))
+
+
+def test_lmstudio_coder_sends_no_authorization_header(monkeypatch):
+    """LM Studio's local server takes no API key; sending an empty bearer
+    token is worse than sending none."""
+    monkeypatch.setenv("LMSTUDIO_MODEL", "qwen2.5-coder-7b-instruct")
+    coder = build_coder(RoleConfig(model_source="lmstudio"))
+
+    with patch(
+        "coder.requests.post",
+        return_value=_mock_response({"choices": [{"message": {"content": "hi"}}]}),
+    ) as mock_post:
+        assert coder.complete("prompt") == "hi"
+
+    assert "Authorization" not in mock_post.call_args.kwargs["headers"]
+
+
 def _set_env_for_model_source(monkeypatch, model_source: str) -> None:
     """Set whatever env vars build_coder requires for `model_source` to
     succeed, so the timeout tests below can be parametrized across all
-    three env-backed sources symmetrically."""
+    four env-backed sources symmetrically."""
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     monkeypatch.setenv("REMOTE_LLM_ENDPOINT", "https://api.openai.com")
     monkeypatch.setenv("REMOTE_LLM_MODEL", "gpt-5")
     monkeypatch.setenv("REMOTE_LLM_API_KEY", "sk-test")
+    # Explicit, so no test in this group hits the network for /v1/models.
+    monkeypatch.setenv("LMSTUDIO_MODEL", "qwen2.5-coder-7b-instruct")
 
 
-@pytest.mark.parametrize("model_source", ["local", "remote", "cloud"])
+@pytest.mark.parametrize("model_source", ["local", "lmstudio", "remote", "cloud"])
 def test_build_coder_uses_default_timeout_when_unset(model_source, monkeypatch):
     monkeypatch.delenv("CODER_REQUEST_TIMEOUT_SECONDS", raising=False)
     _set_env_for_model_source(monkeypatch, model_source)
@@ -395,7 +494,7 @@ def test_build_coder_uses_default_timeout_when_unset(model_source, monkeypatch):
     assert coder.timeout == REQUEST_TIMEOUT_SECONDS
 
 
-@pytest.mark.parametrize("model_source", ["local", "remote", "cloud"])
+@pytest.mark.parametrize("model_source", ["local", "lmstudio", "remote", "cloud"])
 def test_build_coder_reads_request_timeout_env_var(model_source, monkeypatch):
     monkeypatch.setenv("CODER_REQUEST_TIMEOUT_SECONDS", "45")
     _set_env_for_model_source(monkeypatch, model_source)
@@ -527,6 +626,17 @@ def test_build_coder_cloud_defaults_max_tokens(monkeypatch):
     assert coder.max_tokens == DEFAULT_DEEPSEEK_MAX_TOKENS
 
 
+def test_build_coder_lmstudio_leaves_max_tokens_unset_by_default(monkeypatch):
+    """Unlike `cloud`, there is no small provider cap to work around: LM
+    Studio's default is the loaded model's own context window."""
+    _set_env_for_model_source(monkeypatch, "lmstudio")
+    monkeypatch.delenv("CODER_MAX_TOKENS", raising=False)
+
+    coder = build_coder(RoleConfig(model_source="lmstudio"))
+
+    assert coder.max_tokens is None
+
+
 def test_build_coder_remote_leaves_max_tokens_unset_by_default(monkeypatch):
     _set_env_for_model_source(monkeypatch, "remote")
     monkeypatch.delenv("CODER_MAX_TOKENS", raising=False)
@@ -536,7 +646,7 @@ def test_build_coder_remote_leaves_max_tokens_unset_by_default(monkeypatch):
     assert coder.max_tokens is None
 
 
-@pytest.mark.parametrize("model_source", ["remote", "cloud"])
+@pytest.mark.parametrize("model_source", ["lmstudio", "remote", "cloud"])
 def test_build_coder_reads_max_tokens_env_var(model_source, monkeypatch):
     _set_env_for_model_source(monkeypatch, model_source)
     monkeypatch.setenv("CODER_MAX_TOKENS", "4096")

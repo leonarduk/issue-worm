@@ -193,6 +193,23 @@ def test_load_config_endpoint_prefers_ollama_endpoint(monkeypatch):
 # --- Defensive fallback on unrecognized config values -----------------------
 
 
+def test_load_config_accepts_lmstudio_model_source(monkeypatch):
+    """`lmstudio` is a real source (coder.build_coder dispatches it), not a
+    typo to be corrected to `local` - issue-worm-pro's
+    .env-example-lmstudio documented it while this validator still
+    rejected it, so following those docs silently ran against Ollama
+    (#410)."""
+    monkeypatch.setenv("CODER_MODEL_SOURCE", "lmstudio")
+    monkeypatch.delenv("CODER_TARGETS", raising=False)
+
+    config = load_config()
+
+    assert config["coder_config"].model_source == "lmstudio"
+    # Non-local sources don't route per host, so a placeholder slot is
+    # synthesized rather than requiring a dummy CODER_TARGETS entry.
+    assert [t.name for t in config["coder_targets"]] == ["lmstudio-1"]
+
+
 def test_load_config_unknown_model_source_falls_back_to_local(monkeypatch, caplog):
     """A typo'd *_MODEL_SOURCE must not silently misconfigure the role -
     fall back to the safe (private, no-cost) default and say why."""

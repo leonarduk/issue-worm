@@ -199,7 +199,12 @@ def _parse_log_level(raw: str) -> str:
     return upper
 
 
-_VALID_MODEL_SOURCES = {"local", "cloud", "remote", "claude"}
+# "lmstudio" is a second local source alongside "local"/Ollama: LM Studio
+# runs an OpenAI-compatible server on this machine (see coder.build_coder
+# and cicaid-pro's lmstudio_common). It was documented in issue-worm-pro's
+# .env-example-lmstudio before it was accepted here, so setting it fell
+# back to "local" and quietly ran against Ollama instead (#410).
+_VALID_MODEL_SOURCES = {"local", "lmstudio", "cloud", "remote", "claude"}
 
 
 def _load_role_config(role_prefix: str) -> RoleConfig:
