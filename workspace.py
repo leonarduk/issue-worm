@@ -53,6 +53,7 @@ import shutil
 import subprocess
 import tempfile
 import sys
+import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
@@ -1777,6 +1778,368 @@ def _reject_base_environment_kwarg(func_name: str, kwargs: dict) -> None:
         )
 
 
+# run_ci_checks below runs the project's own test/lint suite (`cicaid
+# run-ci-checks --all` by default). That suite never touches a brand-new
+# GitHub Actions workflow step - so a diff that only adds/edits a
+# `.github/workflows/*.yml` step whose own shell command is simply wrong
+# (e.g. a grep pattern that doesn't match the repo's real file contents)
+# sails through verification as a passing attempt: "CI passed" is true
+# only because nothing ran the new step at all. The helpers below close
+# that gap by extracting each `run:` step this diff touched - added
+# wholesale, or an existing step whose body/shell was edited - from the
+# diff's post-apply content and actually executing it against the repo
+# before the attempt is accepted.
+WORKFLOW_STEP_TIMEOUT = 120.0
+
+_WORKFLOW_DIFF_PATH_RE = re.compile(r"^\.github/workflows/.+\.ya?ml$")
+_RUN_BLOCK_RE = re.compile(r"^(\s*)(?:-\s*)?run:\s*[|>][+-]?\s*$")
+_RUN_INLINE_RE = re.compile(r"^(\s*)(?:-\s*)?run:\s*(\S.*)$")
+_STEP_START_RE = re.compile(r"^(\s*)-\s")
+# `shell:` may be the step's first key, in which case it sits on the
+# `- ` line itself - so it allows the same optional dash the two
+# `run:` patterns above do. Without it such a step reads as having no
+# `shell:` at all and its body runs under bash, which is the false
+# rejection the unsupported-shell skip exists to avoid.
+_SHELL_RE = re.compile(r"^\s*(?:-\s*)?shell:\s*(\S+)\s*$")
+
+# Commands used to execute an extracted step body, keyed by its `shell:`
+# value (GitHub Actions default, unset, is bash on Linux runners - the
+# environment this pipeline actually targets). A shell with no entry here
+# (pwsh, powershell, cmd, a custom `shell:` template, ...) is skipped
+# rather than run under the wrong interpreter, which would just produce a
+# false rejection unrelated to the step's own correctness.
+_SHELL_COMMANDS: dict[str | None, list[str]] = {
+    None: ["bash", "-eo", "pipefail", "-c"],
+    "bash": ["bash", "-eo", "pipefail", "-c"],
+    "sh": ["sh", "-e", "-c"],
+    "python": [sys.executable, "-c"],
+    "python3": [sys.executable, "-c"],
+}
+
+# A step body is only a fair test of *its own* correctness when this
+# sandbox can supply everything it reads. Two things it cannot:
+#
+# `${{ ... }}`
+#     GitHub Actions expands expressions before the body ever reaches a
+#     shell. Handed to bash verbatim they are not merely unset, they are
+#     a hard parse error (`${{ github.sha }}` -> "bad substitution"), so
+#     the step fails for a reason that has nothing to do with what it
+#     checks.
+# an environment variable this sandbox does not define
+#     the Actions runtime file vars (`$GITHUB_OUTPUT`, `$GITHUB_ENV`,
+#     ...), and anything declared in a step/job/workflow `env:` block -
+#     which may not even appear in the diff, so there is no reliable way
+#     to reconstruct it. Unset, `echo x >> $GITHUB_OUTPUT` is an
+#     ambiguous redirect and `grep -q "$WANTED" f` matches everything.
+#
+# Either way the honest answer is "not checkable here", so the step is
+# skipped and noted, the same way an unsupported `shell:` is - a false
+# rejection would send the Coder off fixing a step that was correct.
+_ACTIONS_EXPRESSION_RE = re.compile(r"\$\{\{")
+# `${VAR:-default}` and its `:=`/`:+` siblings (and the colon-less forms)
+# supply their own fallback, so the step handles an unset name itself -
+# the same reason a two-argument `os.environ.get` does not count as
+# needing context. `${VAR:?msg}` is deliberately fatal when unset, so it
+# still counts, as does a plain `$VAR` or `${VAR}`.
+_VAR_REF_RE = re.compile(
+    r"\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)(?P<op>:?[-=+])?[^}]*\}"
+    r"|(?P<bare>[A-Za-z_][A-Za-z0-9_]*)\b)"
+)
+# `FOO=bar` at the start of a line, whether bare, as an inline prefix to a
+# command, or behind any of the declaration builtins (which may carry
+# flags of their own, as in `declare -r FOO=bar`).
+_VAR_ASSIGN_RE = re.compile(
+    r"^\s*(?:(?:export|local|declare|readonly|typeset)\s+(?:-\S+\s+)*)?"
+    r"([A-Za-z_][A-Za-z0-9_]*)=",
+    re.MULTILINE,
+)
+_VAR_LOOP_RE = re.compile(r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\b")
+# `read` assigns every name after its options, not just the first. Options
+# that take an argument (`-p "Enter: "`, `-d ''`) must not have that
+# argument mistaken for one of the names.
+_VAR_READ_RE = re.compile(
+    r"""\bread\s+(?:-\S+\s+(?:"[^"]*"\s+|'[^']*'\s+)?)*"""
+    r"""(?P<names>[A-Za-z_][A-Za-z0-9_]*(?:\s+[A-Za-z_][A-Za-z0-9_]*)*)"""
+)
+
+# The python equivalent of a `$VAR` reference: `os.environ["X"]`,
+# `os.environ.get("X")` and `os.getenv("X")`. A trailing comma means the
+# call supplies its own default, so an unset name is not a problem there.
+_PY_ENV_READ_RE = re.compile(
+    r"""os\.(?:environ\s*\[\s*|environ\s*\.\s*get\s*\(\s*|getenv\s*\(\s*)"""
+    # A comma only supplies a default when something follows it:
+    # `os.environ.get("X",)` is a trailing comma, which means no default.
+    r"""(?P<q>['"])(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?P=q)\s*(?P<default>,(?!\s*\)))?"""
+)
+
+# Names the shell itself provides, so a reference to one is not evidence
+# the step needs Actions context we can't supply.
+_SHELL_PROVIDED_VARS = frozenset(
+    {
+        "PWD", "OLDPWD", "IFS", "RANDOM", "LINENO", "SECONDS", "UID", "EUID",
+        "PPID", "HOSTNAME", "HOSTTYPE", "OSTYPE", "MACHTYPE", "REPLY",
+        "FUNCNAME", "SHLVL", "BASHPID", "BASH_VERSION", "BASH_SUBSHELL",
+    }
+)
+
+
+def _unsupported_step_context(
+    script: str, shell: str | None, env: dict[str, str]
+) -> str | None:
+    """Why ``script`` can't be judged in this sandbox, or ``None`` if it
+    can - see the comment above :data:`_ACTIONS_EXPRESSION_RE`."""
+    if _ACTIONS_EXPRESSION_RE.search(script):
+        return "it uses a ${{ }} expression the Actions runtime would expand"
+    if shell in ("python", "python3"):
+        # `$VAR` isn't syntax in a python body, but a python step reads the
+        # same Actions variables through `os.environ` - and unset,
+        # `os.environ["GITHUB_OUTPUT"]` is a KeyError, so the step fails
+        # for a reason that has nothing to do with what it checks. The
+        # `.get`/`getenv` forms that pass a default handle absence
+        # themselves, so they are not evidence of missing context.
+        for match in _PY_ENV_READ_RE.finditer(script):
+            name = match.group("name")
+            if name not in env and not match.group("default"):
+                return f"it reads os.environ[{name!r}], which this sandbox does not define"
+        return None
+    defined = (
+        set(env)
+        | _SHELL_PROVIDED_VARS
+        | set(_VAR_ASSIGN_RE.findall(script))
+        | set(_VAR_LOOP_RE.findall(script))
+        | {
+            name
+            for match in _VAR_READ_RE.finditer(script)
+            for name in match.group("names").split()
+        }
+    )
+    missing = [
+        name
+        for match in _VAR_REF_RE.finditer(script)
+        # A braced reference carrying a default operator supplies its own
+        # value, so it is not evidence of missing context.
+        if not match.group("op")
+        for name in [match.group("braced") or match.group("bare")]
+        if name not in defined
+    ]
+    if missing:
+        return f"it reads ${missing[0]}, which this sandbox does not define"
+    return None
+
+
+def _iter_diff_files(diff_output: str) -> list[tuple[str, list[str]]]:
+    """Split a unified diff (as produced by :func:`get_working_diff`) into
+    ``(path, lines)`` per file, where ``lines`` are that file's hunk lines
+    (including the leading +/-/space marker)."""
+    files: list[tuple[str, list[str]]] = []
+    current_path: str | None = None
+    current_lines: list[str] = []
+    for line in diff_output.splitlines():
+        if line.startswith("diff --git "):
+            if current_path is not None:
+                files.append((current_path, current_lines))
+            current_path, current_lines = None, []
+        elif line.startswith("+++ b/"):
+            current_path = line[len("+++ b/") :]
+        elif current_path is not None:
+            current_lines.append(line)
+    if current_path is not None:
+        files.append((current_path, current_lines))
+    return files
+
+
+def _post_apply_lines(hunk_lines: list[str]) -> list[tuple[str, bool]]:
+    """``(text, touched)`` for a file's content as it reads *after* this
+    diff applies: removed (``-``) lines are dropped, and each surviving
+    line is tagged with whether this diff added it (vs. surrounding
+    unchanged context the diff carries for readability)."""
+    result: list[tuple[str, bool]] = []
+    for line in hunk_lines:
+        if line.startswith("+++") or line.startswith("---") or line.startswith("@@"):
+            continue
+        if line.startswith("+"):
+            result.append((line[1:], True))
+        elif line.startswith(" "):
+            result.append((line[1:], False))
+        # '-' (removed) and '\ No newline at end of file' lines: dropped.
+    return result
+
+
+def _step_shell(lines: list[tuple[str, bool]], run_index: int) -> str | None:
+    """The `shell:` value declared on the same step as ``lines[run_index]``
+    (the step's ``run:`` key), or ``None`` if it doesn't set one -
+    ``shell:`` may appear before or after ``run:`` in the step mapping."""
+    run_text = lines[run_index][0]
+    run_indent = len(run_text) - len(run_text.lstrip())
+
+    start = 0
+    dash_indent = run_indent
+    for k in range(run_index, -1, -1):
+        text = lines[k][0]
+        indent = len(text) - len(text.lstrip())
+        if _STEP_START_RE.match(text) and indent <= run_indent:
+            start, dash_indent = k, indent
+            break
+
+    end = len(lines)
+    for k in range(start + 1, len(lines)):
+        text = lines[k][0]
+        indent = len(text) - len(text.lstrip())
+        if _STEP_START_RE.match(text) and indent <= dash_indent:
+            end = k
+            break
+
+    # Only the step's *own* keys count. A `shell:` nested under `with:`
+    # belongs to the action being invoked, not to this step, and reading
+    # it would skip a step that actually runs under the default shell.
+    dash_text = lines[start][0]
+    after_dash = dash_text.find("-", dash_indent) + 1
+    key_indent = after_dash + len(dash_text[after_dash:]) - len(dash_text[after_dash:].lstrip())
+
+    for k in range(start, end):
+        text = lines[k][0]
+        if k != start and len(text) - len(text.lstrip()) != key_indent:
+            continue
+        match = _SHELL_RE.match(text)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _extract_new_workflow_run_scripts(
+    diff_output: str,
+) -> list[tuple[str, str, str | None]]:
+    """``(path, script, shell)`` for each ``run:`` step this diff touched
+    in a ``.github/workflows/*.yml`` file - added wholesale, or an
+    existing step whose body or ``shell:`` this diff edited.
+
+    A step is only included when at least one line of it (its ``run:``
+    key, its body, or its ``shell:`` key) is a line this diff actually
+    *adds* - an untouched step that merely sits near a real change (and so
+    appears as surrounding context) is never re-executed.
+    """
+    scripts: list[tuple[str, str, str | None]] = []
+    for path, hunk_lines in _iter_diff_files(diff_output):
+        if not _WORKFLOW_DIFF_PATH_RE.match(path):
+            continue
+        lines = _post_apply_lines(hunk_lines)
+        i = 0
+        while i < len(lines):
+            text, touched = lines[i]
+            block_match = _RUN_BLOCK_RE.match(text)
+            if block_match:
+                # The block body is what is indented past the `run:` key -
+                # which is not the same as past the start of the line when
+                # `run:` is the step's first key, because the `- ` sits in
+                # between. Measuring from the line start there treats the
+                # step's own sibling keys (`env:`, `shell:`,
+                # `working-directory:`, ...) as body lines and appends them
+                # to the script, so a correct step fails on `env: command
+                # not found` - a false rejection.
+                indent = text.index("run:")
+                step_touched = touched
+                i += 1
+                body_lines = []
+                while i < len(lines):
+                    btext, btouched = lines[i]
+                    if btext.strip() == "" or len(btext) - len(btext.lstrip()) > indent:
+                        body_lines.append(btext)
+                        step_touched = step_touched or btouched
+                        i += 1
+                    else:
+                        break
+                script = textwrap.dedent("\n".join(body_lines)).strip("\n")
+                if step_touched and script.strip():
+                    shell = _step_shell(lines, i - len(body_lines) - 1)
+                    scripts.append((path, script, shell))
+                continue
+            inline_match = _RUN_INLINE_RE.match(text)
+            if inline_match and touched:
+                shell = _step_shell(lines, i)
+                scripts.append((path, inline_match.group(2), shell))
+            i += 1
+    return scripts
+
+
+def _run_new_workflow_step_scripts(
+    repo_path: str,
+    diff_output: str,
+    extra_env: dict[str, str] | None,
+    timeout: float,
+) -> tuple[bool, str]:
+    """Execute every workflow ``run:`` step this diff touched, found in
+    ``diff_output``, against ``repo_path``, in the same sandboxed
+    environment :func:`run_ci_checks` uses.
+
+    Returns ``(True, "")`` when there is nothing to check. A step's
+    non-zero exit is reported the same way a failing test is - the
+    Verifier treats it as a normal failed attempt, so the Coder sees the
+    real failure output on the next revision instead of the check being
+    silently trusted.
+
+    A step this sandbox can't judge is noted but does not fail the
+    attempt, because a false rejection would send the Coder off fixing a
+    step that was correct. Two cases: a ``shell:`` this helper can't run
+    (anything but bash/sh/python - see :data:`_SHELL_COMMANDS`), and a
+    body that needs Actions runtime context - a ``${{ }}`` expression or
+    an environment variable nothing here defines (see
+    :func:`_unsupported_step_context`).
+    """
+    scripts = _extract_new_workflow_run_scripts(diff_output)
+    if not scripts:
+        return True, ""
+    all_passed = True
+    output_parts: list[str] = []
+    with tempfile.TemporaryDirectory(
+        prefix="issue-worm-ci-home-", ignore_cleanup_errors=True
+    ) as home:
+        env = _non_interactive_env(ci_check_env(repo_path, extra_env, home=home))
+        for path, script, shell in scripts:
+            command = _SHELL_COMMANDS.get(shell)
+            if command is None:
+                output_parts.append(
+                    f"[{path}] skipped new/changed workflow step: "
+                    f"unsupported shell {shell!r}"
+                )
+                continue
+            unsupported = _unsupported_step_context(script, shell, env)
+            if unsupported:
+                output_parts.append(
+                    f"[{path}] skipped new/changed workflow step: {unsupported}"
+                )
+                continue
+            try:
+                result = subprocess.run(
+                    [*command, script],
+                    cwd=repo_path,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    # A step is free to print whatever bytes it likes;
+                    # a strict decode would raise UnicodeDecodeError out
+                    # of here and kill run_revision_attempt instead of
+                    # reporting the step as a normal failed attempt.
+                    errors="replace",
+                    env=env,
+                    timeout=timeout,
+                )
+            except OSError as exc:
+                all_passed = False
+                output_parts.append(f"[{path}] failed to execute new workflow step: {exc}")
+                continue
+            except subprocess.TimeoutExpired:
+                all_passed = False
+                output_parts.append(f"[{path}] new workflow step timed out after {timeout}s")
+                continue
+            status = "passed" if result.returncode == 0 else "FAILED"
+            output_parts.append(
+                f"[{path}] new workflow step {status}:\n{result.stdout}{result.stderr}"
+            )
+            if result.returncode != 0:
+                all_passed = False
+    return all_passed, "\n".join(output_parts)
+
+
 def run_ci_checks(
     repo_path: str,
     command: list[str] | None = None,
@@ -1904,6 +2267,20 @@ def run_revision_attempt(
                 test_output=test_output,
                 diff_output=diff_output,
                 error="CI checks failed",
+                category=CATEGORY_TEST_FAILURE,
+                recovery=recovery,
+            )
+
+        workflow_passed, workflow_output = _run_new_workflow_step_scripts(
+            repo_path, diff_output, extra_env, WORKFLOW_STEP_TIMEOUT
+        )
+        if not workflow_passed:
+            combined_output = "\n\n".join(part for part in (test_output, workflow_output) if part)
+            return WorkspaceResult(
+                success=False,
+                test_output=combined_output,
+                diff_output=diff_output,
+                error="newly added GitHub Actions workflow step failed when run against the repo",
                 category=CATEGORY_TEST_FAILURE,
                 recovery=recovery,
             )

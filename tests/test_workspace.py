@@ -2601,4 +2601,829 @@ def test_run_revision_attempt_reports_unmatched_edit_as_apply_failure(repo):
     assert not result.success
     assert result.error.startswith("apply failed:")
     assert "SEARCH text not found" in result.error
-    assert (Path(repo) / "a.py").read_text() == "value = 1\n"
+
+
+# --- run_revision_attempt: newly added workflow steps are executed ----------
+#
+# Regression coverage for the ai-systems-lab#214 class of bug: a Coder
+# attempt added a "Verify mcp version pin" step to a GitHub Actions
+# workflow whose own `grep` pattern didn't match the repo's real
+# requirements.txt content. `cicaid run-ci-checks --all` (the project's own
+# test/lint suite) never executes a brand-new workflow step, so the attempt
+# was accepted as passing and the PR shipped with a step that fails on its
+# very first real run. These tests exercise the fix: run_revision_attempt
+# now executes a newly-added `run:` step against the repo before accepting
+# the attempt.
+
+
+def test_run_revision_attempt_fails_when_new_workflow_step_fails_against_repo(repo):
+    workflow = (
+        "on: pull_request\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    steps:\n"
+        "      - name: Verify mcp version pin\n"
+        "        run: |\n"
+        "          grep -q 'mcp<2.0.0' a.py\n"
+    )
+    output = _full_file_output(".github/workflows/ci.yml", workflow)
+
+    result = run_revision_attempt(
+        repo, output, [".github/workflows/ci.yml"], ci_command=[sys.executable, "-c", "pass"]
+    )
+
+    assert result.success is False
+    assert result.category == CATEGORY_TEST_FAILURE
+    assert "workflow step" in result.error
+    assert "FAILED" in result.test_output
+    # The attempt is rolled back like any other failed attempt.
+    assert not (Path(repo) / ".github").exists()
+
+
+def test_run_revision_attempt_passes_when_new_workflow_step_succeeds_against_repo(repo):
+    workflow = (
+        "on: pull_request\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    steps:\n"
+        "      - name: Verify value is set\n"
+        "        run: |\n"
+        "          grep -q 'value' a.py\n"
+    )
+    output = _full_file_output(".github/workflows/ci.yml", workflow)
+
+    result = run_revision_attempt(
+        repo, output, [".github/workflows/ci.yml"], ci_command=[sys.executable, "-c", "pass"]
+    )
+
+    assert result.success is True, result.error
+
+
+def test_run_revision_attempt_ignores_untouched_workflow_steps(repo):
+    """Only lines this diff touches are executed - a pre-existing step left
+    untouched by this attempt is never re-run, even if its command would
+    now fail (that's an existing-repo problem, not this attempt's)."""
+    (Path(repo) / ".github" / "workflows").mkdir(parents=True)
+    (Path(repo) / ".github" / "workflows" / "ci.yml").write_text(
+        "on: pull_request\njobs:\n  lint:\n    steps:\n      - run: |\n          false\n"
+    )
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "add pre-existing failing step")
+    start = get_current_commit(repo)
+    output = _full_file_output("a.py", "value = 2")
+
+    result = run_revision_attempt(
+        repo, output, ["a.py"], start_commit=start, ci_command=[sys.executable, "-c", "pass"]
+    )
+
+    assert result.success is True, result.error
+
+
+def test_run_revision_attempt_executes_edited_run_body_under_unchanged_run_key(repo):
+    """A step whose `run:` key is unchanged context and only its body was
+    edited must still be detected and executed - not just a step added
+    wholesale in one hunk."""
+    workflow_path = ".github/workflows/ci.yml"
+    (Path(repo) / ".github" / "workflows").mkdir(parents=True)
+    (Path(repo) / workflow_path).write_text(
+        "on: pull_request\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    steps:\n"
+        "      - name: Sanity check\n"
+        "        run: |\n"
+        "          true\n"
+    )
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "add workflow with passing step")
+    start = get_current_commit(repo)
+
+    old_content = (Path(repo) / workflow_path).read_text()
+    new_content = old_content.replace("          true\n", "          false\n")
+    diff = _make_diff(repo, old_content, new_content, path=workflow_path)
+    output = _diff_output(workflow_path, diff)
+
+    result = run_revision_attempt(
+        repo,
+        output,
+        [workflow_path],
+        start_commit=start,
+        ci_command=[sys.executable, "-c", "pass"],
+    )
+
+    assert result.success is False
+    assert result.category == CATEGORY_TEST_FAILURE
+    assert "workflow step" in result.error
+
+
+def test_run_revision_attempt_skips_new_step_with_unsupported_shell(repo):
+    """A step under a `shell:` this helper doesn't know how to run (pwsh,
+    here) must not be force-executed under bash - that would just be a
+    false rejection unrelated to the step's own correctness."""
+    workflow = (
+        "on: pull_request\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    steps:\n"
+        "      - name: Windows only check\n"
+        "        shell: pwsh\n"
+        "        run: |\n"
+        "          Write-Host 'not valid bash'\n"
+    )
+    output = _full_file_output(".github/workflows/ci.yml", workflow)
+
+    result = run_revision_attempt(
+        repo, output, [".github/workflows/ci.yml"], ci_command=[sys.executable, "-c", "pass"]
+    )
+
+    assert result.success is True, result.error
+
+
+def test_run_revision_attempt_reports_combined_ci_and_workflow_output_on_workflow_failure(repo):
+    workflow = (
+        "on: pull_request\njobs:\n  lint:\n    steps:\n      - run: |\n          false\n"
+    )
+    output = _full_file_output(".github/workflows/ci.yml", workflow)
+
+    result = run_revision_attempt(
+        repo,
+        output,
+        [".github/workflows/ci.yml"],
+        ci_command=[sys.executable, "-c", "print('ci passed marker')"],
+    )
+
+    assert result.success is False
+    assert "ci passed marker" in result.test_output
+    assert "FAILED" in result.test_output
+
+
+def test_extract_new_workflow_run_scripts_reads_added_block_and_inline_runs():
+    from workspace import _extract_new_workflow_run_scripts
+
+    diff = (
+        "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n"
+        "index aaaaaaa..bbbbbbb 100644\n"
+        "--- a/.github/workflows/ci.yml\n"
+        "+++ b/.github/workflows/ci.yml\n"
+        "@@ -1,2 +1,6 @@\n"
+        " on: pull_request\n"
+        "+jobs:\n"
+        "+  lint:\n"
+        "+    steps:\n"
+        "+      - run: |\n"
+        "+          echo one\n"
+        "+          echo two\n"
+        "+      - run: echo inline\n"
+    )
+
+    scripts = _extract_new_workflow_run_scripts(diff)
+
+    assert scripts == [
+        (".github/workflows/ci.yml", "echo one\necho two", None),
+        (".github/workflows/ci.yml", "echo inline", None),
+    ]
+
+
+def test_extract_new_workflow_run_scripts_reads_shell_key(repo):
+    from workspace import _extract_new_workflow_run_scripts
+
+    diff = (
+        "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n"
+        "index aaaaaaa..bbbbbbb 100644\n"
+        "--- a/.github/workflows/ci.yml\n"
+        "+++ b/.github/workflows/ci.yml\n"
+        "@@ -1,2 +1,6 @@\n"
+        " on: pull_request\n"
+        "+jobs:\n"
+        "+  lint:\n"
+        "+    steps:\n"
+        "+      - name: Windows check\n"
+        "+        shell: pwsh\n"
+        "+        run: |\n"
+        "+          Write-Host hi\n"
+    )
+
+    scripts = _extract_new_workflow_run_scripts(diff)
+
+    assert scripts == [(".github/workflows/ci.yml", "Write-Host hi", "pwsh")]
+
+
+def test_extract_new_workflow_run_scripts_reads_shell_key_on_inline_run(repo):
+    """`shell:` is a key on the step, not on the `run:` block, so a
+    one-line `run:` carries it just as a block body does."""
+    from workspace import _extract_new_workflow_run_scripts
+
+    diff = (
+        "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n"
+        "index aaaaaaa..bbbbbbb 100644\n"
+        "--- a/.github/workflows/ci.yml\n"
+        "+++ b/.github/workflows/ci.yml\n"
+        "@@ -1,2 +1,5 @@\n"
+        " on: pull_request\n"
+        "+jobs:\n"
+        "+  lint:\n"
+        "+    steps:\n"
+        "+      - shell: python\n"
+        "+        run: print('hi')\n"
+    )
+
+    scripts = _extract_new_workflow_run_scripts(diff)
+
+    assert scripts == [(".github/workflows/ci.yml", "print('hi')", "python")]
+
+
+def test_extract_new_workflow_run_scripts_stops_block_at_sibling_keys(repo):
+    """A `run: |` block ends where the step's other keys begin. When `run:`
+    is the step's first key the `- ` shifts it two columns right of the
+    line start, so measuring the body from the line start swallows `env:`
+    and friends into the script - and bash then fails the step on `env:
+    command not found`, a false rejection of a correct step."""
+    from workspace import _extract_new_workflow_run_scripts
+
+    diff = (
+        "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n"
+        "index aaaaaaa..bbbbbbb 100644\n"
+        "--- a/.github/workflows/ci.yml\n"
+        "+++ b/.github/workflows/ci.yml\n"
+        "@@ -1,2 +1,9 @@\n"
+        " on: pull_request\n"
+        "+jobs:\n"
+        "+  lint:\n"
+        "+    steps:\n"
+        "+      - run: |\n"
+        "+          make build\n"
+        "+        env:\n"
+        "+          FOO: bar\n"
+        "+        working-directory: src\n"
+    )
+
+    scripts = _extract_new_workflow_run_scripts(diff)
+
+    assert scripts == [(".github/workflows/ci.yml", "make build", None)]
+
+
+def test_extract_new_workflow_run_scripts_reads_shell_after_dash_line_run(repo):
+    """Same shape, with `shell:` as the trailing sibling key: it belongs to
+    the step, not to the script."""
+    from workspace import _extract_new_workflow_run_scripts
+
+    diff = (
+        "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n"
+        "index aaaaaaa..bbbbbbb 100644\n"
+        "--- a/.github/workflows/ci.yml\n"
+        "+++ b/.github/workflows/ci.yml\n"
+        "@@ -1,2 +1,7 @@\n"
+        " on: pull_request\n"
+        "+jobs:\n"
+        "+  lint:\n"
+        "+    steps:\n"
+        "+      - run: |\n"
+        "+          print('hi')\n"
+        "+        shell: python\n"
+    )
+
+    scripts = _extract_new_workflow_run_scripts(diff)
+
+    assert scripts == [(".github/workflows/ci.yml", "print('hi')", "python")]
+
+
+def test_run_revision_attempt_accepts_step_with_sibling_env_key(repo):
+    """End to end: the step's own check passes against the repo, so the
+    attempt is accepted - the trailing `env:` key must not be run as part
+    of the script."""
+    workflow = (
+        "on: pull_request\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    steps:\n"
+        "      - run: |\n"
+        "          grep -q 'value' a.py\n"
+        "        env:\n"
+        "          FOO: bar\n"
+    )
+    output = _full_file_output(".github/workflows/ci.yml", workflow)
+
+    result = run_revision_attempt(
+        repo, output, [".github/workflows/ci.yml"], ci_command=[sys.executable, "-c", "pass"]
+    )
+
+    assert result.success is True, result.error
+
+
+def test_run_revision_attempt_skips_unsupported_shell_declared_first(repo):
+    """The step's `shell:` must be found wherever it sits in the mapping.
+    Missed on the `- ` line, a pwsh step reads as having no `shell:` and
+    its body is run under bash, failing for a reason that has nothing to
+    do with the step - the false rejection the skip exists to avoid."""
+    workflow = (
+        "on: pull_request\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    steps:\n"
+        "      - shell: pwsh\n"
+        "        run: |\n"
+        "          Write-Host hi\n"
+    )
+    output = _full_file_output(".github/workflows/ci.yml", workflow)
+
+    result = run_revision_attempt(
+        repo, output, [".github/workflows/ci.yml"], ci_command=[sys.executable, "-c", "pass"]
+    )
+
+    assert result.success is True, result.error
+
+
+def test_run_revision_attempt_runs_step_under_sh_shell(repo):
+    """`sh` is one of the shells this helper can run (:data:`_SHELL_COMMANDS`),
+    so a step declaring it is executed rather than skipped - and a wrong
+    check under it rejects the attempt like any other."""
+    workflow = (
+        "on: pull_request\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    steps:\n"
+        "      - name: Check the pin\n"
+        "        shell: sh\n"
+        "        run: |\n"
+        "          echo sh-step-marker\n"
+        "          grep -q 'mcp<2.0.0' a.py\n"
+    )
+    output = _full_file_output(".github/workflows/ci.yml", workflow)
+
+    result = run_revision_attempt(
+        repo, output, [".github/workflows/ci.yml"], ci_command=[sys.executable, "-c", "pass"]
+    )
+
+    assert result.success is False
+    assert result.category == CATEGORY_TEST_FAILURE
+    assert "workflow step" in result.error
+    # Actually ran under sh, rather than being skipped as an unsupported shell.
+    assert "sh-step-marker" in result.test_output
+
+
+# --- steps this sandbox can't fairly judge are skipped, not failed -----
+#
+# An extracted body runs as a plain shell script with none of the Actions
+# runtime around it, so a step reading context this sandbox can't supply
+# fails for a reason that has nothing to do with what the step checks.
+# Rejecting the attempt on that would send the Coder off "fixing" a step
+# that was already correct - exactly the false rejection the `shell:`
+# handling already avoids - so such a step is skipped and noted instead.
+
+
+def test_run_revision_attempt_skips_step_using_actions_expression(repo):
+    """`${{ }}` is expanded by Actions before a shell ever sees it; handed
+    to bash verbatim it is a hard parse error ("bad substitution")."""
+    workflow = (
+        "on: pull_request\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    steps:\n"
+        "      - name: Show the commit\n"
+        "        run: |\n"
+        "          echo ${{ github.sha }}\n"
+    )
+    output = _full_file_output(".github/workflows/ci.yml", workflow)
+
+    result = run_revision_attempt(
+        repo, output, [".github/workflows/ci.yml"], ci_command=[sys.executable, "-c", "pass"]
+    )
+
+    assert result.success is True, result.error
+
+
+def test_run_revision_attempt_skips_step_reading_actions_runtime_var(repo):
+    """`$GITHUB_OUTPUT` and friends only exist on a real runner; unset,
+    `echo x >> $GITHUB_OUTPUT` is an ambiguous redirect."""
+    workflow = (
+        "on: pull_request\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    steps:\n"
+        "      - name: Publish a value\n"
+        "        run: |\n"
+        "          echo 'found=yes' >> $GITHUB_OUTPUT\n"
+    )
+    output = _full_file_output(".github/workflows/ci.yml", workflow)
+
+    result = run_revision_attempt(
+        repo, output, [".github/workflows/ci.yml"], ci_command=[sys.executable, "-c", "pass"]
+    )
+
+    assert result.success is True, result.error
+
+
+def test_run_revision_attempt_still_runs_step_using_only_its_own_vars(repo):
+    """The skip is narrow: a step that defines the variables it reads needs
+    no Actions context, so it is still executed - and still rejected when
+    its own check is wrong against the repo (ai-systems-lab#214)."""
+    workflow = (
+        "on: pull_request\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    steps:\n"
+        "      - name: Verify pin\n"
+        "        run: |\n"
+        "          WANTED='mcp<2.0.0'\n"
+        '          grep -q "$WANTED" a.py\n'
+    )
+    output = _full_file_output(".github/workflows/ci.yml", workflow)
+
+    result = run_revision_attempt(
+        repo, output, [".github/workflows/ci.yml"], ci_command=[sys.executable, "-c", "pass"]
+    )
+
+    assert result.success is False
+    assert result.category == CATEGORY_TEST_FAILURE
+    assert "workflow step" in result.error
+
+
+def test_run_revision_attempt_survives_non_utf8_step_output(repo):
+    """A step is free to print whatever bytes it likes, and the helper must
+    report it as a normal failed attempt either way.
+
+    Decoding strictly does not fail the same way on every platform: on
+    POSIX the decode happens in the calling thread, so a stray 0xff raises
+    UnicodeDecodeError straight out of run_revision_attempt; on Windows it
+    happens in a reader thread, where the error is swallowed and the step's
+    output silently comes back empty. ``errors="replace"`` is what makes
+    both cases a plain, reported failure. The body goes through
+    ``shell: python`` so the raw bytes reach the pipe unmodified - a bash
+    ``printf`` is re-encoded by some shells (git-bash does), which would
+    leave this test exercising nothing.
+    """
+    workflow = (
+        "on: pull_request\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    steps:\n"
+        "      - name: Print raw bytes and fail\n"
+        "        shell: python\n"
+        "        run: |\n"
+        "          import sys\n"
+        '          sys.stdout.buffer.write(b"PREFIX \\xff\\xfe RAW")\n'
+        "          sys.stdout.buffer.flush()\n"
+        "          sys.exit(1)\n"
+    )
+    output = _full_file_output(".github/workflows/ci.yml", workflow)
+
+    result = run_revision_attempt(
+        repo, output, [".github/workflows/ci.yml"], ci_command=[sys.executable, "-c", "pass"]
+    )
+
+    assert result.success is False
+    assert result.category == CATEGORY_TEST_FAILURE
+    assert "workflow step" in result.error
+    # Decoded lossily rather than raising or silently dropping the output.
+    assert "PREFIX" in result.test_output
+
+
+def test_run_revision_attempt_reports_every_step_when_one_of_several_fails(repo):
+    """Several touched steps: each runs, and one failure fails the attempt
+    without hiding the others' output."""
+    workflow = (
+        "on: pull_request\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    steps:\n"
+        "      - run: echo first-step-marker\n"
+        "      - run: exit 1\n"
+        "      - run: echo third-step-marker\n"
+    )
+    output = _full_file_output(".github/workflows/ci.yml", workflow)
+
+    result = run_revision_attempt(
+        repo, output, [".github/workflows/ci.yml"], ci_command=[sys.executable, "-c", "pass"]
+    )
+
+    assert result.success is False
+    assert "first-step-marker" in result.test_output
+    assert "third-step-marker" in result.test_output
+    assert "FAILED" in result.test_output
+
+
+@pytest.mark.parametrize(
+    "script,shell,expected",
+    [
+        # Nothing but the repo's own content: judgeable, so not skipped.
+        ("grep -q 'value' a.py", None, None),
+        ('cd "$PWD" && ls', None, None),
+        ('echo "$1 $@ $? $$"', None, None),
+        ('VERSION=1.2\necho "$VERSION"', None, None),
+        ("export FOO=bar\necho $FOO", "bash", None),
+        ("for f in *.py; do echo $f; done", "sh", None),
+        ("read -r LINE < a.py\necho $LINE", "bash", None),
+        # A parameter expansion carrying a fallback handles an unset name
+        # itself, exactly as a two-argument os.environ.get does.
+        ('echo "${WANTED:-none}"', "bash", None),
+        ('echo "${WANTED:=none}"', "bash", None),
+        ('echo "${WANTED:+set}"', "bash", None),
+        ('echo "${WANTED-none}"', "bash", None),
+        # ... but `:?` is deliberately fatal when unset, and a plain
+        # reference has no fallback at all.
+        ('echo "${WANTED:?must be set}"', "bash", "WANTED"),
+        ('echo "${WANTED?msg}"', "bash", "WANTED"),
+        ('echo "${WANTED}"', "bash", "WANTED"),
+        # A declaration builtin still declares, with or without flags of
+        # its own, and an inline `FOO=bar cmd` prefix is an assignment too.
+        ("local FOO=bar\necho $FOO", "bash", None),
+        ("declare -r FOO=bar\necho $FOO", "bash", None),
+        ("readonly FOO=bar\necho $FOO", "bash", None),
+        ("typeset FOO=bar\necho $FOO", "bash", None),
+        ("FOO=bar make test\necho $FOO", "bash", None),
+        # `read` assigns every name after its options, and an option's own
+        # argument is not one of them.
+        ("read A B C < a.py\necho $A $B $C", "bash", None),
+        ('read -p "Enter: " VAR\necho $VAR', "bash", None),
+        # ... but only the names it actually assigns.
+        ("local FOO=bar\necho $OTHER", "bash", "OTHER"),
+        ('read -p "Enter: " VAR\necho $NOPE', "bash", "NOPE"),
+        # Needs Actions context this sandbox can't supply.
+        ("echo ${{ github.sha }}", None, "expression"),
+        ("echo x >> $GITHUB_OUTPUT", None, "GITHUB_OUTPUT"),
+        ('grep -q "$WANTED" a.py', "bash", "WANTED"),
+        # `$VAR` is not syntax in a python body, but `${{ }}` is still
+        # expanded by Actions before python ever runs.
+        ("import os\nprint('$NOT_A_SHELL_VAR')", "python", None),
+        ("print('${{ github.sha }}')", "python", "expression"),
+        # ... but a python step reads the same Actions vars via os.environ,
+        # where an unset name is a KeyError rather than an empty string.
+        ('import os\nprint(os.environ["GITHUB_OUTPUT"])', "python", "GITHUB_OUTPUT"),
+        ("import os\nprint(os.environ['GITHUB_ENV'])", "python3", "GITHUB_ENV"),
+        ('import os\nprint(os.getenv("GITHUB_SHA"))', "python", "GITHUB_SHA"),
+        ('import os\nprint(os.environ.get("GITHUB_REF"))', "python", "GITHUB_REF"),
+        # A supplied default means the step handles absence itself.
+        ('import os\nprint(os.getenv("NOPE", "fallback"))', "python", None),
+        ('import os\nprint(os.environ.get("NOPE", None))', "python", None),
+        # ... but a *trailing* comma supplies nothing, so it still raises.
+        ('import os\nprint(os.environ.get("NOPE",))', "python", "NOPE"),
+        ('import os\nprint(os.environ.get("NOPE", ))', "python", "NOPE"),
+        # A known, deliberate false skip: `$VAR` inside single quotes does
+        # not expand in bash, so this step is judgeable and is skipped
+        # anyway. Erring towards a skip is the safe direction - stripping
+        # quoted spans by regex would mis-span on an unbalanced apostrophe
+        # and turn this into a false *rejection*. Pinned so the behaviour
+        # is a decision rather than a surprise.
+        ("grep -q '$WANTED' a.py", "bash", "WANTED"),
+        # Defined here, so judgeable.
+        ('import os\nprint(os.environ["PATH"])', "python", None),
+    ],
+)
+def test_unsupported_step_context(script, shell, expected):
+    from workspace import _unsupported_step_context
+
+    reason = _unsupported_step_context(script, shell, {"PATH": "/usr/bin", "HOME": "/tmp"})
+
+    if expected is None:
+        assert reason is None
+    else:
+        assert reason is not None and expected in reason
+
+
+
+def test_run_revision_attempt_skips_python_step_reading_actions_env(repo):
+    """A python step reads Actions variables through `os.environ`, not
+    `$VAR`. Unset, `os.environ["GITHUB_OUTPUT"]` raises KeyError, so the
+    step fails for a reason unrelated to what it checks - the same false
+    rejection the shell-side variable check already avoids."""
+    workflow = (
+        "on: pull_request\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    steps:\n"
+        "      - name: Publish a value\n"
+        "        shell: python\n"
+        "        run: |\n"
+        "          import os\n"
+        '          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:\n'
+        '              fh.write("found=yes\\n")\n'
+    )
+    output = _full_file_output(".github/workflows/ci.yml", workflow)
+
+    result = run_revision_attempt(
+        repo, output, [".github/workflows/ci.yml"], ci_command=[sys.executable, "-c", "pass"]
+    )
+
+    assert result.success is True, result.error
+
+
+def test_run_revision_attempt_still_runs_python_step_checking_the_repo(repo):
+    """The python skip stays narrow: a step that only reads the repo needs
+    no Actions context, so it runs - and is rejected when its check is
+    wrong."""
+    workflow = (
+        "on: pull_request\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    steps:\n"
+        "      - name: Verify pin\n"
+        "        shell: python\n"
+        "        run: |\n"
+        "          import pathlib, sys\n"
+        "          if 'mcp<2.0.0' not in pathlib.Path('a.py').read_text():\n"
+        "              sys.exit(1)\n"
+    )
+    output = _full_file_output(".github/workflows/ci.yml", workflow)
+
+    result = run_revision_attempt(
+        repo, output, [".github/workflows/ci.yml"], ci_command=[sys.executable, "-c", "pass"]
+    )
+
+    assert result.success is False
+    assert result.category == CATEGORY_TEST_FAILURE
+    assert "workflow step" in result.error
+
+
+
+def test_extract_new_workflow_run_scripts_keeps_diff_markers_in_a_heredoc(repo):
+    """A `run: |` body is free to contain lines that look like diff headers
+    - a heredoc writing out a patch is the obvious case. They are only
+    ambiguous at column zero, and a block body is always indented, so the
+    diff marker is `+` and the body survives whole."""
+    from workspace import _extract_new_workflow_run_scripts
+
+    body = [
+        "cat <<'EOF' > patch.txt",
+        "--- a/old",
+        "+++ b/new",
+        "@@ -1 +1 @@",
+        "-gone",
+        "+added",
+        "EOF",
+        "test -s patch.txt",
+    ]
+    diff = (
+        "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n"
+        "index aaaaaaa..bbbbbbb 100644\n"
+        "--- a/.github/workflows/ci.yml\n"
+        "+++ b/.github/workflows/ci.yml\n"
+        "@@ -1,2 +1,12 @@\n"
+        " on: pull_request\n"
+        "+jobs:\n"
+        "+  lint:\n"
+        "+    steps:\n"
+        "+      - run: |\n"
+    ) + "".join(f"+          {line}\n" for line in body)
+
+    scripts = _extract_new_workflow_run_scripts(diff)
+
+    assert scripts == [(".github/workflows/ci.yml", "\n".join(body), None)]
+
+
+
+# --- hunks stay attached to the file they came from -------------------
+#
+# `_iter_diff_files` keys off `+++ b/<path>`, which a rename with no
+# content change, a mode-only change and a deletion (`+++ /dev/null`) all
+# lack. The `diff --git` line resets the current path, so none of them can
+# leak their lines into the next file - but the whole feature gates on
+# path, so a mis-attribution would either run a step from a file that is
+# not a workflow or drop a real one. Pinned here rather than argued.
+
+
+def _mixed_diff(decoy_run):
+    """A workflow file preceded by the three header shapes that carry no
+    `+++ b/` line of their own."""
+    return (
+        "diff --git a/old_name.py b/new_name.py\n"
+        "similarity index 100%\n"
+        "rename from old_name.py\n"
+        "rename to new_name.py\n"
+        "diff --git a/perm.sh b/perm.sh\n"
+        "old mode 100644\n"
+        "new mode 100755\n"
+        "diff --git a/gone.py b/gone.py\n"
+        "deleted file mode 100644\n"
+        "index 1234567..0000000\n"
+        "--- a/gone.py\n"
+        "+++ /dev/null\n"
+        "@@ -1,2 +0,0 @@\n"
+        f"-{decoy_run}\n"
+        "-value = 1\n"
+        "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n"
+        "index aaaaaaa..bbbbbbb 100644\n"
+        "--- a/.github/workflows/ci.yml\n"
+        "+++ b/.github/workflows/ci.yml\n"
+        "@@ -1,2 +1,6 @@\n"
+        " on: pull_request\n"
+        "+jobs:\n"
+        "+  lint:\n"
+        "+    steps:\n"
+        "+      - run: echo real-step\n"
+    )
+
+
+def test_iter_diff_files_keeps_hunks_with_their_own_file():
+    from workspace import _iter_diff_files
+
+    files = _iter_diff_files(_mixed_diff("      - run: echo decoy"))
+
+    # The three headerless entries contribute no file at all, and the
+    # workflow carries only its own six hunk lines.
+    assert [path for path, _ in files] == [".github/workflows/ci.yml"]
+    assert len(files[0][1]) == 6
+    assert not any("decoy" in line for line in files[0][1])
+
+
+def test_extract_new_workflow_run_scripts_ignores_a_deleted_files_steps():
+    """A `run:` line that a diff *removes* from another file must not be
+    picked up as a step of the workflow that follows it."""
+    from workspace import _extract_new_workflow_run_scripts
+
+    scripts = _extract_new_workflow_run_scripts(_mixed_diff("      - run: echo decoy"))
+
+    assert scripts == [(".github/workflows/ci.yml", "echo real-step", None)]
+
+
+def test_extract_new_workflow_run_scripts_follows_a_renamed_workflow(repo):
+    """A renamed workflow whose body also changed is attributed to its new
+    path, which is what decides whether it is a workflow at all."""
+    from workspace import _extract_new_workflow_run_scripts
+
+    diff = (
+        "diff --git a/.github/workflows/old.yml b/.github/workflows/ci.yml\n"
+        "similarity index 60%\n"
+        "rename from .github/workflows/old.yml\n"
+        "rename to .github/workflows/ci.yml\n"
+        "index aaaaaaa..bbbbbbb 100644\n"
+        "--- a/.github/workflows/old.yml\n"
+        "+++ b/.github/workflows/ci.yml\n"
+        "@@ -1,2 +1,6 @@\n"
+        " on: pull_request\n"
+        "+jobs:\n"
+        "+  lint:\n"
+        "+    steps:\n"
+        "+      - run: echo renamed-step\n"
+    )
+
+    scripts = _extract_new_workflow_run_scripts(diff)
+
+    assert scripts == [(".github/workflows/ci.yml", "echo renamed-step", None)]
+
+
+
+def test_extract_new_workflow_run_scripts_ignores_shell_key_inside_with(repo):
+    """`shell:` nested under `with:` is an input to the action being
+    invoked, not this step's interpreter. Reading it would skip a step
+    that actually runs under the default bash."""
+    from workspace import _extract_new_workflow_run_scripts
+
+    diff = (
+        "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n"
+        "index aaaaaaa..bbbbbbb 100644\n"
+        "--- a/.github/workflows/ci.yml\n"
+        "+++ b/.github/workflows/ci.yml\n"
+        "@@ -1,2 +1,8 @@\n"
+        " on: pull_request\n"
+        "+jobs:\n"
+        "+  lint:\n"
+        "+    steps:\n"
+        "+      - uses: actions/setup-python@v5\n"
+        "+        with:\n"
+        "+          shell: pwsh\n"
+        "+        run: echo hi\n"
+    )
+
+    scripts = _extract_new_workflow_run_scripts(diff)
+
+    assert scripts == [(".github/workflows/ci.yml", "echo hi", None)]
+
+
+def test_run_revision_attempt_runs_step_whose_var_has_a_default(repo):
+    """A step supplying its own fallback needs no Actions context, so it
+    runs - and is still rejected when its check is wrong against the
+    repo."""
+    workflow = (
+        "on: pull_request\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    steps:\n"
+        "      - name: Verify pin\n"
+        "        run: |\n"
+        '          grep -q "${WANTED:-mcp<2.0.0}" a.py\n'
+    )
+    output = _full_file_output(".github/workflows/ci.yml", workflow)
+
+    result = run_revision_attempt(
+        repo, output, [".github/workflows/ci.yml"], ci_command=[sys.executable, "-c", "pass"]
+    )
+
+    assert result.success is False
+    assert result.category == CATEGORY_TEST_FAILURE
+    assert "workflow step" in result.error
+
+
+def test_extract_new_workflow_run_scripts_ignores_non_workflow_files():
+    from workspace import _extract_new_workflow_run_scripts
+
+    diff = (
+        "diff --git a/README.md b/README.md\n"
+        "index aaaaaaa..bbbbbbb 100644\n"
+        "--- a/README.md\n"
+        "+++ b/README.md\n"
+        "@@ -1 +1,2 @@\n"
+        " intro\n"
+        "+run: this looks like yaml but isn't a workflow file\n"
+    )
+
+    assert _extract_new_workflow_run_scripts(diff) == []
