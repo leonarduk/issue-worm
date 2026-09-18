@@ -1811,6 +1811,65 @@ _SHELL_COMMANDS: dict[str | None, list[str]] = {
     "python3": [sys.executable, "-c"],
 }
 
+# A step body is only a fair test of *its own* correctness when this
+# sandbox can supply everything it reads. Two things it cannot:
+#
+# `${{ ... }}`
+#     GitHub Actions expands expressions before the body ever reaches a
+#     shell. Handed to bash verbatim they are not merely unset, they are
+#     a hard parse error (`${{ github.sha }}` -> "bad substitution"), so
+#     the step fails for a reason that has nothing to do with what it
+#     checks.
+# an environment variable this sandbox does not define
+#     the Actions runtime file vars (`$GITHUB_OUTPUT`, `$GITHUB_ENV`,
+#     ...), and anything declared in a step/job/workflow `env:` block -
+#     which may not even appear in the diff, so there is no reliable way
+#     to reconstruct it. Unset, `echo x >> $GITHUB_OUTPUT` is an
+#     ambiguous redirect and `grep -q "$WANTED" f` matches everything.
+#
+# Either way the honest answer is "not checkable here", so the step is
+# skipped and noted, the same way an unsupported `shell:` is - a false
+# rejection would send the Coder off fixing a step that was correct.
+_ACTIONS_EXPRESSION_RE = re.compile(r"\$\{\{")
+_VAR_REF_RE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\b")
+_VAR_ASSIGN_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=", re.MULTILINE)
+_VAR_LOOP_RE = re.compile(r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\b")
+_VAR_READ_RE = re.compile(r"\bread\s+(?:-\S+\s+)*([A-Za-z_][A-Za-z0-9_]*)")
+
+# Names the shell itself provides, so a reference to one is not evidence
+# the step needs Actions context we can't supply.
+_SHELL_PROVIDED_VARS = frozenset(
+    {
+        "PWD", "OLDPWD", "IFS", "RANDOM", "LINENO", "SECONDS", "UID", "EUID",
+        "PPID", "HOSTNAME", "HOSTTYPE", "OSTYPE", "MACHTYPE", "REPLY",
+        "FUNCNAME", "SHLVL", "BASHPID", "BASH_VERSION", "BASH_SUBSHELL",
+    }
+)
+
+
+def _unsupported_step_context(
+    script: str, shell: str | None, env: dict[str, str]
+) -> str | None:
+    """Why ``script`` can't be judged in this sandbox, or ``None`` if it
+    can - see the comment above :data:`_ACTIONS_EXPRESSION_RE`."""
+    if _ACTIONS_EXPRESSION_RE.search(script):
+        return "it uses a ${{ }} expression the Actions runtime would expand"
+    if shell in ("python", "python3"):
+        # `$VAR` isn't syntax in a python body; the expression check above
+        # is the only Actions-context question that applies to one.
+        return None
+    defined = (
+        set(env)
+        | _SHELL_PROVIDED_VARS
+        | set(_VAR_ASSIGN_RE.findall(script))
+        | set(_VAR_LOOP_RE.findall(script))
+        | set(_VAR_READ_RE.findall(script))
+    )
+    missing = [name for name in _VAR_REF_RE.findall(script) if name not in defined]
+    if missing:
+        return f"it reads ${missing[0]}, which this sandbox does not define"
+    return None
+
 
 def _iter_diff_files(diff_output: str) -> list[tuple[str, list[str]]]:
     """Split a unified diff (as produced by :func:`get_working_diff`) into
@@ -1942,11 +2001,15 @@ def _run_new_workflow_step_scripts(
     non-zero exit is reported the same way a failing test is - the
     Verifier treats it as a normal failed attempt, so the Coder sees the
     real failure output on the next revision instead of the check being
-    silently trusted. A step under a ``shell:`` this helper can't run
-    (anything but bash/sh/python - see :data:`_SHELL_COMMANDS`) is noted
-    but does not fail the attempt: running it under the wrong interpreter
-    would produce a false rejection unrelated to the step's own
-    correctness.
+    silently trusted.
+
+    A step this sandbox can't judge is noted but does not fail the
+    attempt, because a false rejection would send the Coder off fixing a
+    step that was correct. Two cases: a ``shell:`` this helper can't run
+    (anything but bash/sh/python - see :data:`_SHELL_COMMANDS`), and a
+    body that needs Actions runtime context - a ``${{ }}`` expression or
+    an environment variable nothing here defines (see
+    :func:`_unsupported_step_context`).
     """
     scripts = _extract_new_workflow_run_scripts(diff_output)
     if not scripts:
@@ -1965,6 +2028,12 @@ def _run_new_workflow_step_scripts(
                     f"unsupported shell {shell!r}"
                 )
                 continue
+            unsupported = _unsupported_step_context(script, shell, env)
+            if unsupported:
+                output_parts.append(
+                    f"[{path}] skipped new/changed workflow step: {unsupported}"
+                )
+                continue
             try:
                 result = subprocess.run(
                     [*command, script],
@@ -1972,6 +2041,11 @@ def _run_new_workflow_step_scripts(
                     capture_output=True,
                     text=True,
                     encoding="utf-8",
+                    # A step is free to print whatever bytes it likes;
+                    # a strict decode would raise UnicodeDecodeError out
+                    # of here and kill run_revision_attempt instead of
+                    # reporting the step as a normal failed attempt.
+                    errors="replace",
                     env=env,
                     timeout=timeout,
                 )

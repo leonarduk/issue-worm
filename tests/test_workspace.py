@@ -2808,6 +2808,179 @@ def test_extract_new_workflow_run_scripts_reads_shell_key(repo):
     assert scripts == [(".github/workflows/ci.yml", "Write-Host hi", "pwsh")]
 
 
+# --- steps this sandbox can't fairly judge are skipped, not failed -----
+#
+# An extracted body runs as a plain shell script with none of the Actions
+# runtime around it, so a step reading context this sandbox can't supply
+# fails for a reason that has nothing to do with what the step checks.
+# Rejecting the attempt on that would send the Coder off "fixing" a step
+# that was already correct - exactly the false rejection the `shell:`
+# handling already avoids - so such a step is skipped and noted instead.
+
+
+def test_run_revision_attempt_skips_step_using_actions_expression(repo):
+    """`${{ }}` is expanded by Actions before a shell ever sees it; handed
+    to bash verbatim it is a hard parse error ("bad substitution")."""
+    workflow = (
+        "on: pull_request\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    steps:\n"
+        "      - name: Show the commit\n"
+        "        run: |\n"
+        "          echo ${{ github.sha }}\n"
+    )
+    output = _full_file_output(".github/workflows/ci.yml", workflow)
+
+    result = run_revision_attempt(
+        repo, output, [".github/workflows/ci.yml"], ci_command=[sys.executable, "-c", "pass"]
+    )
+
+    assert result.success is True, result.error
+
+
+def test_run_revision_attempt_skips_step_reading_actions_runtime_var(repo):
+    """`$GITHUB_OUTPUT` and friends only exist on a real runner; unset,
+    `echo x >> $GITHUB_OUTPUT` is an ambiguous redirect."""
+    workflow = (
+        "on: pull_request\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    steps:\n"
+        "      - name: Publish a value\n"
+        "        run: |\n"
+        "          echo 'found=yes' >> $GITHUB_OUTPUT\n"
+    )
+    output = _full_file_output(".github/workflows/ci.yml", workflow)
+
+    result = run_revision_attempt(
+        repo, output, [".github/workflows/ci.yml"], ci_command=[sys.executable, "-c", "pass"]
+    )
+
+    assert result.success is True, result.error
+
+
+def test_run_revision_attempt_still_runs_step_using_only_its_own_vars(repo):
+    """The skip is narrow: a step that defines the variables it reads needs
+    no Actions context, so it is still executed - and still rejected when
+    its own check is wrong against the repo (ai-systems-lab#214)."""
+    workflow = (
+        "on: pull_request\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    steps:\n"
+        "      - name: Verify pin\n"
+        "        run: |\n"
+        "          WANTED='mcp<2.0.0'\n"
+        '          grep -q "$WANTED" a.py\n'
+    )
+    output = _full_file_output(".github/workflows/ci.yml", workflow)
+
+    result = run_revision_attempt(
+        repo, output, [".github/workflows/ci.yml"], ci_command=[sys.executable, "-c", "pass"]
+    )
+
+    assert result.success is False
+    assert result.category == CATEGORY_TEST_FAILURE
+    assert "workflow step" in result.error
+
+
+def test_run_revision_attempt_survives_non_utf8_step_output(repo):
+    """A step is free to print whatever bytes it likes, and the helper must
+    report it as a normal failed attempt either way.
+
+    Decoding strictly does not fail the same way on every platform: on
+    POSIX the decode happens in the calling thread, so a stray 0xff raises
+    UnicodeDecodeError straight out of run_revision_attempt; on Windows it
+    happens in a reader thread, where the error is swallowed and the step's
+    output silently comes back empty. ``errors="replace"`` is what makes
+    both cases a plain, reported failure. The body goes through
+    ``shell: python`` so the raw bytes reach the pipe unmodified - a bash
+    ``printf`` is re-encoded by some shells (git-bash does), which would
+    leave this test exercising nothing.
+    """
+    workflow = (
+        "on: pull_request\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    steps:\n"
+        "      - name: Print raw bytes and fail\n"
+        "        shell: python\n"
+        "        run: |\n"
+        "          import sys\n"
+        '          sys.stdout.buffer.write(b"PREFIX \\xff\\xfe RAW")\n'
+        "          sys.stdout.buffer.flush()\n"
+        "          sys.exit(1)\n"
+    )
+    output = _full_file_output(".github/workflows/ci.yml", workflow)
+
+    result = run_revision_attempt(
+        repo, output, [".github/workflows/ci.yml"], ci_command=[sys.executable, "-c", "pass"]
+    )
+
+    assert result.success is False
+    assert result.category == CATEGORY_TEST_FAILURE
+    assert "workflow step" in result.error
+    # Decoded lossily rather than raising or silently dropping the output.
+    assert "PREFIX" in result.test_output
+
+
+def test_run_revision_attempt_reports_every_step_when_one_of_several_fails(repo):
+    """Several touched steps: each runs, and one failure fails the attempt
+    without hiding the others' output."""
+    workflow = (
+        "on: pull_request\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    steps:\n"
+        "      - run: echo first-step-marker\n"
+        "      - run: exit 1\n"
+        "      - run: echo third-step-marker\n"
+    )
+    output = _full_file_output(".github/workflows/ci.yml", workflow)
+
+    result = run_revision_attempt(
+        repo, output, [".github/workflows/ci.yml"], ci_command=[sys.executable, "-c", "pass"]
+    )
+
+    assert result.success is False
+    assert "first-step-marker" in result.test_output
+    assert "third-step-marker" in result.test_output
+    assert "FAILED" in result.test_output
+
+
+@pytest.mark.parametrize(
+    "script,shell,expected",
+    [
+        # Nothing but the repo's own content: judgeable, so not skipped.
+        ("grep -q 'value' a.py", None, None),
+        ('cd "$PWD" && ls', None, None),
+        ('echo "$1 $@ $? $$"', None, None),
+        ('VERSION=1.2\necho "$VERSION"', None, None),
+        ("export FOO=bar\necho $FOO", "bash", None),
+        ("for f in *.py; do echo $f; done", "sh", None),
+        ("read -r LINE < a.py\necho $LINE", "bash", None),
+        # Needs Actions context this sandbox can't supply.
+        ("echo ${{ github.sha }}", None, "expression"),
+        ("echo x >> $GITHUB_OUTPUT", None, "GITHUB_OUTPUT"),
+        ('grep -q "$WANTED" a.py', "bash", "WANTED"),
+        # `$VAR` is not syntax in a python body, but `${{ }}` is still
+        # expanded by Actions before python ever runs.
+        ("import os\nprint('$NOT_A_SHELL_VAR')", "python", None),
+        ("print('${{ github.sha }}')", "python", "expression"),
+    ],
+)
+def test_unsupported_step_context(script, shell, expected):
+    from workspace import _unsupported_step_context
+
+    reason = _unsupported_step_context(script, shell, {"PATH": "/usr/bin", "HOME": "/tmp"})
+
+    if expected is None:
+        assert reason is None
+    else:
+        assert reason is not None and expected in reason
+
+
 def test_extract_new_workflow_run_scripts_ignores_non_workflow_files():
     from workspace import _extract_new_workflow_run_scripts
 
