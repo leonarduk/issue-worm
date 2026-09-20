@@ -23,6 +23,7 @@ from workspace import (
     WorkspaceError,
     _apply_search_replace,
     _detect_line_repetition,
+    _detect_truncated_rewrite,
     _non_interactive_env,
     _RollbackGuard,
     _redact_url,
@@ -2323,6 +2324,99 @@ def test_detect_line_repetition_thresholds():
     # Blank-line runs are padding, not a loop.
     assert _detect_line_repetition("\n" * 100) is None
     assert _detect_line_repetition(block * 20) == "a 3-line block repeated 20 times in a row"
+
+
+# --- truncated full-file rewrites (leonarduk/allotmint-pro#44) ----------------
+#
+# A reply cut off mid-file parses exactly like a complete one: the declared
+# section is there, so the missing-file check passes, and it does not repeat
+# itself, so the loop check passes. Only comparing the body against the file
+# it is about to overwrite shows that most of it is gone.
+
+
+def _numbered_lines(n):
+    return "".join(f"line_{i} = {i}\n" for i in range(n))
+
+
+def test_detect_truncated_rewrite_thresholds():
+    big = _numbered_lines(400)
+    assert _detect_truncated_rewrite(big, _numbered_lines(100)) == (
+        "keeps 100 of 400 lines - looks like a truncated rewrite, refusing to apply it"
+    )
+    # Exactly at the ratio is still refused; a line over it is allowed.
+    assert _detect_truncated_rewrite(big, _numbered_lines(200)) is not None
+    assert _detect_truncated_rewrite(big, _numbered_lines(201)) is None
+    # Below the floor nothing is judged - gutting a short file is ordinary
+    # work, and there is no truncation signal worth reading in it.
+    assert _detect_truncated_rewrite(_numbered_lines(199), "x = 1\n") is None
+    # Growing a file never trips it.
+    assert _detect_truncated_rewrite(big, _numbered_lines(800)) is None
+
+
+def test_apply_refuses_a_full_rewrite_that_dropped_most_of_the_file(repo):
+    """The recorded failure: a 400-line module comes back as 50 plausible
+    lines. The old code wrote it and reported success."""
+    target = Path(repo) / "big.py"
+    target.write_text(_numbered_lines(400))
+    (change,) = parse_coder_output(
+        _full_file_output("big.py", _numbered_lines(50).rstrip("\n")), ["big.py"]
+    )
+
+    with pytest.raises(MalformedOutputError, match=r"keeps 50 of 400 lines"):
+        apply_file_change(repo, change)
+
+    # Refused before the write, so the real file is still intact.
+    assert target.read_text() == _numbered_lines(400)
+
+
+def test_apply_allows_a_large_but_deliberate_deletion(repo):
+    """Removing a quarter of a big file is a normal change, not truncation."""
+    target = Path(repo) / "big.py"
+    target.write_text(_numbered_lines(400))
+    (change,) = parse_coder_output(
+        _full_file_output("big.py", _numbered_lines(300).rstrip("\n")), ["big.py"]
+    )
+
+    assert apply_file_change(repo, change) is None
+    assert target.read_text() == _numbered_lines(300)
+
+
+def test_apply_does_not_judge_a_small_file(repo):
+    """a.py is one line; rewriting it wholesale must stay legal."""
+    (change,) = parse_coder_output(_full_file_output("a.py", "value = 2"), ["a.py"])
+
+    assert apply_file_change(repo, change) is None
+    assert (Path(repo) / "a.py").read_text() == "value = 2\n"
+
+
+def test_apply_does_not_judge_a_file_that_does_not_exist_yet(repo):
+    """A new file has nothing to shrink from."""
+    (change,) = parse_coder_output(_full_file_output("new.py", "x = 1"), ["new.py"])
+
+    assert apply_file_change(repo, change) is None
+    assert (Path(repo) / "new.py").read_text() == "x = 1\n"
+
+
+def test_revision_attempt_rejects_a_truncated_rewrite_as_output_shape(repo):
+    """End to end: the attempt fails, is categorised as output_shape (so a
+    caller can retry on shape rather than logic), and the tree is rolled
+    back - instead of reporting a destructive rewrite as a success."""
+    target = Path(repo) / "big.py"
+    target.write_text(_numbered_lines(400))
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "big")
+
+    result = run_revision_attempt(
+        repo,
+        _full_file_output("big.py", _numbered_lines(50).rstrip("\n")),
+        ["big.py"],
+        ci_command=[sys.executable, "-c", "pass"],
+    )
+
+    assert not result.success
+    assert result.category == CATEGORY_OUTPUT_SHAPE
+    assert "truncated rewrite" in result.error
+    assert target.read_text() == _numbered_lines(400)
 
 
 # --- MODE: EDIT (SEARCH/REPLACE blocks) ---------------------------------------

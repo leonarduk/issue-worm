@@ -684,6 +684,46 @@ def _detect_line_repetition(body: str) -> str | None:
     return f"a {block_len}-line block repeated {repeats} times in a row"
 
 
+# A MODE: FULL section replaces its whole file, so a reply that ran out of
+# room mid-file still parses cleanly: the section is present (the missing-
+# declared-file(s) check only fires when one is absent, never when one is
+# short) and it does not repeat itself (so _detect_line_repetition sees
+# nothing). What lands is a fraction of the file that was there, and the
+# attempt is reported as a success.
+#
+# Recorded live (leonarduk/allotmint-pro#44, 2026-09-20): three separate
+# coders - a local 7B, a local 14B, and a cloud model that hit its
+# 32768-token output cap - each rewrote a 1583-line CDK stack as 341-366
+# lines of plausible, correct-looking code that kept the imports and the
+# class but dropped ~77% of the body. All three runs finished "completed".
+#
+# Only a rewrite of an existing file can be judged this way, and only a
+# substantial one: deleting most of a short file is ordinary work, and so
+# is a deliberate cut. Both thresholds are deliberately permissive - the
+# aim is to catch a body that lost most of a large file, not to police
+# deletions.
+_MIN_REWRITE_LINES = 200
+_MAX_REWRITE_SHRINK = 0.5
+
+
+def _detect_truncated_rewrite(before: str, after: str) -> str | None:
+    """Flag a MODE: FULL body that drops most of the file it replaces.
+
+    Returns a short description of the shrinkage, or None when the file
+    was too small to judge or enough of it survived.
+    """
+    old = len(before.splitlines())
+    if old < _MIN_REWRITE_LINES:
+        return None
+    new = len(after.splitlines())
+    if new > old * _MAX_REWRITE_SHRINK:
+        return None
+    return (
+        f"keeps {new} of {old} lines - looks like a truncated rewrite, "
+        "refusing to apply it"
+    )
+
+
 def _resolve_repeated_sections(
     sections: list[tuple[str, str, str, str | None]],
 ) -> list[tuple[str, str, str, str | None]]:
@@ -1152,13 +1192,32 @@ def apply_file_change(repo_path: str, change: FileChange) -> str | None:
     current tree - checked before the real apply so a bad patch can't
     partially land. The error carries the STRICT rung's git message, which
     names the first mismatching hunk and is the most useful to a reader.
+
+    Also raises MalformedOutputError when a MODE_FULL body would replace an
+    existing file with a fraction of its lines (see
+    :func:`_detect_truncated_rewrite`) - a reply cut off mid-file parses
+    like a complete one, so this is the only place it can be caught.
     """
     if change.mode == MODE_FULL:
         target = Path(repo_path) / change.path
-        target.parent.mkdir(parents=True, exist_ok=True)
         content = change.body
         if content and not content.endswith("\n"):
             content += "\n"
+        if target.is_file():
+            # Checked before the write, not after: a full-file section is
+            # the one mode that destroys what it replaces, so a body that
+            # lost most of the file has to be refused rather than written
+            # and rolled back. errors="replace" because this is a size
+            # comparison - a file that doesn't decode cleanly still has a
+            # line count worth knowing, and refusing to apply over it for
+            # an encoding reason would be its own bug.
+            before = target.read_text(encoding="utf-8", errors="replace")
+            shrink = _detect_truncated_rewrite(before, content)
+            if shrink is not None:
+                raise MalformedOutputError(
+                    f"MODE: {MODE_FULL} section for {change.path!r} {shrink}"
+                )
+        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         return None
 
