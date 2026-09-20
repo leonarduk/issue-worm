@@ -26,7 +26,7 @@ dependencies = [
     # Kept current by .github/workflows/update-dependencies.yml, which also
     # rewrites the copies in requirements.txt and _ai-pr-review.yml - the
     # three must always name the same tag.
-    "cicaid-devtools[dotenv] @ git+https://github.com/leonarduk/cicaid.git@v0.5.2",
+    "cicaid-devtools[dotenv] @ git+https://github.com/leonarduk/cicaid.git@v0.5.3",
     "python-dotenv>=1.0",
     # Direct imports in version_checker.py (the update check).
     "packaging>=24,<27",
