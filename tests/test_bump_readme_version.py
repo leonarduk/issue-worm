@@ -81,3 +81,19 @@ def test_real_readme_has_a_pinned_wheel_url_the_script_can_rewrite():
     rewrite on release."""
     text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
     assert bump(text, "v9.9.9") != text
+
+def test_real_readme_is_not_modified_by_bump(tmp_path):
+    """Ensures that the real README is not modified when running the bump script."""
+    temp_readme = tmp_path / "README.md"
+    real_readme_content = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    temp_readme.write_text(real_readme_content, encoding="utf-8")
+
+    import bump_readme_version
+
+    monkeypatch.setattr(bump_readme_version, "README_PATH", temp_readme)
+
+    with patch.object(sys, "argv", ["bump_readme_version.py", "v9.9.9"]):
+        assert main() == 0
+
+    # Check that the real README content is unchanged
+    assert (REPO_ROOT / "README.md").read_text(encoding="utf-8") == real_readme_content
