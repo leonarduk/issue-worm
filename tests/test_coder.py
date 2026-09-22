@@ -59,6 +59,31 @@ def test_default_ollama_model_uses_get_coder_model_when_ollama_tools_installed(m
     assert _default_ollama_model() == "qwen3.8-216k"
 
 
+def test_default_ollama_model_falls_back_when_get_coder_model_raises(monkeypatch):
+    """get_coder_model() probes live GPU state (nvidia-smi) - a driver
+    hiccup or any other unexpected failure must not raise out of coder
+    construction (#458 review)."""
+
+    def _raise():
+        raise RuntimeError("nvidia-smi exploded")
+
+    fake_coder_model = type("FakeModule", (), {"get_coder_model": staticmethod(_raise)})()
+    fake_package = type("FakePackage", (), {})()
+
+    monkeypatch.setitem(sys.modules, "ollama_tools", fake_package)
+    monkeypatch.setitem(sys.modules, "ollama_tools.coder_model", fake_coder_model)
+    assert _default_ollama_model() == DEFAULT_OLLAMA_MODEL
+
+
+def test_default_ollama_model_falls_back_when_get_coder_model_returns_empty(monkeypatch):
+    fake_coder_model = type("FakeModule", (), {"get_coder_model": staticmethod(lambda: "")})()
+    fake_package = type("FakePackage", (), {})()
+
+    monkeypatch.setitem(sys.modules, "ollama_tools", fake_package)
+    monkeypatch.setitem(sys.modules, "ollama_tools.coder_model", fake_coder_model)
+    assert _default_ollama_model() == DEFAULT_OLLAMA_MODEL
+
+
 def test_local_ollama_coder_uses_default_ollama_model_when_unset(monkeypatch):
     monkeypatch.setattr(coder, "_default_ollama_model", lambda: "picked-by-vram")
     local_coder = LocalOllamaCoder()

@@ -83,14 +83,20 @@ def _default_ollama_model() -> str:
     (the ``vram`` extra) -- it targets one specific machine's NVIDIA/eGPU
     setup, so most installs of issue-worm will not have it. When it is
     importable, its ``get_coder_model()`` picks a model sized to the VRAM
-    actually attached right now; otherwise this falls back to
-    DEFAULT_OLLAMA_MODEL, unchanged from before.
+    actually attached right now (it shells out to ``nvidia-smi``); otherwise,
+    or if that probe fails or returns nothing usable, this falls back to
+    DEFAULT_OLLAMA_MODEL, unchanged from before. Every failure mode here --
+    missing package, a driver hiccup, an unexpected empty result -- must
+    still let LocalOllamaCoder construct with a usable model, so nothing
+    below is allowed to raise out of this function.
     """
     try:
         from ollama_tools.coder_model import get_coder_model
-    except ImportError:
+
+        model = get_coder_model()
+    except Exception:  # noqa: BLE001 - any failure here (missing package, GPU probe error) must fall back, never raise out of coder construction
         return DEFAULT_OLLAMA_MODEL
-    return get_coder_model()
+    return model or DEFAULT_OLLAMA_MODEL
 
 
 class LocalOllamaCoder:
