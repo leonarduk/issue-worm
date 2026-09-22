@@ -37,6 +37,14 @@ dependencies = [
 dev = [
     "pytest>=7.0",
 ]
+# Lets coder._default_ollama_model() auto-pick a local coder model sized to
+# the VRAM actually attached, instead of the fixed DEFAULT_OLLAMA_MODEL
+# fallback. NVIDIA/Windows+Linux only (nvidia-smi), so this is opt-in
+# rather than a core dependency - most installs of issue-worm (cloud/
+# remote/claude sources, non-NVIDIA machines) have no use for it.
+vram = [
+    "ollama-tools @ git+https://github.com/leonarduk/laptop-egpu-llm.git",
+]
 
 [project.scripts]
 issue-worm = "cli:main"

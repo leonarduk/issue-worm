@@ -76,6 +76,23 @@ DEFAULT_LMSTUDIO_ENDPOINT = "http://localhost:1234"
 LMSTUDIO_MODEL_LOOKUP_TIMEOUT_SECONDS = 5
 
 
+def _default_ollama_model() -> str:
+    """The model LocalOllamaCoder uses when CODER_OLLAMA_MODEL is unset.
+
+    ``ollama-tools`` (leonarduk/laptop-egpu-llm) is an optional dependency
+    (the ``vram`` extra) -- it targets one specific machine's NVIDIA/eGPU
+    setup, so most installs of issue-worm will not have it. When it is
+    importable, its ``get_coder_model()`` picks a model sized to the VRAM
+    actually attached right now; otherwise this falls back to
+    DEFAULT_OLLAMA_MODEL, unchanged from before.
+    """
+    try:
+        from ollama_tools.coder_model import get_coder_model
+    except ImportError:
+        return DEFAULT_OLLAMA_MODEL
+    return get_coder_model()
+
+
 class LocalOllamaCoder:
     """Proposes file changes for one issue via a local Ollama instance."""
 
@@ -86,7 +103,7 @@ class LocalOllamaCoder:
         timeout: int = REQUEST_TIMEOUT_SECONDS,
     ):
         self.endpoint = (endpoint or DEFAULT_OLLAMA_ENDPOINT).rstrip("/")
-        self.model = model or DEFAULT_OLLAMA_MODEL
+        self.model = model or _default_ollama_model()
         self.timeout = timeout
 
     def propose(self, workspace_dir: str, task: str, files: list[str]) -> str:
