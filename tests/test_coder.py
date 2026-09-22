@@ -1,10 +1,12 @@
 """Tests for the coders used by the free-tier `build` flow."""
 
+import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
 import requests
 
+import coder
 from coder import (
     DEFAULT_DEEPSEEK_ENDPOINT,
     DEFAULT_DEEPSEEK_MAX_TOKENS,
@@ -16,6 +18,7 @@ from coder import (
     CoderConfigError,
     LocalOllamaCoder,
     RemoteOpenAICoder,
+    _default_ollama_model,
     build_coder,
 )
 from config import RoleConfig
@@ -32,10 +35,59 @@ def _mock_response(json_body, status_ok=True):
 
 
 def test_defaults_used_when_not_configured():
-    coder = LocalOllamaCoder()
+    local_coder = LocalOllamaCoder()
 
-    assert coder.endpoint == DEFAULT_OLLAMA_ENDPOINT
-    assert coder.model == DEFAULT_OLLAMA_MODEL
+    assert local_coder.endpoint == DEFAULT_OLLAMA_ENDPOINT
+    assert local_coder.model == DEFAULT_OLLAMA_MODEL
+
+
+def test_default_ollama_model_falls_back_without_ollama_tools():
+    """ollama-tools is an optional extra - it isn't installed in this test
+    environment, so _default_ollama_model() must return the pre-existing
+    fixed default rather than raising ImportError."""
+    assert _default_ollama_model() == DEFAULT_OLLAMA_MODEL
+
+
+def test_default_ollama_model_uses_get_coder_model_when_ollama_tools_installed(monkeypatch):
+    fake_coder_model = type(
+        "FakeModule", (), {"get_coder_model": staticmethod(lambda: "qwen3.8-216k")}
+    )()
+    fake_package = type("FakePackage", (), {})()
+
+    monkeypatch.setitem(sys.modules, "ollama_tools", fake_package)
+    monkeypatch.setitem(sys.modules, "ollama_tools.coder_model", fake_coder_model)
+    assert _default_ollama_model() == "qwen3.8-216k"
+
+
+def test_default_ollama_model_falls_back_when_get_coder_model_raises(monkeypatch):
+    """get_coder_model() probes live GPU state (nvidia-smi) - a driver
+    hiccup or any other unexpected failure must not raise out of coder
+    construction (#458 review)."""
+
+    def _raise():
+        raise RuntimeError("nvidia-smi exploded")
+
+    fake_coder_model = type("FakeModule", (), {"get_coder_model": staticmethod(_raise)})()
+    fake_package = type("FakePackage", (), {})()
+
+    monkeypatch.setitem(sys.modules, "ollama_tools", fake_package)
+    monkeypatch.setitem(sys.modules, "ollama_tools.coder_model", fake_coder_model)
+    assert _default_ollama_model() == DEFAULT_OLLAMA_MODEL
+
+
+def test_default_ollama_model_falls_back_when_get_coder_model_returns_empty(monkeypatch):
+    fake_coder_model = type("FakeModule", (), {"get_coder_model": staticmethod(lambda: "")})()
+    fake_package = type("FakePackage", (), {})()
+
+    monkeypatch.setitem(sys.modules, "ollama_tools", fake_package)
+    monkeypatch.setitem(sys.modules, "ollama_tools.coder_model", fake_coder_model)
+    assert _default_ollama_model() == DEFAULT_OLLAMA_MODEL
+
+
+def test_local_ollama_coder_uses_default_ollama_model_when_unset(monkeypatch):
+    monkeypatch.setattr(coder, "_default_ollama_model", lambda: "picked-by-vram")
+    local_coder = LocalOllamaCoder()
+    assert local_coder.model == "picked-by-vram"
 
 
 def test_local_propose_passes_timeout_to_requests_post(tmp_path):

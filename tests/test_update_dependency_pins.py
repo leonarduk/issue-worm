@@ -58,6 +58,12 @@ PYPROJECT = (
     'cicaid.git@v0.8.1",\n'
     '    "python-dotenv>=1.0",\n'
     "]\n"
+    "\n"
+    "[project.optional-dependencies]\n"
+    "vram = [\n"
+    '    "ollama-tools @ git+https://github.com/leonarduk/'
+    'laptop-egpu-llm.git@v0.1.0",\n'
+    "]\n"
 )
 # The two pins sit on adjacent lines of the pins file, so "rewrite one
 # without touching the other" is still the sharp edge -- a different shape
@@ -110,6 +116,31 @@ def test_free_update_rewrites_every_file_that_pins_it(repo):
     }
     for name, pin in expected.items():
         assert pin in _read(repo.joinpath(*name.split("/")))
+
+
+def test_ollama_tools_update_rewrites_pyproject_only(repo):
+    # ollama-tools is pinned only in pyproject.toml's `vram` extra - unlike
+    # the cicaid pair, it has no pins-file line at all.
+    changed = apply_update("ollama-tools", "0.2.0", root=repo)
+    assert changed == ["pyproject.toml"]
+    assert "laptop-egpu-llm.git@v0.2.0" in _read(repo / "pyproject.toml")
+    assert _read(repo / "requirements.txt") == REQUIREMENTS
+    assert _read(repo.joinpath(*CICAID_PINS.split("/"))) == CICAID_PINS_TEXT
+
+
+def test_ollama_tools_current_pin(repo):
+    assert current_pin("ollama-tools", root=repo) == "0.1.0"
+
+
+def test_latest_ollama_tools_does_not_pass_token():
+    with patch(
+        "update_dependency_pins._http_json", return_value={"tag_name": "v0.2.0"}
+    ) as mock_http:
+        latest_version("ollama-tools", token="secret")
+        mock_http.assert_called_once_with(
+            "https://api.github.com/repos/leonarduk/laptop-egpu-llm/releases/latest",
+            token=None,
+        )
 
 
 def test_pro_update_rewrites_the_pins_file_only(repo):
@@ -339,6 +370,7 @@ def test_real_repo_pins_are_readable_and_agree():
     """
     assert current_pin("cicaid-devtools", root=REPO_ROOT)
     assert current_pin("cicaid-devtools-pro", root=REPO_ROOT)
+    assert current_pin("ollama-tools", root=REPO_ROOT)
 
 
 def test_script_imports_only_stdlib():
