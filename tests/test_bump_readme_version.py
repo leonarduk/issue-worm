@@ -78,6 +78,30 @@ def test_main_without_version_arg_errors(capsys):
 def test_real_readme_has_a_pinned_wheel_url_the_script_can_rewrite():
     """Guards against the README drifting into a form (e.g. back to
     `pip install issue-worm`, #194) that bump() can no longer find and
-    rewrite on release."""
-    text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-    assert bump(text, "v9.9.9") != text
+    rewrite on release.
+
+    Runs the script's logic against the *real* README.md with a realistic
+    version string, asserting successful execution and correct wheel-URL
+    rewriting — without modifying the actual file.
+    """
+    readme_path = REPO_ROOT / "README.md"
+    original = readme_path.read_text(encoding="utf-8")
+
+    # bump() must complete without raising (successful execution)
+    updated = bump(original, "v9.9.9")
+
+    # The script must actually rewrite something (regex still matches)
+    assert updated != original, (
+        "bump() returned the README unchanged; the pinned wheel URL "
+        "may have drifted out of the regex the script expects."
+    )
+
+    # The new version must appear in the wheel-URL location
+    assert "v9.9.9" in updated
+    assert "issue_worm-9.9.9-py3-none-any.whl" in updated
+
+    # Idempotency: running bump again with the same version is a no-op
+    assert bump(updated, "v9.9.9") == updated
+
+    # The real README on disk must be unmodified
+    assert readme_path.read_text(encoding="utf-8") == original
