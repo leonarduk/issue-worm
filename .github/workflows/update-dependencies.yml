@@ -40,7 +40,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        dependency: [cicaid-devtools, cicaid-devtools-pro]
+        dependency: [cicaid-devtools, cicaid-devtools-pro, ollama-tools]
 
     steps:
       - uses: actions/checkout@v4
@@ -86,16 +86,20 @@ jobs:
           # the PR UI. Use a "-" in the branch name only; the commit
           # message, PR title, and issue title all keep the true version.
           BRANCH_VERSION=${NEW_VERSION//+/-}
-          if [[ "${{ matrix.dependency }}" == "cicaid-devtools" ]]; then
-            RELEASE_URL="https://github.com/leonarduk/cicaid/releases/tag/v${NEW_VERSION}"
-            RELEASE_NOTE=""
-          else
-            # This repo is public but leonarduk/cicaid-pro is not, so the
-            # release link 404s for readers without access to it. The pinned
-            # version itself is already public in _ai-pr-review.yml.
-            RELEASE_URL="https://github.com/leonarduk/cicaid-pro/releases/tag/v${NEW_VERSION}"
-            RELEASE_NOTE=" (private repo; requires access)"
-          fi
+          case "${{ matrix.dependency }}" in
+            cicaid-devtools)
+              RELEASE_URL="https://github.com/leonarduk/cicaid/releases/tag/v${NEW_VERSION}"
+              RELEASE_NOTE="" ;;
+            cicaid-devtools-pro)
+              # This repo is public but leonarduk/cicaid-pro is not, so the
+              # release link 404s for readers without access to it. The
+              # pinned version itself is already public in _ai-pr-review.yml.
+              RELEASE_URL="https://github.com/leonarduk/cicaid-pro/releases/tag/v${NEW_VERSION}"
+              RELEASE_NOTE=" (private repo; requires access)" ;;
+            ollama-tools)
+              RELEASE_URL="https://github.com/leonarduk/laptop-egpu-llm/releases/tag/v${NEW_VERSION}"
+              RELEASE_NOTE="" ;;
+          esac
           {
             echo "old_version=$OLD_VERSION"
             echo "new_version=$NEW_VERSION"
@@ -179,6 +183,18 @@ jobs:
           bash .github/scripts/pip_install_cicaid_pro.sh python -m pip install \
             "cicaid-devtools @ git+https://github.com/leonarduk/cicaid.git@${CICAID_PIN}" \
             "cicaid-devtools-pro @ git+https://github.com/leonarduk/cicaid-pro.git@v${{ steps.check.outputs.new_version }}"
+
+      # ollama-tools is an optional extra (`vram`), installed by no other
+      # step in this repo's CI - this is the only thing that proves a new
+      # tag actually resolves before the PR is opened.
+      - name: Smoke-install ollama-tools from the updated pin
+        if: >-
+          matrix.dependency == 'ollama-tools'
+          && steps.check.outputs.new_version != ''
+          && steps.skip.outputs.skip != 'true'
+        run: |
+          python -m pip install \
+            "ollama-tools @ git+https://github.com/leonarduk/laptop-egpu-llm.git@v${{ steps.check.outputs.new_version }}"
 
       - name: Create or reuse linked issue for the update
         id: issue

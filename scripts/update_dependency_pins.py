@@ -1,6 +1,6 @@
-"""Check and update the repo's pinned cicaid versions (issue #142).
+"""Check and update the repo's pinned cicaid/ollama-tools versions (issue #142, #458).
 
-Two dependencies are tracked:
+Three dependencies are tracked:
 
 - cicaid-devtools — the public leonarduk/cicaid "free shell", pinned in
   three places: as a git+https URL in ``requirements.txt`` and
@@ -14,6 +14,11 @@ Two dependencies are tracked:
   review_comment, deepseek_review, gpt_review, ...) live in that package,
   but issue-worm itself never depends on it. "latest" comes from the GitHub
   Releases API, which needs GITHUB_TOKEN since cicaid-pro is private.
+- ollama-tools — the public leonarduk/laptop-egpu-llm, pinned only as a
+  git+https URL in ``pyproject.toml``'s optional ``vram`` extra (#458):
+  coder._default_ollama_model() imports it to auto-pick a coder model sized
+  to the VRAM actually attached. "latest" comes from the GitHub Releases
+  API, no token needed since the repo is public.
 
 Both review-workflow pins moved out of ``.github/workflows/_ai-pr-review.yml``
 and into the pins file (#142, #156): GitHub hard-blocks a workflow's default
@@ -62,13 +67,18 @@ PYPROJECT = "pyproject.toml"
 # arrangement changes: the same two pins, still rewritten by this script.
 CICAID_PINS = ".github/cicaid-pins.env"
 
-DEPS = ("cicaid-devtools", "cicaid-devtools-pro")
+DEPS = ("cicaid-devtools", "cicaid-devtools-pro", "ollama-tools")
 
 CICAID_FREE_RELEASES_API = (
     "https://api.github.com/repos/leonarduk/cicaid/releases/latest"
 )
 CICAID_PRO_RELEASES_API = (
     "https://api.github.com/repos/leonarduk/cicaid-pro/releases/latest"
+)
+# ollama-tools (leonarduk/laptop-egpu-llm) backs coder._default_ollama_model()
+# via the optional `vram` extra (#458) - public repo, no token needed.
+OLLAMA_TOOLS_RELEASES_API = (
+    "https://api.github.com/repos/leonarduk/laptop-egpu-llm/releases/latest"
 )
 
 # Each dependency is pinned in two syntaxes now: a git+https URL in
@@ -90,6 +100,13 @@ _CICAID_FREE_PIN_RE = re.compile(
 )
 _CICAID_PRO_PIN_RE = re.compile(
     r"(git\+https://github\.com/leonarduk/cicaid-pro\.git@v|^CICAID_PRO_REF=v)"
+    r"([0-9][A-Za-z0-9.+-]*)",
+    re.MULTILINE,
+)
+# ollama-tools has one pin location only (pyproject.toml's `vram` extra),
+# so no pins-file alternative branch is needed here, unlike the cicaid pair.
+_OLLAMA_TOOLS_PIN_RE = re.compile(
+    r"(git\+https://github\.com/leonarduk/laptop-egpu-llm\.git@v)"
     r"([0-9][A-Za-z0-9.+-]*)",
     re.MULTILINE,
 )
@@ -122,6 +139,13 @@ _SPECS = {
         needs_token=True,
         files=(CICAID_PINS,),
         repo_slug="cicaid-pro",
+    ),
+    "ollama-tools": _Spec(
+        pin_re=_OLLAMA_TOOLS_PIN_RE,
+        releases_api=OLLAMA_TOOLS_RELEASES_API,
+        needs_token=False,
+        files=(PYPROJECT,),
+        repo_slug="laptop-egpu-llm",
     ),
 }
 
@@ -270,12 +294,17 @@ def _rewrite(dep: str, text: str, new_version: str) -> str:
 
     new_text, count = spec.pin_re.subn(replace, text)
     if count == 0:
-        raise PinError(
-            f"could not find the {dep} pin in the file (expected "
-            f"git+https://github.com/leonarduk/{spec.repo_slug}.git@vX.Y.Z, or "
-            f"a {'CICAID_PRO_REF' if spec.needs_token else 'CICAID_REF'}=vX.Y.Z "
-            f"line in {CICAID_PINS})"
-        )
+        expected = f"git+https://github.com/leonarduk/{spec.repo_slug}.git@vX.Y.Z"
+        # The cicaid pair also carries a CICAID[_PRO]_REF=vX.Y.Z line in the
+        # pins file; ollama-tools has no such second syntax (its only pin
+        # location is pyproject.toml's `vram` extra), so only mention it
+        # when the pins file is actually one of this dependency's files.
+        if CICAID_PINS in spec.files:
+            expected += (
+                f", or a {'CICAID_PRO_REF' if spec.needs_token else 'CICAID_REF'}"
+                f"=vX.Y.Z line in {CICAID_PINS}"
+            )
+        raise PinError(f"could not find the {dep} pin in the file (expected {expected})")
     return new_text
 
 
