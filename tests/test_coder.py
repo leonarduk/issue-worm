@@ -50,7 +50,7 @@ def test_default_ollama_model_falls_back_without_ollama_tools():
 
 def test_default_ollama_model_uses_get_coder_model_when_ollama_tools_installed(monkeypatch):
     fake_coder_model = type(
-        "FakeModule", (), {"get_coder_model": staticmethod(lambda: "qwen3.8-216k")}
+        "FakeModule", (), {"get_coder_model": staticmethod(lambda strategy: "qwen3.8-216k")}
     )()
     fake_package = type("FakePackage", (), {})()
 
@@ -64,7 +64,7 @@ def test_default_ollama_model_falls_back_when_get_coder_model_raises(monkeypatch
     hiccup or any other unexpected failure must not raise out of coder
     construction (#458 review)."""
 
-    def _raise():
+    def _raise(strategy):
         raise RuntimeError("nvidia-smi exploded")
 
     fake_coder_model = type("FakeModule", (), {"get_coder_model": staticmethod(_raise)})()
@@ -76,12 +76,87 @@ def test_default_ollama_model_falls_back_when_get_coder_model_raises(monkeypatch
 
 
 def test_default_ollama_model_falls_back_when_get_coder_model_returns_empty(monkeypatch):
-    fake_coder_model = type("FakeModule", (), {"get_coder_model": staticmethod(lambda: "")})()
+    fake_coder_model = type(
+        "FakeModule", (), {"get_coder_model": staticmethod(lambda strategy: "")}
+    )()
     fake_package = type("FakePackage", (), {})()
 
     monkeypatch.setitem(sys.modules, "ollama_tools", fake_package)
     monkeypatch.setitem(sys.modules, "ollama_tools.coder_model", fake_coder_model)
     assert _default_ollama_model() == DEFAULT_OLLAMA_MODEL
+
+
+def _fake_ollama_tools(monkeypatch, capture: list[str]):
+    """Install a fake ollama_tools.coder_model whose get_coder_model records
+    the strategy it was called with and returns a fixed model name."""
+
+    def _record(strategy):
+        capture.append(strategy)
+        return "qwen3.8-216k"
+
+    fake_coder_model = type("FakeModule", (), {"get_coder_model": staticmethod(_record)})()
+    fake_package = type("FakePackage", (), {})()
+    monkeypatch.setitem(sys.modules, "ollama_tools", fake_package)
+    monkeypatch.setitem(sys.modules, "ollama_tools.coder_model", fake_coder_model)
+    monkeypatch.setitem(
+        sys.modules,
+        "ollama_tools.gpu",
+        type("FakeGpuModule", (), {"STRATEGIES": ("conservative", "proportional", "even")})(),
+    )
+
+
+def test_gpu_strategy_defaults_to_conservative_when_unset(monkeypatch):
+    monkeypatch.delenv("OLLAMA_GPU_STRATEGY", raising=False)
+    calls: list[str] = []
+    _fake_ollama_tools(monkeypatch, calls)
+    _default_ollama_model()
+    assert calls == ["conservative"]
+
+
+def test_gpu_strategy_reads_env_override(monkeypatch):
+    monkeypatch.setenv("OLLAMA_GPU_STRATEGY", "proportional")
+    calls: list[str] = []
+    _fake_ollama_tools(monkeypatch, calls)
+    model = _default_ollama_model()
+    assert calls == ["proportional"]
+    assert model == "qwen3.8-216k"
+
+
+def test_gpu_strategy_is_case_insensitive(monkeypatch):
+    monkeypatch.setenv("OLLAMA_GPU_STRATEGY", "Proportional")
+    calls: list[str] = []
+    _fake_ollama_tools(monkeypatch, calls)
+    _default_ollama_model()
+    assert calls == ["proportional"]
+
+
+def test_gpu_strategy_falls_back_on_invalid_value(monkeypatch, caplog):
+    monkeypatch.setenv("OLLAMA_GPU_STRATEGY", "yolo")
+    calls: list[str] = []
+    _fake_ollama_tools(monkeypatch, calls)
+    _default_ollama_model()
+    assert calls == ["conservative"]
+    assert "not one of" in caplog.text
+
+
+def test_gpu_strategy_whitespace_only_value_falls_back_to_conservative(monkeypatch):
+    monkeypatch.setenv("OLLAMA_GPU_STRATEGY", "   ")
+    calls: list[str] = []
+    _fake_ollama_tools(monkeypatch, calls)
+    _default_ollama_model()
+    assert calls == ["conservative"]
+
+
+def test_gpu_strategy_falls_back_when_ollama_tools_gpu_missing(monkeypatch):
+    """OLLAMA_GPU_STRATEGY set, but ollama_tools.gpu isn't importable (e.g.
+    an older ollama-tools install without the STRATEGIES constant) - this
+    must still fall back to conservative rather than raising."""
+    monkeypatch.setenv("OLLAMA_GPU_STRATEGY", "proportional")
+    calls: list[str] = []
+    _fake_ollama_tools(monkeypatch, calls)
+    monkeypatch.delitem(sys.modules, "ollama_tools.gpu", raising=False)
+    _default_ollama_model()
+    assert calls == ["conservative"]
 
 
 def test_local_ollama_coder_uses_default_ollama_model_when_unset(monkeypatch):
