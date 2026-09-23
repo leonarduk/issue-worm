@@ -85,7 +85,7 @@ def _gpu_strategy() -> str:
     Resolved from ``OLLAMA_GPU_STRATEGY``, validated against
     ``ollama_tools.gpu.STRATEGIES``. An unset or invalid value falls back
     to ``conservative`` -- the safe default (see laptop-egpu-llm's
-    docs/model-picker.md: guessing high is what hangs the machine).
+    docs/lmstudio-multi-gpu.md: guessing high is what hangs the machine).
     ``proportional`` is what actually reaches the qwen3.8-216k tier on an
     asymmetric card pair, but only if the runtime is genuinely configured
     to place layers proportionally rather than evenly -- that is a fact
