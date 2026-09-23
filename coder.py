@@ -76,6 +76,38 @@ DEFAULT_LMSTUDIO_ENDPOINT = "http://localhost:1234"
 LMSTUDIO_MODEL_LOOKUP_TIMEOUT_SECONDS = 5
 
 
+_DEFAULT_GPU_STRATEGY = "conservative"
+
+
+def _gpu_strategy() -> str:
+    """The VRAM-budget strategy ``get_coder_model()`` should use.
+
+    Resolved from ``OLLAMA_GPU_STRATEGY``, validated against
+    ``ollama_tools.gpu.STRATEGIES``. An unset or invalid value falls back
+    to ``conservative`` -- the safe default (see laptop-egpu-llm's
+    docs/model-picker.md: guessing high is what hangs the machine).
+    ``proportional`` is what actually reaches the qwen3.8-216k tier on an
+    asymmetric card pair, but only if the runtime is genuinely configured
+    to place layers proportionally rather than evenly -- that is a fact
+    about the machine, not something this function can detect, so it is
+    opt-in via the env var rather than assumed.
+    """
+    raw = os.environ.get("OLLAMA_GPU_STRATEGY", "").strip().lower()
+    if not raw:
+        return _DEFAULT_GPU_STRATEGY
+    try:
+        from ollama_tools.gpu import STRATEGIES
+    except Exception:  # noqa: BLE001 - ollama-tools may not be installed; same fail-soft contract as _default_ollama_model
+        return _DEFAULT_GPU_STRATEGY
+    if raw not in STRATEGIES:
+        logger.warning(
+            "OLLAMA_GPU_STRATEGY=%r is not one of %s; using %r",
+            raw, STRATEGIES, _DEFAULT_GPU_STRATEGY,
+        )
+        return _DEFAULT_GPU_STRATEGY
+    return raw
+
+
 def _default_ollama_model() -> str:
     """The model LocalOllamaCoder uses when CODER_OLLAMA_MODEL is unset.
 
@@ -83,8 +115,9 @@ def _default_ollama_model() -> str:
     (the ``vram`` extra) -- it targets one specific machine's NVIDIA/eGPU
     setup, so most installs of issue-worm will not have it. When it is
     importable, its ``get_coder_model()`` picks a model sized to the VRAM
-    actually attached right now (it shells out to ``nvidia-smi``); otherwise,
-    or if that probe fails or returns nothing usable, this falls back to
+    actually attached right now (it shells out to ``nvidia-smi``), under
+    the strategy :func:`_gpu_strategy` resolves; otherwise, or if that
+    probe fails or returns nothing usable, this falls back to
     DEFAULT_OLLAMA_MODEL, unchanged from before. Every failure mode here --
     missing package, a driver hiccup, an unexpected empty result -- must
     still let LocalOllamaCoder construct with a usable model, so nothing
@@ -93,7 +126,7 @@ def _default_ollama_model() -> str:
     try:
         from ollama_tools.coder_model import get_coder_model
 
-        model = get_coder_model()
+        model = get_coder_model(_gpu_strategy())
     except Exception:  # noqa: BLE001 - any failure here (missing package, GPU probe error) must fall back, never raise out of coder construction
         return DEFAULT_OLLAMA_MODEL
     return model or DEFAULT_OLLAMA_MODEL
