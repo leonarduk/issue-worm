@@ -97,7 +97,13 @@ def _gpu_strategy() -> str:
         return _DEFAULT_GPU_STRATEGY
     try:
         from ollama_tools.gpu import STRATEGIES
-    except Exception:  # noqa: BLE001 - ollama-tools may not be installed; same fail-soft contract as _default_ollama_model
+    except ImportError:
+        return _DEFAULT_GPU_STRATEGY
+    except Exception:  # noqa: BLE001 - a broken ollama-tools install must not break coder construction
+        logger.warning(
+            "OLLAMA_GPU_STRATEGY=%r was set but ollama_tools.gpu failed to import; using %r",
+            raw, _DEFAULT_GPU_STRATEGY,
+        )
         return _DEFAULT_GPU_STRATEGY
     if raw not in STRATEGIES:
         logger.warning(

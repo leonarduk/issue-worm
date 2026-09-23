@@ -139,6 +139,26 @@ def test_gpu_strategy_falls_back_on_invalid_value(monkeypatch, caplog):
     assert "not one of" in caplog.text
 
 
+def test_gpu_strategy_whitespace_only_value_falls_back_to_conservative(monkeypatch):
+    monkeypatch.setenv("OLLAMA_GPU_STRATEGY", "   ")
+    calls: list[str] = []
+    _fake_ollama_tools(monkeypatch, calls)
+    _default_ollama_model()
+    assert calls == ["conservative"]
+
+
+def test_gpu_strategy_falls_back_when_ollama_tools_gpu_missing(monkeypatch):
+    """OLLAMA_GPU_STRATEGY set, but ollama_tools.gpu isn't importable (e.g.
+    an older ollama-tools install without the STRATEGIES constant) - this
+    must still fall back to conservative rather than raising."""
+    monkeypatch.setenv("OLLAMA_GPU_STRATEGY", "proportional")
+    calls: list[str] = []
+    _fake_ollama_tools(monkeypatch, calls)
+    monkeypatch.delitem(sys.modules, "ollama_tools.gpu", raising=False)
+    _default_ollama_model()
+    assert calls == ["conservative"]
+
+
 def test_local_ollama_coder_uses_default_ollama_model_when_unset(monkeypatch):
     monkeypatch.setattr(coder, "_default_ollama_model", lambda: "picked-by-vram")
     local_coder = LocalOllamaCoder()
