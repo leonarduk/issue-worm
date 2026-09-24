@@ -38,7 +38,7 @@ from typing import Protocol
 
 import requests
 
-from workspace import MODE_FULL, sanitize_file_path
+from workspace import MODE_EDIT, MODE_FULL, sanitize_file_path
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +63,12 @@ DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
 # a FULL rewrite of several large files and stays well under DeepSeek
 # V4's documented output ceiling. Overridable via CODER_MAX_TOKENS.
 DEFAULT_DEEPSEEK_MAX_TOKENS = 32768
+
+# Existing files at or above this many bytes get MODE: EDIT (targeted
+# search/replace) rather than MODE: FULL (complete rewrite), mirroring
+# issue-worm-pro's NativeCoder. Files that don't exist yet are always
+# MODE: FULL: there is nothing to search against.
+SIZE_THRESHOLD = 10_000
 
 # LM Studio serves an OpenAI-compatible API on this machine, so
 # CODER_MODEL_SOURCE=lmstudio reuses RemoteOpenAICoder with local defaults
@@ -489,7 +495,7 @@ def _build_prompt(workspace_dir: str, task: str, files: list[str]) -> str:
         "Current contents of the declared files (a file that doesn't exist "
         "yet is shown as empty — the task may be asking you to create it):\n"
         f"{file_sections}\n\n"
-        f"{_build_format_instructions(files)}"
+        f"{_build_format_instructions(workspace_dir, files)}"
     )
 
 
@@ -518,14 +524,39 @@ def _safe_relative_path(path: str) -> str | None:
     return normalized
 
 
-def _build_format_instructions(files: list[str]) -> str:
+def _mode_for_file(workspace_dir: str, path: str) -> str:
+    """Return the Coder MODE for one declared file.
+
+    Mirrors issue-worm-pro's NativeCoder: existing files at or above
+    SIZE_THRESHOLD get MODE_EDIT (targeted search/replace), everything
+    else gets MODE_FULL. A missing file is always MODE_FULL, since there
+    is no content to search against.
+    """
+    safe_path = _safe_relative_path(path)
+    if safe_path is None:
+        return MODE_FULL
+    path_obj = Path(workspace_dir) / safe_path
+    try:
+        if path_obj.is_file() and path_obj.stat().st_size >= SIZE_THRESHOLD:
+            return MODE_EDIT
+    except OSError:
+        pass
+    return MODE_FULL
+
+
+def _build_format_instructions(workspace_dir: str, files: list[str]) -> str:
+    mode_lines = "\n".join(
+        f"- {f}: MODE: {_mode_for_file(workspace_dir, f)}" for f in files
+    )
     return (
         "Respond with one section per changed file, in exactly this format "
         "and nothing else:\n\n"
         "=== FILE: <path> ===\n"
-        f"=== MODE: {MODE_FULL} ===\n"
-        "<the complete new file content>\n"
+        "=== MODE: <mode> ===\n"
+        "<the complete new file content when the mode is FULL, or the "
+        "search/replace blocks when the mode is EDIT>\n"
         "=== END FILE ===\n\n"
-        f"Only touch these declared files: {', '.join(files)}. Always use "
-        f"MODE: {MODE_FULL} (a complete file rewrite), not a diff."
+        "Use exactly these modes:\n"
+        f"{mode_lines}\n\n"
+        f"Only touch these declared files: {', '.join(files)}."
     )

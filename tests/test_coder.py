@@ -15,13 +15,16 @@ from coder import (
     DEFAULT_OLLAMA_ENDPOINT,
     DEFAULT_OLLAMA_MODEL,
     REQUEST_TIMEOUT_SECONDS,
+    SIZE_THRESHOLD,
     CoderConfigError,
     LocalOllamaCoder,
     RemoteOpenAICoder,
+    _build_format_instructions,
     _default_ollama_model,
     build_coder,
 )
 from config import RoleConfig
+from workspace import MODE_EDIT, MODE_FULL
 
 
 def _mock_response(json_body, status_ok=True):
@@ -215,6 +218,47 @@ def test_propose_notes_missing_file(tmp_path):
 
     prompt = mock_post.call_args[1]["json"]["prompt"]
     assert "does not exist yet" in prompt
+
+
+def test_format_instructions_use_full_mode_for_small_existing_file(tmp_path):
+    (tmp_path / "small.py").write_text("x" * (SIZE_THRESHOLD - 1), encoding="utf-8")
+
+    instructions = _build_format_instructions(str(tmp_path), ["small.py"])
+
+    assert f"small.py: MODE: {MODE_FULL}" in instructions
+    assert f"small.py: MODE: {MODE_EDIT}" not in instructions
+
+
+def test_format_instructions_use_edit_mode_for_large_existing_file(tmp_path):
+    (tmp_path / "large.py").write_text("x" * SIZE_THRESHOLD, encoding="utf-8")
+
+    instructions = _build_format_instructions(str(tmp_path), ["large.py"])
+
+    assert f"large.py: MODE: {MODE_EDIT}" in instructions
+    assert f"large.py: MODE: {MODE_FULL}" not in instructions
+
+
+def test_format_instructions_use_full_mode_for_missing_large_path(tmp_path):
+    # The path doesn't exist, so there is nothing to search/replace even
+    # though its eventual size would be large.
+    instructions = _build_format_instructions(str(tmp_path), ["not_yet_large.py"])
+
+    assert f"not_yet_large.py: MODE: {MODE_FULL}" in instructions
+    assert f"not_yet_large.py: MODE: {MODE_EDIT}" not in instructions
+
+
+def test_format_instructions_mixed_modes_in_one_call(tmp_path):
+    (tmp_path / "small.py").write_text("x" * 10, encoding="utf-8")
+    (tmp_path / "large.py").write_text("x" * SIZE_THRESHOLD, encoding="utf-8")
+    # not_yet_large.py is intentionally absent.
+
+    instructions = _build_format_instructions(
+        str(tmp_path), ["small.py", "large.py", "not_yet_large.py"]
+    )
+
+    assert f"small.py: MODE: {MODE_FULL}" in instructions
+    assert f"large.py: MODE: {MODE_EDIT}" in instructions
+    assert f"not_yet_large.py: MODE: {MODE_FULL}" in instructions
 
 
 def test_propose_returns_empty_string_when_build_prompt_raises(tmp_path):
