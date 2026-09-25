@@ -2654,7 +2654,6 @@ def run_advisory_attempt(
     start_commit: str,
     ci_command: list[str] | None = None,
     extra_env: dict[str, str] | None = None,
-    **kwargs,
 ) -> WorkspaceResult:
     """Verify one attempt by a coder that edited the workspace itself.
 
@@ -2679,11 +2678,15 @@ def run_advisory_attempt(
     covers the whole attempt. CI then runs on the same tree that was staged.
 
     Rolls back to ``start_commit`` on any failure or interruption, exactly
-    like :func:`run_revision_attempt`; a passing attempt's changes are left
-    staged for commit-and-push.
-    """
-    _reject_base_environment_kwarg("run_advisory_attempt", kwargs)
+    like :func:`run_revision_attempt` - including the no-changes result,
+    which still hard-resets the tree - and a passing attempt's changes are
+    left staged for commit-and-push.
 
+    Unlike :func:`run_revision_attempt` and :func:`run_ci_checks` there is
+    no ``**kwargs``: this function is new, so no legacy caller passes the
+    retired ``env=`` and needs the tailored error; any unknown keyword,
+    ``env=`` included, is Python's own ``TypeError``.
+    """
     with _RollbackGuard(repo_path, start_commit) as guard:
         head = get_current_commit(repo_path)
         if head != start_commit:
