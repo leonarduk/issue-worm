@@ -67,6 +67,12 @@ jobs:
               sha="$(git ls-remote "$url" refs/heads/main | cut -f 1)"
               echo "::warning::${spec#*=} has no nightly tag yet; testing its main instead."
             fi
+            # ls-remote failing outright already aborts the step (Actions runs
+            # bash with -e -o pipefail); this catches it succeeding with no match.
+            if [ -z "$sha" ]; then
+              echo "::error::Could not resolve nightly or main for ${spec#*=}."
+              exit 1
+            fi
             python -m pip install --force-reinstall --no-deps "$pkg @ git+$url@$sha"
             echo "| $pkg | $ref | \`${sha:0:12}\` |" >> "$GITHUB_STEP_SUMMARY"
           done
