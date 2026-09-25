@@ -13,6 +13,10 @@ name: Nightly Tag
 # describe_command can derive a package version from it, and the
 # release workflow's `v*` tag filter never fires on it. A dated name like
 # nightly-2026-01-31 would break the first of those.
+#
+# Consumers: the tag is force-moved, so a clone that already has it needs
+# `git fetch --force --tags` (or `git fetch origin +refs/tags/nightly:refs/tags/nightly`)
+# to see the new position.
 
 on:
   schedule:
@@ -30,7 +34,7 @@ jobs:
   tag:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7  # same major the release workflow uses
         with:
           ref: main
 
@@ -39,9 +43,11 @@ jobs:
           NIGHTLY_TAG: nightly
         run: |
           head="$(git rev-parse HEAD)"
-          # Last line is the peeled commit if the tag was ever made annotated;
-          # empty if the tag does not exist yet.
-          prev="$(git ls-remote --tags origin "refs/tags/$NIGHTLY_TAG" "refs/tags/$NIGHTLY_TAG^{}" | tail -n 1 | cut -f 1)"
+          # Prefer the peeled ^{} line (present only if the tag was ever made
+          # annotated) without relying on ls-remote's output order; empty if
+          # the tag does not exist yet.
+          prev="$(git ls-remote --tags origin "refs/tags/$NIGHTLY_TAG" "refs/tags/$NIGHTLY_TAG^{}" \
+            | awk -v t="refs/tags/$NIGHTLY_TAG" '$2 == t "^{}" { peeled = $1 } $2 == t { plain = $1 } END { print (peeled != "" ? peeled : plain) }')"
           if [ "$head" = "$prev" ]; then
             echo "::notice::main is still at $head; $NIGHTLY_TAG unchanged."
             exit 0
