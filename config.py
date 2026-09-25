@@ -49,6 +49,16 @@ class RoleConfig:
     model_source: str  # "local" | "cloud" | "remote" | "claude"
     ollama_endpoint: Optional[str] = None
     ollama_model: Optional[str] = None
+    # Ollama's per-request `think` setting for this role, passed through as
+    # OLLAMA_THINK (cicaid-pro's ollama_common.get_ollama_think parses it:
+    # true/false, or a level such as "low" for models that take one). None
+    # means "not set for this role" - the process-wide OLLAMA_THINK, if any,
+    # applies. Per role because the roles want different answers: on
+    # qwen3.8-216k, thinking off made Triage ~4x faster with no visible loss,
+    # while the Coder without it wrote its design deliberation into the
+    # reply, or tool calls, instead of code (leonarduk/cicaid#51 runs 3-5:
+    # 3/3 real-code coder replies with thinking on, 2/6 with it off).
+    ollama_think: Optional[str] = None
     # MCP doc lookup settings (issue #15). mcp_doc_lookup_enabled gates the
     # feature; the rest are the resolved defaults so get_role_env_vars can
     # emit a self-contained env dict when enabled.
@@ -233,6 +243,10 @@ def _load_role_config(role_prefix: str) -> RoleConfig:
     if not ollama_model:
         ollama_model = os.getenv(f"{role_prefix}_MODEL")
 
+    # Blank means unset, the same as absent: a `CODER_OLLAMA_THINK=` line
+    # left in .env must not send think="" to Ollama.
+    ollama_think = (os.getenv(f"{role_prefix}_OLLAMA_THINK") or "").strip() or None
+
     # MCP doc lookup keys are global, not role-prefixed (issue #15): every
     # role reads the same MCP_* vars, and only an agent that acts on them
     # (currently the Analyser) uses them. The Context7 API key is deliberately
@@ -244,6 +258,7 @@ def _load_role_config(role_prefix: str) -> RoleConfig:
         model_source=model_source,
         ollama_endpoint=ollama_endpoint,
         ollama_model=ollama_model,
+        ollama_think=ollama_think,
         mcp_doc_lookup_enabled=mcp_doc_lookup_enabled,
         mcp_server_url=os.getenv("MCP_SERVER_URL") or DEFAULT_MCP_SERVER_URL,
         mcp_tool_name=os.getenv("MCP_TOOL_NAME") or DEFAULT_MCP_TOOL_NAME,
@@ -427,6 +442,11 @@ def get_role_env_vars(role_config: RoleConfig) -> dict[str, str]:
 
     if role_config.ollama_model:
         env_vars["OLLAMA_MODEL"] = role_config.ollama_model
+
+    if role_config.ollama_think:
+        # fetch_review resolves each key from this dict before os.environ,
+        # so a role's value beats a process-wide OLLAMA_THINK.
+        env_vars["OLLAMA_THINK"] = role_config.ollama_think
 
     if role_config.mcp_doc_lookup_enabled:
         # Self-contained when enabled: cicaid_bridge.mcp_doc_lookup can rely

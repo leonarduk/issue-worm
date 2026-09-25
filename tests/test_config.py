@@ -40,6 +40,30 @@ def test_get_role_env_vars_with_minimal_fields():
     assert env_vars["MODEL_SOURCE"] == "local"
     assert "OLLAMA_ENDPOINT" not in env_vars
     assert "OLLAMA_MODEL" not in env_vars
+    assert "OLLAMA_THINK" not in env_vars  # unset for the role: process-wide value applies
+
+
+def test_get_role_env_vars_passes_ollama_think_through():
+    assert get_role_env_vars(RoleConfig(model_source="local", ollama_think="true"))["OLLAMA_THINK"] == "true"
+    assert get_role_env_vars(RoleConfig(model_source="local", ollama_think="low"))["OLLAMA_THINK"] == "low"
+
+
+def test_load_config_reads_ollama_think_per_role(monkeypatch):
+    """Each role gets its own <ROLE>_OLLAMA_THINK; a role without one emits
+    nothing, so the process-wide OLLAMA_THINK (if any) is what applies to it.
+    A blank value counts as unset - a `CODER_OLLAMA_THINK=` line left in
+    .env must not send think="" to Ollama."""
+    monkeypatch.setenv("CODER_OLLAMA_THINK", "true")
+    monkeypatch.setenv("TRIAGE_OLLAMA_THINK", " false ")
+    monkeypatch.setenv("ANALYSER_OLLAMA_THINK", "")
+
+    config = load_config()
+
+    assert config["coder_config"].ollama_think == "true"
+    assert config["triage_config"].ollama_think == "false"
+    assert config["analyser_config"].ollama_think is None
+    assert get_role_env_vars(config["coder_config"])["OLLAMA_THINK"] == "true"
+    assert "OLLAMA_THINK" not in get_role_env_vars(config["analyser_config"])
 
 
 def test_load_config_defaults(monkeypatch):
