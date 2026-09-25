@@ -1297,10 +1297,11 @@ def get_working_diff(
     :func:`run_advisory_attempt`) may edit files outside its declared list,
     and those edits must reach the diff. It is only safe on a tree that was
     reset to the attempt's base commit before the coder ran, which is what
-    keeps leftovers out instead of the path filter. Passing both is a
-    contradiction and raises ``ValueError``.
+    keeps leftovers out instead of the path filter. Passing both - even an
+    empty ``declared_files`` list - is a contradiction and raises
+    ``ValueError``.
     """
-    if stage_all and declared_files:
+    if stage_all and declared_files is not None:
         raise ValueError("get_working_diff: pass declared_files or stage_all, not both")
     if stage_all:
         _run_git(repo_path, "add", "-A")

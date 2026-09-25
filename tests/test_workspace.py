@@ -3537,9 +3537,10 @@ def test_get_working_diff_stage_all_includes_undeclared_changes(repo):
     assert "b/other.py" in diff
 
 
-def test_get_working_diff_stage_all_with_declared_files_is_rejected(repo):
+@pytest.mark.parametrize("declared", [["a.py"], []])
+def test_get_working_diff_stage_all_with_declared_files_is_rejected(repo, declared):
     with pytest.raises(ValueError):
-        get_working_diff(repo, ["a.py"], stage_all=True)
+        get_working_diff(repo, declared, stage_all=True)
 
 
 def test_get_working_diff_stage_all_skips_gitignored_files(repo):
