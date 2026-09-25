@@ -2672,9 +2672,10 @@ def run_advisory_attempt(
     does on the locked path.
 
     If the coder committed its own work, HEAD is moved back to
-    ``start_commit`` with ``git reset --soft`` first, so the commits' changes
-    land in the index and the diff covers the whole attempt, not just what
-    was left uncommitted. CI then runs on the same tree that was staged.
+    ``start_commit`` with ``git reset --soft`` first. That keeps the
+    committed changes staged and leaves any uncommitted edits where they
+    were, and the stage-everything step below picks both up, so the diff
+    covers the whole attempt. CI then runs on the same tree that was staged.
 
     Rolls back to ``start_commit`` on any failure or interruption, exactly
     like :func:`run_revision_attempt`; a passing attempt's changes are left

@@ -3654,3 +3654,58 @@ def test_run_advisory_attempt_rolls_back_on_ci_failure(repo):
 def test_run_advisory_attempt_rejects_env_kwarg(repo):
     with pytest.raises(TypeError):
         run_advisory_attempt(repo, get_current_commit(repo), env={})
+
+
+def test_run_advisory_attempt_no_changes_leaves_tree_at_start(repo):
+    """The empty-diff early return skips guard.disarm(), so the guard's
+    reset runs: an ignored-only change never survives the attempt."""
+    start = get_current_commit(repo)
+
+    with patch("workspace.run_ci_checks") as ci:
+        result = run_advisory_attempt(repo, start)
+
+    assert not result.success
+    assert get_current_commit(repo) == start
+    assert _git(repo, "status", "--porcelain").stdout == ""
+    ci.assert_not_called()
+
+
+def test_run_advisory_attempt_rejects_unknown_kwargs(repo):
+    with pytest.raises(TypeError):
+        run_advisory_attempt(repo, get_current_commit(repo), extra_envs={})
+
+
+def test_run_advisory_attempt_passes_extra_env_to_ci_and_workflow_steps(repo):
+    start = get_current_commit(repo)
+    (Path(repo) / "a.py").write_text("value = 2\n")
+
+    with (
+        patch("workspace.run_ci_checks", return_value=(True, "ok")) as ci,
+        patch(
+            "workspace._run_new_workflow_step_scripts", return_value=(True, "")
+        ) as steps,
+    ):
+        result = run_advisory_attempt(repo, start, ["make", "ci"], extra_env={"K": "v"})
+
+    assert result.success
+    ci.assert_called_once_with(repo, ["make", "ci"], extra_env={"K": "v"})
+    assert steps.call_args.args[2] == {"K": "v"}
+
+
+def test_run_advisory_attempt_rolls_back_on_workflow_step_failure(repo):
+    start = get_current_commit(repo)
+    (Path(repo) / "a.py").write_text("value = 2\n")
+
+    with (
+        patch("workspace.run_ci_checks", return_value=(True, "ci ok")),
+        patch(
+            "workspace._run_new_workflow_step_scripts",
+            return_value=(False, "step failed"),
+        ),
+    ):
+        result = run_advisory_attempt(repo, start)
+
+    assert not result.success
+    assert result.category == "test_failure"
+    assert result.test_output == "ci ok\n\nstep failed"
+    assert (Path(repo) / "a.py").read_text() == "value = 1\n"
