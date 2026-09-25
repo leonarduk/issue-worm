@@ -2562,6 +2562,22 @@ def test_canonical_block_is_not_given_the_diff_style_leniency():
         parse_coder_output(run_into, ["a.py"])
 
 
+def test_canonical_block_accepts_a_diff_style_divider_but_still_needs_closing():
+    """'+++ REPLACE' is accepted as the divider of a canonical block too
+    (same leniency as tolerating miscounted marker characters), but a
+    canonical block still needs its own '>>>>>>> REPLACE' closing line -
+    unlike a block opened with '--- SEARCH', it isn't closed by end-of-body."""
+    body = "<<<<<<< SEARCH\nvalue = 1\n+++ REPLACE\nvalue = 2\n>>>>>>> REPLACE\n"
+    output = f"=== FILE: a.py ===\n=== MODE: EDIT ===\n{body}=== END FILE ===\n"
+    changes = parse_coder_output(output, ["a.py"])
+
+    assert _apply_search_replace("value = 1\n", changes[0].body, "a.py") == ("value = 2\n", None)
+
+    unclosed = "=== FILE: a.py ===\n=== MODE: EDIT ===\n<<<<<<< SEARCH\nx\n+++ REPLACE\ny\n=== END FILE ===\n"
+    with pytest.raises(MalformedOutputError, match="not closed.*truncated"):
+        parse_coder_output(unclosed, ["a.py"])
+
+
 def test_search_replace_exact_match_applies_blocks_in_order():
     body = (
         "<<<<<<< SEARCH\nimport os\n=======\nimport json\nimport os\n>>>>>>> REPLACE\n"
