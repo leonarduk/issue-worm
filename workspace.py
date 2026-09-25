@@ -46,6 +46,7 @@ repository check from an error to a warning, for a workspace whose
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -54,6 +55,7 @@ import subprocess
 import tempfile
 import sys
 import textwrap
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
@@ -1765,6 +1767,7 @@ def ci_check_env(
     extra_env: dict[str, str] | None = None,
     *,
     home: str,
+    venv_dir: str | None = None,
 ) -> dict[str, str]:
     """The full environment for the target repo's CI-check subprocess.
 
@@ -1780,8 +1783,14 @@ def ci_check_env(
       semantic change from the target's own environment: a test suite that
       relies on its temp dir sharing a filesystem/volume with the repo, or
       being a tmpfs, sees a plain throwaway directory instead);
-    - ``PYTHONPATH`` = ``repo_path`` and nothing else, so the checkout under
-      test shadows any installed copy of the same modules;
+    - ``PYTHONPATH`` = ``repo_path`` (plus ``repo_path/src`` for a
+      src-layout repo) and nothing else, so the checkout under test shadows
+      any installed copy of the same modules - including a module the patch
+      only just added, which an installed copy cannot have;
+    - with ``venv_dir`` (the target's own verifier venv, see
+      :func:`ensure_verifier_venv`), that venv's scripts directory first on
+      ``PATH`` and ``VIRTUAL_ENV`` set, so ``pytest``/``python`` inside a
+      check resolve to the target's own isolated install, not the tool's;
     - ``PYTHONIOENCODING=utf-8`` so the child's output decodes the way
       :func:`run_ci_checks` reads it, whatever the console codepage;
     - a fixed git author/committer identity, because a target's tests that
@@ -1811,7 +1820,16 @@ def ci_check_env(
         env["TMP"] = home
     else:
         env["TMPDIR"] = home
-    env["PYTHONPATH"] = str(Path(repo_path).resolve())
+    repo = Path(repo_path).resolve()
+    python_path = [str(repo)]
+    if (repo / "src").is_dir():
+        python_path.append(str(repo / "src"))
+    env["PYTHONPATH"] = os.pathsep.join(python_path)
+    if venv_dir is not None:
+        env["PATH"] = os.pathsep.join(
+            part for part in (str(_venv_scripts_dir(venv_dir)), env.get("PATH")) if part
+        )
+        env["VIRTUAL_ENV"] = str(venv_dir)
     env["PYTHONIOENCODING"] = "utf-8"
     env["GIT_AUTHOR_NAME"] = CI_GIT_IDENTITY_NAME
     env["GIT_AUTHOR_EMAIL"] = CI_GIT_IDENTITY_EMAIL
@@ -2199,6 +2217,230 @@ def _run_new_workflow_step_scripts(
     return all_passed, "\n".join(output_parts)
 
 
+# --- the target's own verifier venv -----------------------------------------
+#
+# PYTHONPATH=<workspace> (ci_check_env) makes the patch shadow an installed
+# copy, but the checks still ran in the TOOL's interpreter, with the tool's
+# own site-packages: everything issue-worm itself depends on (cicaid, the
+# pro extensions, their entry points) was importable in the target's test
+# run whether the target declared it or not. A target whose tests assert on
+# what is installed - cicaid's `test_cli.py` checks the commands it
+# discovers "with nothing installed" - failed there on every patch, correct
+# or not; a target missing a declared test dependency the tool happens to
+# carry passed when CI would not. CI has neither problem: it installs the
+# target alone, `pip install -e ".[test]"`, into a fresh environment.
+#
+# ensure_verifier_venv() is that, once per workspace: an isolated venv (no
+# system site-packages) holding the target installed editable plus its test
+# extras. It lives outside the checkout - reset_to_commit's `git clean -fd`
+# would delete it between attempts - and is rebuilt only when a dependency
+# manifest changes. Editable, so each attempt's patch is live without a
+# reinstall. One scheduler worker per workspace (#301), so no locking.
+
+VERIFIER_VENV_ENV = "ISSUE_WORM_VERIFIER_VENV"
+VERIFIER_VENV_DIR_ENV = "ISSUE_WORM_VERIFIER_VENV_DIR"
+VERIFIER_VENV_SETUP_TIMEOUT = 900.0
+_VERIFIER_VENV_DISABLED = ("0", "false", "no", "off")
+_VERIFIER_VENV_STAMP = "issue-worm-deps.sha256"
+# Optional-dependency groups CI conventionally installs for a test run, in
+# the order they are requested.
+_TEST_EXTRAS = ("test", "tests", "testing", "dev")
+_PROJECT_MANIFESTS = ("pyproject.toml", "setup.py", "setup.cfg")
+# Only the base and test/dev requirement files - not every
+# requirements-*.txt, some of which pull whole optional stacks (video,
+# automation) no test run needs.
+_REQUIREMENTS_FILES = (
+    "requirements.txt",
+    "requirements-dev.txt",
+    "requirements_dev.txt",
+    "requirements-test.txt",
+    "dev-requirements.txt",
+    "test-requirements.txt",
+)
+# What pip itself needs from the real environment: a cache and config under
+# the user's profile, proxies, and its own PIP_* settings. Still not the
+# tool's API keys or state directory.
+_VENV_SETUP_PASSTHROUGH = (
+    "HOME",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+)
+
+
+def _venv_scripts_dir(venv_dir: str | Path) -> Path:
+    return Path(venv_dir) / ("Scripts" if os.name == "nt" else "bin")
+
+
+def _venv_python(venv_dir: str | Path) -> Path:
+    return _venv_scripts_dir(venv_dir) / ("python.exe" if os.name == "nt" else "python")
+
+
+def _is_installable_project(repo: Path) -> bool:
+    if (repo / "setup.py").is_file() or (repo / "setup.cfg").is_file():
+        return True
+    pyproject = repo / "pyproject.toml"
+    if not pyproject.is_file():
+        return False
+    try:
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
+    # A pyproject.toml holding only [tool.*] config is not a package.
+    return "project" in data or "build-system" in data
+
+
+def _test_extras(repo: Path) -> list[str]:
+    try:
+        data = tomllib.loads((repo / "pyproject.toml").read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return []
+    declared = (data.get("project") or {}).get("optional-dependencies") or {}
+    return [name for name in _TEST_EXTRAS if name in declared]
+
+
+def verifier_venv_install_args(repo_path: str) -> list[list[str]]:
+    """The ``pip`` argument lists that install ``repo_path`` for its tests.
+
+    An installable project is installed editable with whichever of the
+    conventional test extras (:data:`_TEST_EXTRAS`) it declares; its base
+    and test requirement files, if any, are installed too. Empty when the
+    repo is not a Python project at all - :func:`ensure_verifier_venv`
+    then builds nothing.
+    """
+    repo = Path(repo_path).resolve()
+    args: list[list[str]] = []
+    if _is_installable_project(repo):
+        extras = _test_extras(repo)
+        args.append(["install", "-e", "." + (f"[{','.join(extras)}]" if extras else "")])
+    requirements = [name for name in _REQUIREMENTS_FILES if (repo / name).is_file()]
+    if requirements:
+        requirement_args = ["install"]
+        for name in requirements:
+            requirement_args += ["-r", name]
+        args.append(requirement_args)
+    return args
+
+
+def verifier_venv_dir(repo_path: str) -> Path:
+    """Where :func:`ensure_verifier_venv` keeps ``repo_path``'s venv.
+
+    Under ``ISSUE_WORM_VERIFIER_VENV_DIR`` if set, else
+    ``~/.issue-worm/verifier-venvs``; one directory per checkout path.
+    """
+    repo = Path(repo_path).resolve()
+    root = os.environ.get(VERIFIER_VENV_DIR_ENV) or str(
+        Path.home() / ".issue-worm" / "verifier-venvs"
+    )
+    key = hashlib.sha1(str(repo).lower().encode("utf-8")).hexdigest()[:10]
+    return Path(root) / f"{repo.name}-{key}"
+
+
+def _dependency_digest(repo: Path, install_args: list[list[str]]) -> str:
+    digest = hashlib.sha256()
+    digest.update(sys.version.encode("utf-8"))
+    digest.update(repr(install_args).encode("utf-8"))
+    for name in (*_PROJECT_MANIFESTS, *_REQUIREMENTS_FILES):
+        path = repo / name
+        if path.is_file():
+            digest.update(name.encode("utf-8"))
+            digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def _venv_setup_env() -> dict[str, str]:
+    passthrough = (
+        _CI_ENV_PASSTHROUGH_WINDOWS if os.name == "nt" else _CI_ENV_PASSTHROUGH_POSIX
+    )
+    env = {
+        key: os.environ[key]
+        for key in (*passthrough, *_VENV_SETUP_PASSTHROUGH)
+        if key in os.environ
+    }
+    env.update({key: value for key, value in os.environ.items() if key.startswith("PIP_")})
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
+
+
+def _run_venv_setup_step(command: list[str], cwd: Path, env: dict[str, str]) -> None:
+    try:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            timeout=VERIFIER_VENV_SETUP_TIMEOUT,
+        )
+    except OSError as exc:
+        raise WorkspaceError(f"{' '.join(command)} could not run: {exc}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise WorkspaceError(
+            f"{' '.join(command)} timed out after {VERIFIER_VENV_SETUP_TIMEOUT}s"
+        ) from exc
+    if result.returncode != 0:
+        output = (result.stdout + result.stderr).strip()
+        raise WorkspaceError(
+            f"{' '.join(command)} exited {result.returncode}: {output[-2000:]}"
+        )
+
+
+def ensure_verifier_venv(repo_path: str) -> Path | None:
+    """The target's own isolated venv for its CI checks, built if needed.
+
+    Returns None - no venv, the checks run in this process's interpreter
+    exactly as before - when ``ISSUE_WORM_VERIFIER_VENV`` is set to
+    ``0``/``false``/``no``/``off``, or when ``repo_path`` is not a Python
+    project (:func:`verifier_venv_install_args` is empty).
+
+    Otherwise returns the venv directory, reusing the cached one when its
+    stamp still matches the repo's dependency manifests and this Python,
+    and rebuilding it from scratch when not (a stale pin must not linger).
+    Raises :class:`WorkspaceError` if creating it or installing into it
+    fails; :func:`run_ci_checks` falls back to the tool's own environment
+    in that case rather than failing the attempt.
+    """
+    if os.environ.get(VERIFIER_VENV_ENV, "").strip().lower() in _VERIFIER_VENV_DISABLED:
+        return None
+    install_args = verifier_venv_install_args(repo_path)
+    if not install_args:
+        return None
+
+    repo = Path(repo_path).resolve()
+    venv_dir = verifier_venv_dir(repo_path)
+    stamp_path = venv_dir / _VERIFIER_VENV_STAMP
+    digest = _dependency_digest(repo, install_args)
+    try:
+        if _venv_python(venv_dir).is_file() and stamp_path.read_text(encoding="utf-8") == digest:
+            return venv_dir
+    except OSError:
+        pass
+
+    logger.info("verifier venv: building %s for %s", venv_dir, repo)
+    shutil.rmtree(venv_dir, ignore_errors=True)
+    env = _venv_setup_env()
+    _run_venv_setup_step([sys.executable, "-m", "venv", str(venv_dir)], repo, env)
+    python = str(_venv_python(venv_dir))
+    for args in install_args:
+        _run_venv_setup_step(
+            [python, "-m", "pip", "--disable-pip-version-check", "--no-input", *args],
+            repo,
+            env,
+        )
+    stamp_path.write_text(digest, encoding="utf-8")
+    return venv_dir
+
+
 def run_ci_checks(
     repo_path: str,
     command: list[str] | None = None,
@@ -2217,6 +2459,11 @@ def run_ci_checks(
     target's endpoint/model vars, #159); it is NOT a base environment, and
     a caller must not spread ``os.environ`` into it.
 
+    For a Python target the checks run inside the target's own isolated
+    venv (:func:`ensure_verifier_venv`), the way CI installs it; if that
+    venv cannot be prepared they run in this process's interpreter as
+    before, with a note saying so prefixed to the returned output.
+
     ``timeout`` defaults to :data:`DEFAULT_CI_TIMEOUT` (a real test suite
     takes minutes; the bound exists so a hung CI command surfaces as a
     :class:`WorkspaceError` instead of blocking the orchestrator forever,
@@ -2231,10 +2478,41 @@ def run_ci_checks(
     _reject_base_environment_kwarg("run_ci_checks", kwargs)
     command = list(command) if command else list(DEFAULT_CI_COMMAND)
     effective_timeout = DEFAULT_CI_TIMEOUT if timeout is None else timeout
+
+    note = ""
+    try:
+        venv_dir = ensure_verifier_venv(repo_path)
+    except (WorkspaceError, OSError) as exc:
+        # Degrade to the old behaviour rather than fail an attempt the patch
+        # may well have passed: no network, a broken build backend, etc.
+        logger.warning("verifier venv unavailable for %s: %s", repo_path, exc)
+        note = (
+            f"note: issue-worm could not prepare an isolated verifier venv "
+            f"({exc}); these checks ran in issue-worm's own environment "
+            f"instead, where its installed packages are visible.\n\n"
+        )
+        venv_dir = None
+    if venv_dir is not None and os.path.basename(command[0]) == command[0]:
+        # The runner (`cicaid run-ci-checks`) is issue-worm's tool, not the
+        # target's: resolve it against this process's PATH before the
+        # venv's scripts directory goes first, so a target that ships a
+        # same-named script (cicaid itself) does not swap in the code under
+        # test as its own verifier. The checks it spawns still see the venv.
+        runner = shutil.which(command[0])
+        if runner:
+            command[0] = runner
+
     with tempfile.TemporaryDirectory(
         prefix="issue-worm-ci-home-", ignore_cleanup_errors=True
     ) as home:
-        env = _non_interactive_env(ci_check_env(repo_path, extra_env, home=home))
+        env = _non_interactive_env(
+            ci_check_env(
+                repo_path,
+                extra_env,
+                home=home,
+                venv_dir=str(venv_dir) if venv_dir is not None else None,
+            )
+        )
         try:
             result = subprocess.run(
                 command,
@@ -2246,13 +2524,13 @@ def run_ci_checks(
                 timeout=effective_timeout,
             )
         except OSError as exc:
-            return False, f"failed to run CI command {command}: {exc}"
+            return False, f"{note}failed to run CI command {command}: {exc}"
         except subprocess.TimeoutExpired as exc:
             raise WorkspaceError(
                 f"CI command {' '.join(command)} timed out after "
                 f"{effective_timeout}s"
             ) from exc
-    return result.returncode == 0, result.stdout + result.stderr
+    return result.returncode == 0, note + result.stdout + result.stderr
 
 
 def run_revision_attempt(
