@@ -2502,6 +2502,66 @@ def test_edit_keeps_a_heading_underline_in_a_markup_file():
     )
 
 
+# --- diff-header-style EDIT blocks ('--- SEARCH' / '+++ REPLACE') ----------
+#
+# The shape qwen3.8-216k (thinking off) wrote for every EDIT section on
+# leonarduk/cicaid#51 run 5: no '=======' divider and no closing
+# '>>>>>>> REPLACE' line; '+++ REPLACE' separates the two halves and the
+# block ends at the next '--- SEARCH' or at the end of the section.
+
+
+def _diff_style_edit(path, *pairs):
+    body = "".join(f"--- SEARCH\n{old}+++ REPLACE\n{new}" for old, new in pairs)
+    return f"=== FILE: {path} ===\n=== MODE: EDIT ===\n{body}=== END FILE ===\n"
+
+
+def test_diff_style_edit_block_applies():
+    changes = parse_coder_output(_diff_style_edit("a.py", ("value = 1\n", "value = 2\n")), ["a.py"])
+
+    assert _apply_search_replace("value = 1\n", changes[0].body, "a.py") == ("value = 2\n", None)
+
+
+def test_diff_style_blocks_end_at_the_next_search_marker():
+    output = _diff_style_edit(
+        "a.py", ("value = 1\n", "value = 2\n"), ("other = 3\n", "other = 4\n")
+    )
+    changes = parse_coder_output(output, ["a.py"])
+
+    assert _apply_search_replace(
+        "value = 1\nother = 3\n", changes[0].body, "a.py"
+    ) == ("value = 2\nother = 4\n", None)
+
+
+def test_diff_style_block_may_still_be_closed_with_a_replace_line():
+    body = "--- SEARCH\nvalue = 1\n+++ REPLACE\nvalue = 2\n>>>>>>> REPLACE\nprose after\n"
+    output = f"=== FILE: a.py ===\n=== MODE: EDIT ===\n{body}=== END FILE ===\n"
+    changes = parse_coder_output(output, ["a.py"])
+
+    assert _apply_search_replace("value = 1\n", changes[0].body, "a.py") == ("value = 2\n", None)
+
+
+def test_diff_style_search_without_its_replace_half_is_still_truncation():
+    output = "=== FILE: a.py ===\n=== MODE: EDIT ===\n--- SEARCH\nvalue = 1\n=== END FILE ===\n"
+
+    with pytest.raises(MalformedOutputError, match="not closed.*truncated"):
+        parse_coder_output(output, ["a.py"])
+
+
+def test_canonical_block_is_not_given_the_diff_style_leniency():
+    """An unclosed canonical block still reads as a truncated reply, and a
+    canonical block run into by the next SEARCH is still an error."""
+    unclosed = "=== FILE: a.py ===\n=== MODE: EDIT ===\n<<<<<<< SEARCH\nx\n=======\ny\n=== END FILE ===\n"
+    with pytest.raises(MalformedOutputError, match="not closed.*truncated"):
+        parse_coder_output(unclosed, ["a.py"])
+
+    run_into = (
+        "=== FILE: a.py ===\n=== MODE: EDIT ===\n<<<<<<< SEARCH\nx\n=======\ny\n"
+        "--- SEARCH\nz\n+++ REPLACE\nw\n=== END FILE ===\n"
+    )
+    with pytest.raises(MalformedOutputError, match="no '>>>>>>> REPLACE' line"):
+        parse_coder_output(run_into, ["a.py"])
+
+
 def test_search_replace_exact_match_applies_blocks_in_order():
     body = (
         "<<<<<<< SEARCH\nimport os\n=======\nimport json\nimport os\n>>>>>>> REPLACE\n"

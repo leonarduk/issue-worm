@@ -797,8 +797,25 @@ def _resolve_repeated_sections(
 # Anything outside a block (prose, Markdown fences) is ignored. Marker
 # lines tolerate 5-9 marker characters and trailing whitespace, since
 # models miscount them.
+#
+# A diff-header-style spelling is accepted too. qwen3.8-216k with thinking
+# off wrote its EDIT sections this way when asked to produce a fix on
+# leonarduk/cicaid#51 run 5 (as the Analyser, which had been asked for
+# instructions and answered with a full reply instead) - a spelling a
+# Coder reply from the same model would be rejected unapplied for, with
+# nothing else wrong in it:
+#   --- SEARCH
+#   <lines copied verbatim from the current file>
+#   +++ REPLACE
+#   <lines to put in their place>
+# It has no closing line: the block ends at the next SEARCH marker, at a
+# '>>>>>>> REPLACE' line if the model adds one, or at the end of the body.
+# Only a block OPENED with '--- SEARCH' gets that leniency; for the
+# canonical grammar an unclosed block still reads as a truncated reply.
 _SEARCH_MARKER_RE = re.compile(r"^<{5,9} ?SEARCH[ \t]*$")
 _DIVIDER_MARKER_RE = re.compile(r"^={5,9}[ \t]*$")
+_DIFF_SEARCH_MARKER_RE = re.compile(r"^-{3,9} ?SEARCH[ \t]*$")
+_DIFF_DIVIDER_MARKER_RE = re.compile(r"^\+{3,9} ?REPLACE[ \t]*$")
 # Files where a line of "=" is legitimate content (a setext/rst heading
 # underline), so a divider-shaped line inside a REPLACE part is kept rather
 # than rejected as a second divider (#338).
@@ -822,17 +839,26 @@ def _parse_search_replace_blocks(body: str, path: str) -> list[tuple[str, str]]:
     state = "outside"
     search: list[str] = []
     replace: list[str] = []
+    # True while inside a block opened with '--- SEARCH' (see the grammar
+    # comment above): such a block may end at the next SEARCH marker or at
+    # the end of the body instead of at a '>>>>>>> REPLACE' line.
+    diff_style = False
+
+    def is_search_marker(text: str) -> bool:
+        return bool(_SEARCH_MARKER_RE.match(text) or _DIFF_SEARCH_MARKER_RE.match(text))
+
     for line in body.splitlines():
         stripped = line.rstrip("\r")
         if state == "outside":
-            if _SEARCH_MARKER_RE.match(stripped):
+            if is_search_marker(stripped):
                 state, search, replace = "search", [], []
+                diff_style = bool(_DIFF_SEARCH_MARKER_RE.match(stripped))
         elif state == "search":
-            if _DIVIDER_MARKER_RE.match(stripped):
-                state = "replace"
-            elif _SEARCH_MARKER_RE.match(stripped) or _REPLACE_MARKER_RE.match(
+            if _DIVIDER_MARKER_RE.match(stripped) or _DIFF_DIVIDER_MARKER_RE.match(
                 stripped
             ):
+                state = "replace"
+            elif is_search_marker(stripped) or _REPLACE_MARKER_RE.match(stripped):
                 raise MalformedOutputError(
                     f"MODE: EDIT section for {path!r}: SEARCH block "
                     f"{len(blocks) + 1} has no '=======' divider"
@@ -843,11 +869,16 @@ def _parse_search_replace_blocks(body: str, path: str) -> list[tuple[str, str]]:
             if _REPLACE_MARKER_RE.match(stripped):
                 blocks.append(("\n".join(search), "\n".join(replace)))
                 state = "outside"
-            elif _SEARCH_MARKER_RE.match(stripped):
-                raise MalformedOutputError(
-                    f"MODE: EDIT section for {path!r}: block {len(blocks) + 1} "
-                    "has no '>>>>>>> REPLACE' line before the next SEARCH"
-                )
+            elif is_search_marker(stripped):
+                if not diff_style:
+                    raise MalformedOutputError(
+                        f"MODE: EDIT section for {path!r}: block {len(blocks) + 1} "
+                        "has no '>>>>>>> REPLACE' line before the next SEARCH"
+                    )
+                # Diff-style: the next SEARCH marker is this block's end.
+                blocks.append(("\n".join(search), "\n".join(replace)))
+                state, search, replace = "search", [], []
+                diff_style = bool(_DIFF_SEARCH_MARKER_RE.match(stripped))
             elif _DIVIDER_MARKER_RE.match(stripped) and not path.lower().endswith(
                 _MARKUP_SUFFIXES
             ):
@@ -863,6 +894,10 @@ def _parse_search_replace_blocks(body: str, path: str) -> list[tuple[str, str]]:
                 )
             else:
                 replace.append(line)
+    if state == "replace" and diff_style:
+        # Diff-style has no closing line: end of body closes the block.
+        blocks.append(("\n".join(search), "\n".join(replace)))
+        state = "outside"
     if state != "outside":
         raise MalformedOutputError(
             f"MODE: EDIT section for {path!r}: block {len(blocks) + 1} is not "
