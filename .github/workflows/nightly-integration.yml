@@ -27,6 +27,13 @@ concurrency:
   group: nightly-integration
   cancel-in-progress: false
 
+# An explicit `shell: bash` gets -eo pipefail; the unspecified default is
+# only `bash -e`, under which a failing `git ls-remote | awk` pipeline would
+# pass as "no such ref" and quietly fall back to testing main.
+defaults:
+  run:
+    shell: bash
+
 env:
   # package=owner/repo, space separated.
   NIGHTLY_DEPS: cicaid-devtools=leonarduk/cicaid
@@ -67,8 +74,8 @@ jobs:
               sha="$(git ls-remote "$url" refs/heads/main | cut -f 1)"
               echo "::warning::${spec#*=} has no nightly tag yet; testing its main instead."
             fi
-            # ls-remote failing outright already aborts the step (Actions runs
-            # bash with -e -o pipefail); this catches it succeeding with no match.
+            # ls-remote failing outright aborts the step (pipefail, via the
+            # shell default above); this catches it succeeding with no match.
             if [ -z "$sha" ]; then
               echo "::error::Could not resolve nightly or main for ${spec#*=}."
               exit 1
