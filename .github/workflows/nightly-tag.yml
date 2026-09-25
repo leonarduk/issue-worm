@@ -1,0 +1,52 @@
+name: Nightly Tag
+
+# Moves a floating `nightly` tag to the tip of main once a night, but only
+# when main has changed since the tag was last moved - a quiet night leaves
+# the tag (and its timestamp) alone.
+#
+# Deliberately a tag only, not a GitHub Release: every version checker and
+# dependency-pin updater across issue-worm / cicaid (and their pro repos)
+# polls releases/latest, and nothing here should ever appear there.
+#
+# The name is also deliberate: `nightly` has no digit, so neither
+# setuptools-scm's default `git describe --match '*[0-9]*'` nor a stricter v-only
+# describe_command can derive a package version from it, and the
+# release workflow's `v*` tag filter never fires on it. A dated name like
+# nightly-2026-01-31 would break the first of those.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"  # 03:17 UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nightly-tag
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+
+      - name: Move nightly tag if main has changed
+        env:
+          NIGHTLY_TAG: nightly
+        run: |
+          head="$(git rev-parse HEAD)"
+          # Last line is the peeled commit if the tag was ever made annotated;
+          # empty if the tag does not exist yet.
+          prev="$(git ls-remote --tags origin "refs/tags/$NIGHTLY_TAG" "refs/tags/$NIGHTLY_TAG^{}" | tail -n 1 | cut -f 1)"
+          if [ "$head" = "$prev" ]; then
+            echo "::notice::main is still at $head; $NIGHTLY_TAG unchanged."
+            exit 0
+          fi
+          # Lightweight on purpose: git describe without --tags ignores it.
+          git tag --force "$NIGHTLY_TAG" "$head"
+          git push --force origin "refs/tags/$NIGHTLY_TAG"
+          echo "Moved $NIGHTLY_TAG from ${prev:-<none>} to $head."
