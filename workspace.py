@@ -1311,7 +1311,12 @@ def apply_file_change(repo_path: str, change: FileChange) -> str | None:
     )
 
 
-def get_working_diff(repo_path: str, declared_files: list[str] | None = None) -> str:
+def get_working_diff(
+    repo_path: str,
+    declared_files: list[str] | None = None,
+    *,
+    stage_all: bool = False,
+) -> str:
     """Stage changes (including new/deleted files) and return the
     resulting diff against HEAD - the patch a passing attempt hands back
     to the caller for commit-and-push.
@@ -1321,8 +1326,21 @@ def get_working_diff(repo_path: str, declared_files: list[str] | None = None) ->
     (left over from a previous attempt, a build artifact, etc.) is never
     swept into the diff. Falls back to staging everything when no paths
     are declared.
+
+    ``stage_all=True`` stages every non-ignored change regardless, and says
+    so at the call site: an advisory-scope coder (see
+    :func:`run_advisory_attempt`) may edit files outside its declared list,
+    and those edits must reach the diff. It is only safe on a tree that was
+    reset to the attempt's base commit before the coder ran, which is what
+    keeps leftovers out instead of the path filter. Passing both - even an
+    empty ``declared_files`` list - is a contradiction and raises
+    ``ValueError``.
     """
-    if declared_files:
+    if stage_all and declared_files is not None:
+        raise ValueError("get_working_diff: pass declared_files or stage_all, not both")
+    if stage_all:
+        _run_git(repo_path, "add", "-A")
+    elif declared_files:
         _run_git(repo_path, "add", "-A", "--", *declared_files)
     else:
         _run_git(repo_path, "add", "-A")
@@ -2663,4 +2681,92 @@ def run_revision_attempt(
             test_output=test_output,
             diff_output=diff_output,
             recovery=recovery,
+        )
+
+
+def run_advisory_attempt(
+    repo_path: str,
+    start_commit: str,
+    ci_command: list[str] | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> WorkspaceResult:
+    """Verify one attempt by a coder that edited the workspace itself.
+
+    The advisory-scope counterpart of :func:`run_revision_attempt`
+    (leonarduk/issue-worm-pro#1917). An agentic coder's ``FILES:`` list is a
+    hint, not a lock: it may touch other files, and those edits must reach
+    the diff. So there is no coder output to parse or apply here - the edits
+    are already on disk - and the diff stages every non-ignored change
+    (``stage_all=True``) instead of only the declared paths.
+
+    That is only sound because the CALLER resets the tree to
+    ``start_commit`` with :func:`reset_to_commit` BEFORE the coder runs.
+    This function cannot do it (the reset would wipe the edits it is here to
+    verify), and the reset is what keeps a previous attempt's leftovers and
+    stray build output out of the diff - the job the declared-path filter
+    does on the locked path.
+
+    If the coder committed its own work, HEAD is moved back to
+    ``start_commit`` with ``git reset --soft`` first. That keeps the
+    committed changes staged and leaves any uncommitted edits where they
+    were, and the stage-everything step below picks both up, so the diff
+    covers the whole attempt. CI then runs on the same tree that was staged.
+
+    Rolls back to ``start_commit`` on any failure or interruption, exactly
+    like :func:`run_revision_attempt` - including the no-changes result,
+    which still hard-resets the tree - and a passing attempt's changes are
+    left staged for commit-and-push.
+
+    Unlike :func:`run_revision_attempt` and :func:`run_ci_checks` there is
+    no ``**kwargs``: this function is new, so no legacy caller passes the
+    retired ``env=`` and needs the tailored error; any unknown keyword,
+    ``env=`` included, is Python's own ``TypeError``.
+    """
+    with _RollbackGuard(repo_path, start_commit) as guard:
+        head = get_current_commit(repo_path)
+        if head != start_commit:
+            logger.info(
+                "Advisory coder moved HEAD from %s to %s; folding its commits "
+                "back into the index",
+                start_commit,
+                head,
+            )
+            _run_git(repo_path, "reset", "--soft", start_commit)
+
+        diff_output = get_working_diff(repo_path, stage_all=True)
+        if not diff_output.strip():
+            return WorkspaceResult(
+                success=False,
+                error="advisory coder made no changes to the workspace",
+                category=CATEGORY_OUTPUT_SHAPE,
+            )
+
+        passed, test_output = run_ci_checks(repo_path, ci_command, extra_env=extra_env)
+        if not passed:
+            return WorkspaceResult(
+                success=False,
+                test_output=test_output,
+                diff_output=diff_output,
+                error="CI checks failed",
+                category=CATEGORY_TEST_FAILURE,
+            )
+
+        workflow_passed, workflow_output = _run_new_workflow_step_scripts(
+            repo_path, diff_output, extra_env, WORKFLOW_STEP_TIMEOUT
+        )
+        if not workflow_passed:
+            combined_output = "\n\n".join(part for part in (test_output, workflow_output) if part)
+            return WorkspaceResult(
+                success=False,
+                test_output=combined_output,
+                diff_output=diff_output,
+                error="newly added GitHub Actions workflow step failed when run against the repo",
+                category=CATEGORY_TEST_FAILURE,
+            )
+
+        guard.disarm()
+        return WorkspaceResult(
+            success=True,
+            test_output=test_output,
+            diff_output=diff_output,
         )
