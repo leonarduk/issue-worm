@@ -100,7 +100,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          number="$(gh issue list --state open --search "\"$ISSUE_TITLE\" in:title" --json number,title \
+          # Plain listing, not --search: search can lag or tokenize the
+          # title, and a miss here would open a duplicate issue every night.
+          number="$(gh issue list --state open --limit 1000 --json number,title \
             --jq "map(select(.title == env.ISSUE_TITLE)) | .[0].number // empty")"
           body="Nightly integration failed on $(date -u +%F): $RUN_URL"
           if [ -n "$number" ]; then
@@ -117,7 +119,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          number="$(gh issue list --state open --search "\"$ISSUE_TITLE\" in:title" --json number,title \
+          # Plain listing, not --search: search can lag or tokenize the
+          # title, and a miss here would open a duplicate issue every night.
+          number="$(gh issue list --state open --limit 1000 --json number,title \
             --jq "map(select(.title == env.ISSUE_TITLE)) | .[0].number // empty")"
           if [ -n "$number" ]; then
             gh issue close "$number" --comment "Green again: $RUN_URL"
