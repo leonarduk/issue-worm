@@ -82,6 +82,7 @@ jobs:
             fi
             python -m pip install --force-reinstall --no-deps "$pkg @ git+$url@$sha"
             echo "| $pkg | $ref | \`${sha:0:12}\` |" >> "$GITHUB_STEP_SUMMARY"
+            echo "$pkg=$sha" >> "$RUNNER_TEMP/nightly-shas"
           done
           # A dependency a nightly commit added is not installed under
           # --no-deps. Fail on it - that is drift the pins need to catch up
@@ -90,6 +91,19 @@ jobs:
             echo "::error::A sibling's nightly commit needs dependencies this repo's install doesn't provide (see pip check above)."
             exit 1
           fi
+
+      # Guard against a later install step (or a future version constraint
+      # in pyproject.toml) quietly replacing a sibling with a release: the
+      # run must test exactly the commits recorded in the summary.
+      - name: Verify the sibling commits under test
+        run: |
+          while IFS='=' read -r pkg sha; do
+            got="$(python -c 'import json, sys; from importlib.metadata import distribution; d = distribution(sys.argv[1]).read_text("direct_url.json"); print(json.loads(d).get("vcs_info", {}).get("commit_id", "") if d else "")' "$pkg")"
+            if [ "$got" != "$sha" ]; then
+              echo "::error::$pkg is installed at ${got:-a non-git source}, not the commit under test ($sha)."
+              exit 1
+            fi
+          done < "$RUNNER_TEMP/nightly-shas"
 
       - name: Run test suite
         run: python -m pytest
