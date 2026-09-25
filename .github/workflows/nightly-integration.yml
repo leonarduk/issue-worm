@@ -76,9 +76,13 @@ jobs:
             python -m pip install --force-reinstall --no-deps "$pkg @ git+$url@$sha"
             echo "| $pkg | $ref | \`${sha:0:12}\` |" >> "$GITHUB_STEP_SUMMARY"
           done
-          # A dependency the nightly commit added is not installed under
-          # --no-deps; surface that rather than let it pass as a test error.
-          python -m pip check || echo "::warning::pip check found inconsistencies (see above)."
+          # A dependency a nightly commit added is not installed under
+          # --no-deps. Fail on it - that is drift the pins need to catch up
+          # with - rather than let a lazily-imported gap pass the tests.
+          if ! python -m pip check; then
+            echo "::error::A sibling's nightly commit needs dependencies this repo's install doesn't provide (see pip check above)."
+            exit 1
+          fi
 
       - name: Run test suite
         run: python -m pytest
