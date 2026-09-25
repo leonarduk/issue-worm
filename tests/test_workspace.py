@@ -43,6 +43,7 @@ from workspace import (
     refresh_to_main,
     reset_to_commit,
     run_ci_checks,
+    run_advisory_attempt,
     run_revision_attempt,
     sanitize_file_path,
 )
@@ -3521,3 +3522,135 @@ def test_extract_new_workflow_run_scripts_ignores_non_workflow_files():
     )
 
     assert _extract_new_workflow_run_scripts(diff) == []
+
+
+# --- get_working_diff(stage_all=True) / run_advisory_attempt (issue-worm-pro#1917)
+
+
+def test_get_working_diff_stage_all_includes_undeclared_changes(repo):
+    (Path(repo) / "a.py").write_text("value = 2\n")
+    (Path(repo) / "other.py").write_text("y = 1\n")
+
+    diff = get_working_diff(repo, stage_all=True)
+
+    assert "a/a.py" in diff
+    assert "b/other.py" in diff
+
+
+def test_get_working_diff_stage_all_with_declared_files_is_rejected(repo):
+    with pytest.raises(ValueError):
+        get_working_diff(repo, ["a.py"], stage_all=True)
+
+
+def test_get_working_diff_stage_all_skips_gitignored_files(repo):
+    ensure_gitignored(repo, ("build/",))
+    (Path(repo) / "build").mkdir()
+    (Path(repo) / "build" / "out.txt").write_text("artifact\n")
+    (Path(repo) / "a.py").write_text("value = 2\n")
+
+    diff = get_working_diff(repo, stage_all=True)
+
+    assert "a/a.py" in diff
+    assert "build/out.txt" not in diff
+
+
+def test_run_advisory_attempt_includes_edits_outside_declared_files(repo):
+    start = get_current_commit(repo)
+    reset_to_commit(repo, start)
+    # The coder edits the tree directly, including a file it never declared.
+    (Path(repo) / "a.py").write_text("value = 2\n")
+    (Path(repo) / "helper.py").write_text("def helper():\n    return 1\n")
+
+    with patch("workspace.run_ci_checks", return_value=(True, "ok")) as ci:
+        result = run_advisory_attempt(repo, start)
+
+    assert result.success
+    assert "b/a.py" in result.diff_output
+    assert "b/helper.py" in result.diff_output
+    ci.assert_called_once()
+    # Left staged for commit-and-push, like a passing locked attempt.
+    staged = _git(repo, "diff", "--cached", "--name-only").stdout.split()
+    assert staged == ["a.py", "helper.py"]
+
+
+def test_run_advisory_attempt_after_reset_excludes_previous_leftovers(repo):
+    start = get_current_commit(repo)
+    # A previous attempt's stray untracked file...
+    (Path(repo) / "leftover.py").write_text("stale = True\n")
+    # ...is cleared by the caller's pre-attempt reset.
+    reset_to_commit(repo, start)
+    (Path(repo) / "a.py").write_text("value = 3\n")
+
+    with patch("workspace.run_ci_checks", return_value=(True, "ok")):
+        result = run_advisory_attempt(repo, start)
+
+    assert result.success
+    assert "leftover.py" not in result.diff_output
+    assert not (Path(repo) / "leftover.py").exists()
+
+
+def test_run_advisory_attempt_ci_runs_on_the_staged_tree(repo):
+    start = get_current_commit(repo)
+    (Path(repo) / "extra.py").write_text("x = 1\n")
+    seen = {}
+
+    def fake_ci(repo_path, command, extra_env=None):
+        seen["tree"] = sorted(
+            p.name for p in Path(repo_path).iterdir() if p.name != ".git"
+        )
+        seen["staged"] = _git(repo_path, "diff", "--cached", "--name-only").stdout.split()
+        return True, "ok"
+
+    with patch("workspace.run_ci_checks", side_effect=fake_ci):
+        result = run_advisory_attempt(repo, start)
+
+    assert result.success
+    assert seen["tree"] == ["a.py", "extra.py"]
+    assert seen["staged"] == ["extra.py"]
+
+
+def test_run_advisory_attempt_folds_coder_commits_into_the_diff(repo):
+    start = get_current_commit(repo)
+    (Path(repo) / "committed.py").write_text("c = 1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "coder's own commit")
+    (Path(repo) / "a.py").write_text("value = 4\n")
+
+    with patch("workspace.run_ci_checks", return_value=(True, "ok")):
+        result = run_advisory_attempt(repo, start)
+
+    assert result.success
+    assert get_current_commit(repo) == start
+    assert "b/committed.py" in result.diff_output
+    assert "b/a.py" in result.diff_output
+
+
+def test_run_advisory_attempt_with_no_changes_fails_without_running_ci(repo):
+    start = get_current_commit(repo)
+
+    with patch("workspace.run_ci_checks") as ci:
+        result = run_advisory_attempt(repo, start)
+
+    assert not result.success
+    assert result.category == "output_shape"
+    ci.assert_not_called()
+
+
+def test_run_advisory_attempt_rolls_back_on_ci_failure(repo):
+    start = get_current_commit(repo)
+    (Path(repo) / "a.py").write_text("value = 2\n")
+    (Path(repo) / "helper.py").write_text("h = 1\n")
+
+    with patch("workspace.run_ci_checks", return_value=(False, "boom")):
+        result = run_advisory_attempt(repo, start)
+
+    assert not result.success
+    assert result.test_output == "boom"
+    assert "b/helper.py" in result.diff_output
+    assert (Path(repo) / "a.py").read_text() == "value = 1\n"
+    assert not (Path(repo) / "helper.py").exists()
+
+
+def test_run_advisory_attempt_rejects_env_kwarg(repo):
+    with pytest.raises(TypeError):
+        run_advisory_attempt(repo, get_current_commit(repo), env={})
