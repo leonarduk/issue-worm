@@ -182,7 +182,8 @@ class LocalOllamaCoder:
                 timeout=self.timeout,
             )
             response.raise_for_status()
-            return response.json().get("response") or ""
+            data = response.json()
+            return _strip_inline_reasoning(data.get("response") or "", data.get("thinking"))
         except (requests.RequestException, ValueError):
             logger.warning(
                 "Ollama request to %s (model %s) failed",
@@ -191,6 +192,25 @@ class LocalOllamaCoder:
                 exc_info=True,
             )
             return ""
+
+
+def _strip_inline_reasoning(text: str, thinking: str | None) -> str:
+    """Drop a thinking model's reasoning that Ollama left in `response`.
+
+    A model whose chat template opens `<think>` in the prompt itself (the
+    Unsloth Qwen3 templates, e.g. qwen3.8-216k on Ollama 0.34) gets no
+    `thinking` field back: the deliberation, a bare `</think>`, then the
+    answer all arrive in `response`. Everything up to the first `</think>`
+    goes, unless Ollama did split the reasoning out (a non-empty
+    `thinking`), in which case any `</think>` left is the answer's own.
+    Same rule as cicaid-pro's `ollama_common.extract_ollama_review`.
+    """
+    if thinking:
+        return text
+    head, sep, tail = text.partition("</think>")
+    if sep and ("<think>" not in head or head.lstrip().startswith("<think>")):
+        return tail.lstrip()
+    return text
 
 
 class RemoteOpenAICoder:

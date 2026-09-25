@@ -168,6 +168,24 @@ def test_local_ollama_coder_uses_default_ollama_model_when_unset(monkeypatch):
     assert local_coder.model == "picked-by-vram"
 
 
+def test_local_complete_drops_inline_reasoning_before_bare_think_close():
+    """qwen3.8-216k on Ollama 0.34: `thinking` comes back empty and the
+    reasoning arrives in `response` ahead of a bare </think>."""
+    coder = LocalOllamaCoder(endpoint="http://example.invalid", model="test-model")
+    reply = {"response": "Let me think.\n</think>\n\nFILE: a.py", "thinking": ""}
+
+    with patch("coder.requests.post", return_value=_mock_response(reply)):
+        assert coder.complete("p") == "FILE: a.py"
+
+
+def test_local_complete_keeps_think_close_when_ollama_split_the_thinking():
+    coder = LocalOllamaCoder(endpoint="http://example.invalid", model="test-model")
+    reply = {"response": "tag = '</think>'", "thinking": "reasoning"}
+
+    with patch("coder.requests.post", return_value=_mock_response(reply)):
+        assert coder.complete("p") == "tag = '</think>'"
+
+
 def test_local_propose_passes_timeout_to_requests_post(tmp_path):
     coder = LocalOllamaCoder(endpoint="http://example.invalid", model="test-model", timeout=45)
 
