@@ -85,11 +85,21 @@ jobs:
             echo "$pkg=$sha" >> "$RUNNER_TEMP/nightly-shas"
           done
           # A dependency a nightly commit added is not installed under
-          # --no-deps. Fail on it - that is drift the pins need to catch up
-          # with - rather than let a lazily-imported gap pass the tests.
-          if ! python -m pip check; then
-            echo "::error::A sibling's nightly commit needs dependencies this repo's install doesn't provide (see pip check above)."
-            exit 1
+          # --no-deps. Fail on that - it is drift the pins need to catch up
+          # with - but only when a swapped sibling is the one complaining;
+          # unrelated drift in the base install just warns, so it can't open
+          # a tracking issue blaming the siblings.
+          if ! report="$(python -m pip check 2>&1)"; then
+            echo "$report"
+            names=""
+            for spec in $NIGHTLY_DEPS; do
+              names="${names:+$names|}$(printf '%s' "${spec%%=*}" | sed 's/[-_.]/[-_.]/g')"
+            done
+            if printf '%s\n' "$report" | grep -Eiq "^($names) "; then
+              echo "::error::A sibling's nightly commit needs dependencies this repo's install doesn't provide (see pip check above)."
+              exit 1
+            fi
+            echo "::warning::pip check found problems unrelated to the swapped siblings (see above)."
           fi
 
       # Guard against a later install step (or a future version constraint
