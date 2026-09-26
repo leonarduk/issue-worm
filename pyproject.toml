@@ -42,12 +42,12 @@ dev = [
 # fallback. NVIDIA/Windows+Linux only (nvidia-smi), so this is opt-in
 # rather than a core dependency - most installs of issue-worm (cloud/
 # remote/claude sources, non-NVIDIA machines) have no use for it.
-# Pinned to a tagged release (v0.1.0, the tag carrying get_coder_model)
+# Pinned to a tagged release (v0.1.1: get_coder_model counts resident Ollama VRAM)
 # rather than a floating ref - an unpinned git dependency on someone else's
 # HEAD is a supply-chain footgun for anyone installing this extra. Kept
 # current by update-dependencies.yml's ollama-tools leg.
 vram = [
-    "ollama-tools @ git+https://github.com/leonarduk/laptop-egpu-llm.git@v0.1.0",
+    "ollama-tools @ git+https://github.com/leonarduk/laptop-egpu-llm.git@v0.1.1",
 ]
 
 [project.scripts]
