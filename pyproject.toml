@@ -47,7 +47,7 @@ dev = [
 # HEAD is a supply-chain footgun for anyone installing this extra. Kept
 # current by update-dependencies.yml's ollama-tools leg.
 vram = [
-    "ollama-tools @ git+https://github.com/leonarduk/laptop-egpu-llm.git@v0.1.1",
+    "ollama-tools @ git+https://github.com/leonarduk/laptop-egpu-llm.git@v0.1.0",
 ]
 
 [project.scripts]
