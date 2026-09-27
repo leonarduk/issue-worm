@@ -75,6 +75,31 @@ jobs:
               --generate-notes
           fi
 
+      # This release already IS the new version, so issue-worm-pro doesn't
+      # need to wait for its next scheduled poll to notice it -- point its
+      # update-dependencies.yml at it directly. That workflow always checks
+      # its full matrix (issue-worm, cicaid-devtools-pro, ollama-tools) on
+      # workflow_dispatch, and its cicaid-devtools pin is deliberately only
+      # ever moved via the issue-worm leg (see its update_dependency_pins.py),
+      # so no per-dependency input is needed here. Needs a cross-repo PAT
+      # with Actions:write on issue-worm-pro (github.token only reaches this
+      # repo); DISPATCH_TOKEN is a repo secret here, not something a release
+      # can set itself.
+      - name: Trigger dependency update in issue-worm-pro
+        env:
+          GH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning::DISPATCH_TOKEN is not set; skipping issue-worm-pro dependency-update dispatch. Add a fine-grained PAT with Actions:write on leonarduk/issue-worm-pro as the DISPATCH_TOKEN repo secret."
+            exit 0
+          fi
+          # Best-effort: the release is already published by this point, so a
+          # dispatch failure (bad token scope, workflow renamed/removed in
+          # issue-worm-pro) must not turn a successful release red. The next
+          # scheduled poll there still catches this release either way.
+          gh workflow run update-dependencies.yml --repo leonarduk/issue-worm-pro || \
+            echo "::warning::Could not dispatch update-dependencies.yml in leonarduk/issue-worm-pro — it will pick up this release on its next scheduled run instead."
+
       - name: Update README to this release's version
         run: python scripts/bump_readme_version.py "${{ github.ref_name }}"
 
