@@ -93,7 +93,12 @@ jobs:
             echo "::warning::DISPATCH_TOKEN is not set; skipping issue-worm-pro dependency-update dispatch. Add a fine-grained PAT with Actions:write on leonarduk/issue-worm-pro as the DISPATCH_TOKEN repo secret."
             exit 0
           fi
-          gh workflow run update-dependencies.yml --repo leonarduk/issue-worm-pro
+          # Best-effort: the release is already published by this point, so a
+          # dispatch failure (bad token scope, workflow renamed/removed in
+          # issue-worm-pro) must not turn a successful release red. The next
+          # scheduled poll there still catches this release either way.
+          gh workflow run update-dependencies.yml --repo leonarduk/issue-worm-pro || \
+            echo "::warning::Could not dispatch update-dependencies.yml in leonarduk/issue-worm-pro — it will pick up this release on its next scheduled run instead."
 
       - name: Update README to this release's version
         run: python scripts/bump_readme_version.py "${{ github.ref_name }}"
