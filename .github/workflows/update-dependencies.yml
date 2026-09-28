@@ -289,7 +289,7 @@ jobs:
       - name: Close superseded dependency PRs and issues
         if: >-
           steps.check.outputs.new_version != '' && steps.skip.outputs.skip != 'true'
-          && steps.pr.outputs.pr_url != '' && steps.issue.outputs.issue_number != ''
+          && steps.pr.outputs.pr_url != ''
         env:
           GH_TOKEN: ${{ github.token }}
           DEPENDENCY: ${{ matrix.dependency }}
@@ -316,20 +316,30 @@ jobs:
             gh api "repos/$GITHUB_REPOSITORY/git/refs/heads/$OLD_BRANCH" -X DELETE >/dev/null 2>&1 || true
           done
 
-          # Matched by title prefix, not gh's substring `in:title` search
-          # alone -- that would also catch e.g. "Update foo-bar to v1.0.0"
-          # for a dependency named "foo". Excluded by issue *number* rather
-          # than by re-deriving this run's title text, so a future change to
-          # how that title is built can't cause this to close the issue it
-          # just created.
-          gh issue list --repo "$GITHUB_REPOSITORY" --state open \
-            --search "in:title \"Update ${DEPENDENCY} to v\"" --json number,title --limit 500 |
-            jq -r --arg prefix "Update ${DEPENDENCY} to v" --arg new "$NEW_ISSUE_NUMBER" \
-              '.[] | select(.title | startswith($prefix)) | select((.number | tostring) != $new) | .number' |
-          while read -r OLD_ISSUE; do
-            [[ -z "$OLD_ISSUE" ]] && continue
-            echo "Closing superseded issue #$OLD_ISSUE"
-            gh issue close "$OLD_ISSUE" --repo "$GITHUB_REPOSITORY" \
-              --reason "not planned" \
-              --comment "Superseded by ${NEW_PR_URL}."
-          done
+          # Guarded on its own, separately from the PR-closing block above:
+          # closing superseded PRs must not depend on the tracking-issue
+          # machinery having worked. If NEW_ISSUE_NUMBER were ever empty,
+          # excluding by title match alone (no issue number to exclude by)
+          # would risk closing the issue this run just created, so skip the
+          # issue-closing pass entirely rather than guess.
+          if [[ -n "$NEW_ISSUE_NUMBER" ]]; then
+            # Matched by title prefix, not gh's substring `in:title` search
+            # alone -- that would also catch e.g. "Update foo-bar to v1.0.0"
+            # for a dependency named "foo". Excluded by issue *number* rather
+            # than by re-deriving this run's title text, so a future change
+            # to how that title is built can't cause this to close the issue
+            # it just created.
+            gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+              --search "in:title \"Update ${DEPENDENCY} to v\"" --json number,title --limit 500 |
+              jq -r --arg prefix "Update ${DEPENDENCY} to v" --arg new "$NEW_ISSUE_NUMBER" \
+                '.[] | select(.title | startswith($prefix)) | select((.number | tostring) != $new) | .number' |
+            while read -r OLD_ISSUE; do
+              [[ -z "$OLD_ISSUE" ]] && continue
+              echo "Closing superseded issue #$OLD_ISSUE"
+              gh issue close "$OLD_ISSUE" --repo "$GITHUB_REPOSITORY" \
+                --reason "not planned" \
+                --comment "Superseded by ${NEW_PR_URL}."
+            done
+          else
+            echo "NEW_ISSUE_NUMBER is empty; skipping superseded-issue cleanup."
+          fi
