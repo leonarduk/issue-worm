@@ -278,6 +278,13 @@ jobs:
       # open when v0.5.9's is created) was previously left stacked next to
       # the new one instead of being superseded. Close it -- and its linked
       # tracking issue, which a close-without-merge does not auto-close.
+      #
+      # No explicit error handling on the `gh pr/issue close` calls below:
+      # GitHub Actions runs `run:` steps as `bash -eo pipefail {0}`, so a
+      # failing close (permissions, already-closed race) aborts the step
+      # immediately with a red check instead of being swallowed -- it does
+      # not silently leave a superseded PR open with its issue closed, or
+      # vice versa.
       - name: Close superseded dependency PRs and issues
         if: >-
           steps.check.outputs.new_version != '' && steps.skip.outputs.skip != 'true'
@@ -295,7 +302,7 @@ jobs:
           while read -r OLD_PR; do
             [[ -z "$OLD_PR" ]] && continue
             echo "Closing superseded PR #$OLD_PR"
-            gh pr close "$OLD_PR" --repo "$GITHUB_REPOSITORY" \
+            gh pr close "$OLD_PR" --repo "$GITHUB_REPOSITORY" --delete-branch \
               --comment "Superseded by ${NEW_PR_URL}, which bumps \`${DEPENDENCY}\` to a newer version."
           done
 
