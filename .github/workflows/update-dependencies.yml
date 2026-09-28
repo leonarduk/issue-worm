@@ -298,12 +298,17 @@ jobs:
         run: |
           gh pr list --repo "$GITHUB_REPOSITORY" --state open --json number,headRefName --limit 500 |
             jq -r --arg branch "$CURRENT_BRANCH" --arg prefix "deps/${DEPENDENCY}-v" \
-              '.[] | select(.headRefName | startswith($prefix)) | select(.headRefName != $branch) | .number' |
-          while read -r OLD_PR; do
+              '.[] | select(.headRefName | startswith($prefix)) | select(.headRefName != $branch) | "\(.number)\t\(.headRefName)"' |
+          while IFS=$'\t' read -r OLD_PR OLD_BRANCH; do
             [[ -z "$OLD_PR" ]] && continue
             echo "Closing superseded PR #$OLD_PR"
-            gh pr close "$OLD_PR" --repo "$GITHUB_REPOSITORY" --delete-branch \
+            gh pr close "$OLD_PR" --repo "$GITHUB_REPOSITORY" \
               --comment "Superseded by ${NEW_PR_URL}, which bumps \`${DEPENDENCY}\` to a newer version."
+            # Best-effort only: branch deletion is cleanup, not the point of
+            # this step, and must not abort the loop (bash -eo pipefail) and
+            # skip every other superseded PR/issue over one stale ref that's
+            # already gone or protected.
+            gh api "repos/$GITHUB_REPOSITORY/git/refs/heads/$OLD_BRANCH" -X DELETE >/dev/null 2>&1 || true
           done
 
           # Matched by title prefix, not gh's substring `in:title` search
