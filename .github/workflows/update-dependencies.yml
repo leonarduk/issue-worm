@@ -279,15 +279,17 @@ jobs:
       # the new one instead of being superseded. Close it -- and its linked
       # tracking issue, which a close-without-merge does not auto-close.
       - name: Close superseded dependency PRs and issues
-        if: steps.check.outputs.new_version != '' && steps.skip.outputs.skip != 'true'
+        if: >-
+          steps.check.outputs.new_version != '' && steps.skip.outputs.skip != 'true'
+          && steps.pr.outputs.pr_url != ''
         env:
           GH_TOKEN: ${{ github.token }}
           DEPENDENCY: ${{ matrix.dependency }}
-          NEW_VERSION: ${{ steps.check.outputs.new_version }}
+          NEW_ISSUE_NUMBER: ${{ steps.issue.outputs.issue_number }}
           NEW_PR_URL: ${{ steps.pr.outputs.pr_url }}
           CURRENT_BRANCH: deps/${{ matrix.dependency }}-v${{ steps.check.outputs.branch_version }}
         run: |
-          gh pr list --repo "$GITHUB_REPOSITORY" --state open --json number,headRefName |
+          gh pr list --repo "$GITHUB_REPOSITORY" --state open --json number,headRefName --limit 500 |
             jq -r --arg branch "$CURRENT_BRANCH" --arg prefix "deps/${DEPENDENCY}-v" \
               '.[] | select(.headRefName | startswith($prefix)) | select(.headRefName != $branch) | .number' |
           while read -r OLD_PR; do
@@ -297,10 +299,16 @@ jobs:
               --comment "Superseded by ${NEW_PR_URL}, which bumps \`${DEPENDENCY}\` to a newer version."
           done
 
+          # Matched by title prefix, not gh's substring `in:title` search
+          # alone -- that would also catch e.g. "Update foo-bar to v1.0.0"
+          # for a dependency named "foo". Excluded by issue *number* rather
+          # than by re-deriving this run's title text, so a future change to
+          # how that title is built can't cause this to close the issue it
+          # just created.
           gh issue list --repo "$GITHUB_REPOSITORY" --state open \
-            --search "in:title \"Update ${DEPENDENCY} to v\"" --json number,title |
-            jq -r --arg title "Update ${DEPENDENCY} to v${NEW_VERSION}" \
-              '.[] | select(.title != $title) | .number' |
+            --search "in:title \"Update ${DEPENDENCY} to v\"" --json number,title --limit 500 |
+            jq -r --arg prefix "Update ${DEPENDENCY} to v" --arg new "$NEW_ISSUE_NUMBER" \
+              '.[] | select(.title | startswith($prefix)) | select((.number | tostring) != $new) | .number' |
           while read -r OLD_ISSUE; do
             [[ -z "$OLD_ISSUE" ]] && continue
             echo "Closing superseded issue #$OLD_ISSUE"
