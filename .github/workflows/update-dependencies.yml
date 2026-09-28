@@ -272,6 +272,7 @@ jobs:
             --base main \
             --head "$BRANCH")
           echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
+          echo "head_ref=$BRANCH" >> "$GITHUB_OUTPUT"
 
       # The skip step above only catches a PR for *this exact* version; an
       # older, still-open PR for the same dependency (e.g. v0.5.8's PR still
@@ -294,7 +295,11 @@ jobs:
           DEPENDENCY: ${{ matrix.dependency }}
           NEW_ISSUE_NUMBER: ${{ steps.issue.outputs.issue_number }}
           NEW_PR_URL: ${{ steps.pr.outputs.pr_url }}
-          CURRENT_BRANCH: deps/${{ matrix.dependency }}-v${{ steps.check.outputs.branch_version }}
+          # The actual branch just pushed and opened as a PR, not
+          # re-derived from branch_version -- the two happen to match today,
+          # but re-deriving invites the new PR closing itself the moment
+          # they ever don't.
+          CURRENT_BRANCH: ${{ steps.pr.outputs.head_ref }}
         run: |
           gh pr list --repo "$GITHUB_REPOSITORY" --state open --json number,headRefName --limit 500 |
             jq -r --arg branch "$CURRENT_BRANCH" --arg prefix "deps/${DEPENDENCY}-v" \
