@@ -289,7 +289,7 @@ jobs:
       - name: Close superseded dependency PRs and issues
         if: >-
           steps.check.outputs.new_version != '' && steps.skip.outputs.skip != 'true'
-          && steps.pr.outputs.pr_url != ''
+          && steps.pr.outputs.pr_url != '' && steps.issue.outputs.issue_number != ''
         env:
           GH_TOKEN: ${{ github.token }}
           DEPENDENCY: ${{ matrix.dependency }}
