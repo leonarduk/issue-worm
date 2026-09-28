@@ -231,6 +231,7 @@ jobs:
           echo "issue_number=$ISSUE_NUMBER" >> "$GITHUB_OUTPUT"
 
       - name: Push and open pull request
+        id: pr
         if: steps.check.outputs.new_version != '' && steps.skip.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -265,8 +266,45 @@ jobs:
           Closes #${ISSUE_NUMBER}
           EOF
           )
-          gh pr create --repo "$GITHUB_REPOSITORY" \
+          PR_URL=$(gh pr create --repo "$GITHUB_REPOSITORY" \
             --title "Update ${DEPENDENCY} to v${NEW_VERSION}" \
             --body "$BODY" \
             --base main \
-            --head "$BRANCH"
+            --head "$BRANCH")
+          echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
+
+      # The skip step above only catches a PR for *this exact* version; an
+      # older, still-open PR for the same dependency (e.g. v0.5.8's PR still
+      # open when v0.5.9's is created) was previously left stacked next to
+      # the new one instead of being superseded. Close it -- and its linked
+      # tracking issue, which a close-without-merge does not auto-close.
+      - name: Close superseded dependency PRs and issues
+        if: steps.check.outputs.new_version != '' && steps.skip.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPENDENCY: ${{ matrix.dependency }}
+          NEW_VERSION: ${{ steps.check.outputs.new_version }}
+          NEW_PR_URL: ${{ steps.pr.outputs.pr_url }}
+          CURRENT_BRANCH: deps/${{ matrix.dependency }}-v${{ steps.check.outputs.branch_version }}
+        run: |
+          gh pr list --repo "$GITHUB_REPOSITORY" --state open --json number,headRefName |
+            jq -r --arg branch "$CURRENT_BRANCH" --arg prefix "deps/${DEPENDENCY}-v" \
+              '.[] | select(.headRefName | startswith($prefix)) | select(.headRefName != $branch) | .number' |
+          while read -r OLD_PR; do
+            [[ -z "$OLD_PR" ]] && continue
+            echo "Closing superseded PR #$OLD_PR"
+            gh pr close "$OLD_PR" --repo "$GITHUB_REPOSITORY" \
+              --comment "Superseded by ${NEW_PR_URL}, which bumps \`${DEPENDENCY}\` to a newer version."
+          done
+
+          gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "in:title \"Update ${DEPENDENCY} to v\"" --json number,title |
+            jq -r --arg title "Update ${DEPENDENCY} to v${NEW_VERSION}" \
+              '.[] | select(.title != $title) | .number' |
+          while read -r OLD_ISSUE; do
+            [[ -z "$OLD_ISSUE" ]] && continue
+            echo "Closing superseded issue #$OLD_ISSUE"
+            gh issue close "$OLD_ISSUE" --repo "$GITHUB_REPOSITORY" \
+              --reason "not planned" \
+              --comment "Superseded by ${NEW_PR_URL}."
+          done
