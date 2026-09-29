@@ -90,6 +90,62 @@ def test_a_tool_config_only_pyproject_is_not_installed(tmp_path):
 # --- building and caching -------------------------------------------------------
 
 
+def _with_declared_requirements(repo: Path, declared: str) -> Path:
+    repo.mkdir(parents=True, exist_ok=True)
+    _python_project(repo)
+    with (repo / "pyproject.toml").open("a", encoding="utf-8") as f:
+        f.write(f"[tool.issue-worm]\nverifier-requirements = {declared}\n")
+    return repo
+
+
+def test_install_args_add_declared_verifier_requirements_from_a_sibling(tmp_path):
+    """allotmint-pro's tests import a sibling allotmint checkout, so its CI
+    also installs that repo's backend/requirements.txt."""
+    repo = _with_declared_requirements(
+        tmp_path / "pro", '["../shared/backend/requirements.txt"]'
+    )
+    (tmp_path / "shared" / "backend").mkdir(parents=True)
+    (tmp_path / "shared" / "backend" / "requirements.txt").write_text("pyyaml\n")
+
+    assert verifier_venv_install_args(str(repo)) == [
+        ["install", "-e", "."],
+        ["install", "-r", "../shared/backend/requirements.txt"],
+    ]
+
+
+def test_install_args_skip_a_declared_requirement_that_does_not_exist(tmp_path):
+    repo = _with_declared_requirements(tmp_path / "pro", '["../missing/requirements.txt"]')
+
+    assert verifier_venv_install_args(str(repo)) == [["install", "-e", "."]]
+
+
+def test_install_args_ignore_a_malformed_verifier_requirements_value(tmp_path):
+    repo = _with_declared_requirements(tmp_path / "pro", '"not-a-list.txt"')
+
+    assert verifier_venv_install_args(str(repo)) == [["install", "-e", "."]]
+
+
+def test_rebuilds_when_a_declared_sibling_requirement_appears_or_changes(tmp_path, venv_root):
+    repo = _with_declared_requirements(tmp_path / "pro", '["../shared/requirements.txt"]')
+    venv_dir = verifier_venv_dir(str(repo))
+
+    def fake_step(command, cwd, env):
+        if command[1:3] == ["-m", "venv"]:
+            _fake_built_venv(venv_dir)
+
+    with patch("workspace._run_venv_setup_step", side_effect=fake_step) as step:
+        ensure_verifier_venv(str(repo))  # sibling not cloned yet
+        (tmp_path / "shared").mkdir()
+        (tmp_path / "shared" / "requirements.txt").write_text("pyyaml\n")
+        ensure_verifier_venv(str(repo))  # it appeared: rebuild
+        ensure_verifier_venv(str(repo))  # unchanged: cached
+        (tmp_path / "shared" / "requirements.txt").write_text("pyyaml\nbotocore\n")
+        ensure_verifier_venv(str(repo))  # upstream pin change: rebuild
+
+    venv_creations = [c for c in step.call_args_list if c.args[0][1:3] == ["-m", "venv"]]
+    assert len(venv_creations) == 3
+
+
 def test_disabled_by_env_builds_nothing(tmp_path, venv_root, monkeypatch):
     _python_project(tmp_path)
     monkeypatch.setenv(VERIFIER_VENV_ENV, "0")
