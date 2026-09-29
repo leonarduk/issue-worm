@@ -514,3 +514,65 @@ def test_node_deps_skips_when_git_cannot_say_whether_node_modules_is_ignored(
         assert workspace.ensure_node_deps(str(repo)) == []
 
     step.assert_not_called()
+
+
+def test_node_deps_does_nothing_for_a_repo_without_package_json(tmp_path, node_deps_on):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+
+    with (
+        patch("workspace.shutil.which") as which,
+        patch("workspace._run_venv_setup_step") as step,
+    ):
+        assert workspace.ensure_node_deps(str(tmp_path)) == []
+
+    which.assert_not_called()
+    step.assert_not_called()
+
+
+def test_node_deps_one_failing_dir_does_not_stop_the_others(tmp_path, node_deps_on):
+    repo = _node_repo(tmp_path)
+    admin = repo / "admin"
+    admin.mkdir()
+    (admin / "package.json").write_text('{"name": "admin"}\n', encoding="utf-8")
+    (admin / "package-lock.json").write_text('{"lockfileVersion": 3}\n', encoding="utf-8")
+    (admin / ".gitignore").write_text("node_modules\n", encoding="utf-8")
+
+    def admin_fails(command, cwd, env):
+        if Path(cwd).name == "admin":
+            raise WorkspaceError("npm ci exited 1")
+        _fake_npm_ci(command, cwd, env)
+
+    with (
+        patch("workspace.shutil.which", return_value="/usr/bin/npm"),
+        patch("workspace._run_venv_setup_step", side_effect=admin_fails) as step,
+    ):
+        notes = workspace.ensure_node_deps(str(repo))
+
+    assert sorted(Path(c.args[1]).name for c in step.call_args_list) == ["admin", "frontend"]
+    assert len(notes) == 1 and "admin/" in notes[0]
+    assert (repo / "frontend" / "node_modules" / workspace._NODE_DEPS_STAMP).is_file()
+
+
+def test_node_deps_skips_dot_directories(tmp_path, node_deps_on):
+    repo = _node_repo(tmp_path)
+    tooling = repo / ".tooling"
+    tooling.mkdir()
+    (tooling / "package.json").write_text('{"name": "t"}\n', encoding="utf-8")
+    (tooling / "package-lock.json").write_text('{"lockfileVersion": 3}\n', encoding="utf-8")
+
+    assert [d.name for d in workspace._node_project_dirs(repo.resolve())] == ["frontend"]
+
+
+def test_node_deps_stamps_a_project_with_no_dependencies(tmp_path, node_deps_on):
+    """npm ci creates no node_modules for a dependency-free project; without
+    one the stamp could not be written and it would reinstall every run."""
+    repo = _node_repo(tmp_path)
+
+    with (
+        patch("workspace.shutil.which", return_value="/usr/bin/npm"),
+        patch("workspace._run_venv_setup_step") as step,  # creates nothing
+    ):
+        workspace.ensure_node_deps(str(repo))
+        workspace.ensure_node_deps(str(repo))
+
+    step.assert_called_once()

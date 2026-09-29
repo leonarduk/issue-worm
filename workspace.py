@@ -2503,8 +2503,18 @@ def _node_project_dirs(repo: Path) -> list[Path]:
     """The repo root and its direct subdirectories that hold both a
     ``package.json`` and a ``package-lock.json`` - where CI would run
     ``npm ci``. Deeper trees are left alone: a nested lockfile is far more
-    often a fixture or a vendored package than something CI installs."""
-    candidates = [repo, *sorted(p for p in repo.iterdir() if p.is_dir() and not p.name.startswith("."))]
+    often a fixture or a vendored package than something CI installs. So
+    are dot-directories (``.github``, ``.venv``, ...), which hold tooling,
+    not the project, and symlinked directories, which may point outside
+    the checkout."""
+    candidates = [
+        repo,
+        *sorted(
+            p
+            for p in repo.iterdir()
+            if p.is_dir() and not p.is_symlink() and not p.name.startswith(".")
+        ),
+    ]
     return [
         d
         for d in candidates
@@ -2614,6 +2624,8 @@ def ensure_node_deps(repo_path: str) -> list[str]:
             )
             continue
         try:
+            # A project with no dependencies gets no node_modules from npm ci.
+            node_modules.mkdir(exist_ok=True)
             stamp_path.write_text(digest, encoding="utf-8")
         except OSError as exc:
             # The install itself worked, so the checks can still run; the
