@@ -3671,7 +3671,7 @@ def test_run_advisory_attempt_ci_runs_on_the_staged_tree(repo):
     (Path(repo) / "extra.py").write_text("x = 1\n")
     seen = {}
 
-    def fake_ci(repo_path, command, extra_env=None):
+    def fake_ci(repo_path, command, extra_env=None, changed_paths=None):
         seen["tree"] = sorted(
             p.name for p in Path(repo_path).iterdir() if p.name != ".git"
         )
@@ -3765,7 +3765,9 @@ def test_run_advisory_attempt_passes_extra_env_to_ci_and_workflow_steps(repo):
         result = run_advisory_attempt(repo, start, ["make", "ci"], extra_env={"K": "v"})
 
     assert result.success
-    ci.assert_called_once_with(repo, ["make", "ci"], extra_env={"K": "v"})
+    ci.assert_called_once_with(
+        repo, ["make", "ci"], extra_env={"K": "v"}, changed_paths=["a.py"]
+    )
     assert steps.call_args.args[2] == {"K": "v"}
 
 

@@ -46,6 +46,7 @@ repository check from an error to a warning, for a workspace whose
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import logging
 import os
@@ -2810,11 +2811,82 @@ def ensure_node_deps(repo_path: str) -> list[str]:
     return notes
 
 
+# The target's cicaid check list (read by `cicaid run-ci-checks` too).
+CI_CHECKS_CONFIG = ".cicaid-checks.toml"
+
+
+def changed_paths_from_diff(diff_output: str) -> list[str]:
+    """The repo-relative paths a git diff touches, in order, both sides of a
+    rename included."""
+    paths: list[str] = []
+    for line in diff_output.splitlines():
+        match = re.match(r"diff --git a/(.+?) b/(.+)$", line)
+        if match:
+            for path in match.groups():
+                if path not in paths:
+                    paths.append(path)
+    return paths
+
+
+def _path_matches(path: str, glob: str) -> bool:
+    """Case-insensitive glob match where ``*`` also crosses ``/`` and a
+    leading ``**/`` also matches at the repo root (so ``**/*.sh`` covers
+    ``run.sh``)."""
+    path = path.replace("\\", "/").lower()
+    glob = glob.lower()
+    return fnmatch.fnmatchcase(path, glob) or (
+        glob.startswith("**/") and fnmatch.fnmatchcase(path, glob[3:])
+    )
+
+
+def select_ci_checks(repo_path: str, changed_paths: list[str]) -> tuple[list[str] | None, str]:
+    """Which of the target's cicaid checks a change needs, and a note
+    saying so - or ``(None, "")`` to run them all.
+
+    Opt-in per check: a ``[[checks]]`` entry in ``.cicaid-checks.toml`` may
+    declare ``paths = ["frontend/**", ...]`` (cicaid itself ignores the
+    key). A check runs when any changed path matches one of its globs; a
+    check that declares no ``paths`` always runs. Everything runs - exactly
+    as before - when no check declares ``paths``, the config can't be read,
+    or the selection would be every check or none, so a change nothing
+    claims is still fully checked. A frontend-only fix then skips the
+    backend, infrastructure and shell suites instead of paying ~10 minutes
+    per attempt for them; the PR's own CI still runs everything.
+    """
+    try:
+        data = tomllib.loads((Path(repo_path) / CI_CHECKS_CONFIG).read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return None, ""
+    entries = data.get("checks")
+    if not isinstance(entries, list):
+        return None, ""
+    checks = [e for e in entries if isinstance(e, dict) and isinstance(e.get("name"), str)]
+    if not any(isinstance(e.get("paths"), list) for e in checks):
+        return None, ""
+    selected = []
+    for entry in checks:
+        globs = entry.get("paths")
+        if not isinstance(globs, list) or any(
+            isinstance(glob, str) and _path_matches(path, glob)
+            for path in changed_paths
+            for glob in globs
+        ):
+            selected.append(entry["name"])
+    if not selected or len(selected) == len(checks):
+        return None, ""
+    skipped = [entry["name"] for entry in checks if entry["name"] not in selected]
+    return selected, (
+        f"note: ran only the checks this change touches ({', '.join(selected)}); "
+        f"skipped {', '.join(skipped)} - see paths in {CI_CHECKS_CONFIG}.\n\n"
+    )
+
+
 def run_ci_checks(
     repo_path: str,
     command: list[str] | None = None,
     extra_env: dict[str, str] | None = None,
     timeout: float | None = None,
+    changed_paths: list[str] | None = None,
     **kwargs,
 ) -> tuple[bool, str]:
     """Run the configured CI-check command (default: `cicaid run-ci-checks
@@ -2843,19 +2915,29 @@ def run_ci_checks(
     Analyser) the same way a real test failure is. A command that exceeds
     its timeout is different - it raises :class:`WorkspaceError` so the
     stall is not mistaken for a test failure.
+
+    With ``changed_paths`` and the default command, only the checks those
+    paths need are run when the target declares per-check ``paths`` (see
+    :func:`select_ci_checks`); the output then starts with a note naming
+    what was skipped.
     """
     _reject_base_environment_kwarg("run_ci_checks", kwargs)
     command = list(command) if command else list(DEFAULT_CI_COMMAND)
     effective_timeout = resolve_ci_timeout(repo_path) if timeout is None else timeout
 
     note = ""
+    if changed_paths and command == DEFAULT_CI_COMMAND:
+        selected, note = select_ci_checks(repo_path, changed_paths)
+        if selected:
+            logger.info("CI checks for %s: running only %s", repo_path, selected)
+            command = [*DEFAULT_CI_COMMAND[:-1], *(arg for name in selected for arg in ("--check", name))]
     try:
         venv_dir = ensure_verifier_venv(repo_path)
     except (WorkspaceError, OSError) as exc:
         # Degrade to the old behaviour rather than fail an attempt the patch
         # may well have passed: no network, a broken build backend, etc.
         logger.warning("verifier venv unavailable for %s: %s", repo_path, exc)
-        note = (
+        note += (
             f"note: issue-worm could not prepare an isolated verifier venv "
             f"({exc}); these checks ran in issue-worm's own environment "
             f"instead, where its installed packages are visible.\n\n"
@@ -2969,7 +3051,12 @@ def run_revision_attempt(
         # pathspec if handed to `git add` unsanitized.
         diff_output = get_working_diff(repo_path, [change.path for change in changes])
 
-        passed, test_output = run_ci_checks(repo_path, ci_command, extra_env=extra_env)
+        passed, test_output = run_ci_checks(
+            repo_path,
+            ci_command,
+            extra_env=extra_env,
+            changed_paths=changed_paths_from_diff(diff_output),
+        )
         if not passed:
             return WorkspaceResult(
                 success=False,
@@ -3060,7 +3147,12 @@ def run_advisory_attempt(
                 category=CATEGORY_OUTPUT_SHAPE,
             )
 
-        passed, test_output = run_ci_checks(repo_path, ci_command, extra_env=extra_env)
+        passed, test_output = run_ci_checks(
+            repo_path,
+            ci_command,
+            extra_env=extra_env,
+            changed_paths=changed_paths_from_diff(diff_output),
+        )
         if not passed:
             return WorkspaceResult(
                 success=False,
