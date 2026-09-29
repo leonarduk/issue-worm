@@ -2560,17 +2560,39 @@ def ensure_node_deps(repo_path: str) -> list[str]:
     for project_dir in project_dirs:
         label = project_dir.relative_to(repo).as_posix() if project_dir != repo else "."
         node_modules = project_dir / "node_modules"
-        ignored = _run_git(
-            str(repo), "check-ignore", "-q", str(node_modules), check=False
-        ).returncode == 0
-        if not ignored:
-            logger.info(
-                "verifier node deps: skipping %s - its node_modules is not gitignored",
-                label,
+        try:
+            # 0 = ignored, 1 = not ignored, anything else = git itself failed.
+            ignore_rc = _run_git(
+                str(repo), "check-ignore", "-q", str(node_modules), check=False
+            ).returncode
+        except WorkspaceError as exc:
+            ignore_rc, ignore_error = None, str(exc)
+        else:
+            ignore_error = None
+        if ignore_rc != 0:
+            if ignore_rc == 1:
+                logger.info(
+                    "verifier node deps: skipping %s - its node_modules is not gitignored",
+                    label,
+                )
+            else:
+                logger.warning(
+                    "verifier node deps: skipping %s - could not tell whether its "
+                    "node_modules is gitignored (git check-ignore %s)",
+                    label,
+                    ignore_error or f"exited {ignore_rc}",
+                )
+            continue
+        stamp_path = node_modules / _NODE_DEPS_STAMP
+        try:
+            digest = _node_deps_digest(project_dir)
+        except OSError as exc:
+            notes.append(
+                f"note: issue-worm could not read {label}/package.json or "
+                f"package-lock.json ({exc}); its JavaScript dependencies were not "
+                f"installed and checks that need them may fail."
             )
             continue
-        digest = _node_deps_digest(project_dir)
-        stamp_path = node_modules / _NODE_DEPS_STAMP
         try:
             if stamp_path.read_text(encoding="utf-8") == digest:
                 continue
@@ -2591,7 +2613,18 @@ def ensure_node_deps(repo_path: str) -> list[str]:
                 f"in {label}/ ({exc}); checks that need them will fail."
             )
             continue
-        stamp_path.write_text(digest, encoding="utf-8")
+        try:
+            stamp_path.write_text(digest, encoding="utf-8")
+        except OSError as exc:
+            # The install itself worked, so the checks can still run; the
+            # only cost is reinstalling next time.
+            logger.warning(
+                "verifier node deps: could not write %s (%s); %s/ will be "
+                "reinstalled next time",
+                stamp_path,
+                exc,
+                label,
+            )
     return notes
 
 

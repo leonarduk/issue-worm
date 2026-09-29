@@ -425,3 +425,92 @@ def test_run_ci_checks_prefixes_a_node_deps_note(tmp_path):
     assert not passed
     assert output.startswith("note: npm is not on PATH\n\n")
     assert output.endswith("lint failed")
+
+
+def test_node_deps_installs_at_the_repo_root_too(tmp_path, node_deps_on):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / "package.json").write_text('{"name": "root"}\n', encoding="utf-8")
+    (tmp_path / "package-lock.json").write_text('{"lockfileVersion": 3}\n', encoding="utf-8")
+    (tmp_path / ".gitignore").write_text("node_modules\n", encoding="utf-8")
+
+    with (
+        patch("workspace.shutil.which", return_value="/usr/bin/npm"),
+        patch("workspace._run_venv_setup_step", side_effect=_fake_npm_ci) as step,
+    ):
+        assert workspace.ensure_node_deps(str(tmp_path)) == []
+
+    assert Path(step.call_args.args[1]) == tmp_path.resolve()
+
+
+def test_node_deps_skips_a_package_json_without_a_lockfile(tmp_path, node_deps_on):
+    repo = _node_repo(tmp_path)
+    (repo / "frontend" / "package-lock.json").unlink()
+
+    with patch("workspace._run_venv_setup_step") as step:
+        assert workspace.ensure_node_deps(str(repo)) == []
+
+    step.assert_not_called()
+
+
+def test_node_deps_passes_the_setup_env_without_the_tools_api_keys(
+    tmp_path, node_deps_on, monkeypatch
+):
+    repo = _node_repo(tmp_path)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-secret")
+
+    with (
+        patch("workspace.shutil.which", return_value="/usr/bin/npm"),
+        patch("workspace._run_venv_setup_step", side_effect=_fake_npm_ci) as step,
+    ):
+        workspace.ensure_node_deps(str(repo))
+
+    env = step.call_args.args[2]
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "VIRTUAL_ENV" not in env
+
+
+def test_node_deps_never_raises_when_the_manifests_cannot_be_read(tmp_path, node_deps_on):
+    repo = _node_repo(tmp_path)
+
+    with (
+        patch("workspace._node_deps_digest", side_effect=PermissionError("denied")),
+        patch("workspace._run_venv_setup_step") as step,
+    ):
+        notes = workspace.ensure_node_deps(str(repo))
+
+    step.assert_not_called()
+    assert len(notes) == 1 and "denied" in notes[0] and "frontend/" in notes[0]
+
+
+def test_node_deps_never_raises_when_the_stamp_cannot_be_written(tmp_path, node_deps_on):
+    repo = _node_repo(tmp_path)
+    real_write_text = Path.write_text
+
+    def write_text(self, *args, **kwargs):
+        if self.name == workspace._NODE_DEPS_STAMP:
+            raise OSError("disk full")
+        return real_write_text(self, *args, **kwargs)
+
+    with (
+        patch("workspace.shutil.which", return_value="/usr/bin/npm"),
+        patch("workspace._run_venv_setup_step", side_effect=_fake_npm_ci),
+        patch.object(Path, "write_text", write_text),
+    ):
+        assert workspace.ensure_node_deps(str(repo)) == []
+
+
+def test_node_deps_skips_when_git_cannot_say_whether_node_modules_is_ignored(
+    tmp_path, node_deps_on
+):
+    repo = _node_repo(tmp_path)
+
+    with (
+        patch(
+            "workspace._run_git",
+            return_value=subprocess.CompletedProcess(["git"], 128, "", "fatal"),
+        ),
+        patch("workspace._run_venv_setup_step") as step,
+    ):
+        assert workspace.ensure_node_deps(str(repo)) == []
+
+    step.assert_not_called()
