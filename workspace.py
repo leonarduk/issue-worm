@@ -2414,14 +2414,37 @@ def _test_extras(repo: Path) -> list[str]:
     return [name for name in _TEST_EXTRAS if name in declared]
 
 
+def _declared_verifier_requirements(repo: Path) -> list[str]:
+    """Extra requirement files the target asks its verifier venv to install,
+    from ``[tool.issue-worm] verifier-requirements`` in its pyproject.toml.
+
+    For a target whose own CI installs more than its manifests describe -
+    e.g. allotmint-pro, whose tests import a sibling allotmint checkout and
+    so need that repo's ``backend/requirements.txt`` too. Paths are
+    relative to the repo root, as pip's ``-r`` takes them from there. A
+    malformed value is ignored rather than failing the verifier.
+    """
+    try:
+        data = tomllib.loads((repo / "pyproject.toml").read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return []
+    declared = ((data.get("tool") or {}).get("issue-worm") or {}).get("verifier-requirements")
+    if not isinstance(declared, list):
+        return []
+    return [item for item in declared if isinstance(item, str) and item]
+
+
 def verifier_venv_install_args(repo_path: str) -> list[list[str]]:
     """The ``pip`` argument lists that install ``repo_path`` for its tests.
 
     An installable project is installed editable with whichever of the
     conventional test extras (:data:`_TEST_EXTRAS`) it declares; its base
-    and test requirement files, if any, are installed too. Empty when the
-    repo is not a Python project at all - :func:`ensure_verifier_venv`
-    then builds nothing.
+    and test requirement files, if any, are installed too, plus any it
+    declares under ``[tool.issue-worm] verifier-requirements``
+    (:func:`_declared_verifier_requirements`) that exist - a missing one
+    (a sibling checkout not cloned yet) is skipped with a warning. Empty
+    when the repo is not a Python project at all -
+    :func:`ensure_verifier_venv` then builds nothing.
     """
     repo = Path(repo_path).resolve()
     args: list[list[str]] = []
@@ -2429,6 +2452,16 @@ def verifier_venv_install_args(repo_path: str) -> list[list[str]]:
         extras = _test_extras(repo)
         args.append(["install", "-e", "." + (f"[{','.join(extras)}]" if extras else "")])
     requirements = [name for name in _REQUIREMENTS_FILES if (repo / name).is_file()]
+    for name in _declared_verifier_requirements(repo):
+        if (repo / name).is_file():
+            requirements.append(name)
+        else:
+            logger.warning(
+                "verifier venv: %s declares verifier requirement %s, which does not exist; "
+                "skipping it",
+                repo,
+                name,
+            )
     if requirements:
         requirement_args = ["install"]
         for name in requirements:
@@ -2460,6 +2493,16 @@ def _dependency_digest(repo: Path, install_args: list[list[str]]) -> str:
         if path.is_file():
             digest.update(name.encode("utf-8"))
             digest.update(path.read_bytes())
+    # A declared requirement file lives outside the repo's own manifests
+    # (often in a sibling checkout), so hash it too: an upstream pin change
+    # there must rebuild the venv, and so must the file appearing at all.
+    for name in _declared_verifier_requirements(repo):
+        path = repo / name
+        digest.update(name.encode("utf-8"))
+        try:
+            digest.update(path.read_bytes())
+        except OSError:
+            digest.update(b"<missing>")
     return digest.hexdigest()
 
 
