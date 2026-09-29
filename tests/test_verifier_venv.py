@@ -303,3 +303,125 @@ def test_run_ci_checks_falls_back_with_a_note_when_the_venv_cannot_be_built(tmp_
     assert "no network" in output
     assert output.endswith("1 failed")
     assert "VIRTUAL_ENV" not in captured["env"]
+
+
+# --- JavaScript dependencies (workspace.ensure_node_deps) ---------------------
+
+
+def _node_repo(path: Path, *, ignore_node_modules: bool = True) -> Path:
+    """A git checkout with a frontend/ npm project, like allotmint's."""
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    frontend = path / "frontend"
+    frontend.mkdir()
+    (frontend / "package.json").write_text('{"name": "fe"}\n', encoding="utf-8")
+    (frontend / "package-lock.json").write_text('{"lockfileVersion": 3}\n', encoding="utf-8")
+    if ignore_node_modules:
+        (frontend / ".gitignore").write_text("node_modules\n", encoding="utf-8")
+    return path
+
+
+def _fake_npm_ci(command, cwd, env):
+    """What `npm ci` leaves behind, as far as ensure_node_deps looks."""
+    (Path(cwd) / "node_modules").mkdir(exist_ok=True)
+
+
+@pytest.fixture
+def node_deps_on(monkeypatch):
+    monkeypatch.delenv(workspace.VERIFIER_NODE_DEPS_ENV, raising=False)
+
+
+def test_node_deps_runs_npm_ci_where_node_modules_is_ignored_then_caches(tmp_path, node_deps_on):
+    repo = _node_repo(tmp_path)
+
+    with (
+        patch("workspace.shutil.which", return_value="/usr/bin/npm"),
+        patch("workspace._run_venv_setup_step", side_effect=_fake_npm_ci) as step,
+    ):
+        assert workspace.ensure_node_deps(str(repo)) == []
+        assert workspace.ensure_node_deps(str(repo)) == []  # stamped: no reinstall
+
+    step.assert_called_once()
+    command, cwd = step.call_args.args[0], step.call_args.args[1]
+    assert command == ["/usr/bin/npm", "ci", "--no-audit", "--no-fund"]
+    assert Path(cwd) == (repo / "frontend").resolve()
+
+
+def test_node_deps_reinstalls_when_the_lockfile_changes(tmp_path, node_deps_on):
+    repo = _node_repo(tmp_path)
+
+    with (
+        patch("workspace.shutil.which", return_value="/usr/bin/npm"),
+        patch("workspace._run_venv_setup_step", side_effect=_fake_npm_ci) as step,
+    ):
+        workspace.ensure_node_deps(str(repo))
+        (repo / "frontend" / "package-lock.json").write_text('{"lockfileVersion": 4}\n')
+        workspace.ensure_node_deps(str(repo))
+
+    assert step.call_count == 2
+
+
+def test_node_deps_skips_a_dir_whose_node_modules_is_not_gitignored(tmp_path, node_deps_on):
+    """Installing there would leave the checkout full of untracked files,
+    which git clean -fd then deletes and the scheduler reads as dirty."""
+    repo = _node_repo(tmp_path, ignore_node_modules=False)
+
+    with patch("workspace._run_venv_setup_step") as step:
+        assert workspace.ensure_node_deps(str(repo)) == []
+
+    step.assert_not_called()
+
+
+def test_node_deps_reports_a_missing_npm_instead_of_raising(tmp_path, node_deps_on):
+    repo = _node_repo(tmp_path)
+
+    with (
+        patch("workspace.shutil.which", return_value=None),
+        patch("workspace._run_venv_setup_step") as step,
+    ):
+        notes = workspace.ensure_node_deps(str(repo))
+
+    step.assert_not_called()
+    assert len(notes) == 1 and "npm is not on PATH" in notes[0] and "frontend/" in notes[0]
+
+
+def test_node_deps_a_failed_install_leaves_no_stamp_so_the_next_call_retries(tmp_path, node_deps_on):
+    repo = _node_repo(tmp_path)
+
+    def failing(command, cwd, env):
+        _fake_npm_ci(command, cwd, env)
+        raise WorkspaceError("npm ci exited 1: ETIMEDOUT")
+
+    with patch("workspace.shutil.which", return_value="/usr/bin/npm"):
+        with patch("workspace._run_venv_setup_step", side_effect=failing):
+            notes = workspace.ensure_node_deps(str(repo))
+        with patch("workspace._run_venv_setup_step", side_effect=_fake_npm_ci) as step:
+            assert workspace.ensure_node_deps(str(repo)) == []
+
+    assert len(notes) == 1 and "ETIMEDOUT" in notes[0]
+    step.assert_called_once()
+
+
+def test_node_deps_disabled_by_env_installs_nothing(tmp_path, monkeypatch):
+    repo = _node_repo(tmp_path)
+    monkeypatch.setenv(workspace.VERIFIER_NODE_DEPS_ENV, "0")
+
+    with patch("workspace._run_venv_setup_step") as step:
+        assert workspace.ensure_node_deps(str(repo)) == []
+
+    step.assert_not_called()
+
+
+def test_run_ci_checks_prefixes_a_node_deps_note(tmp_path):
+    with (
+        patch("workspace.ensure_verifier_venv", return_value=None),
+        patch("workspace.ensure_node_deps", return_value=["note: npm is not on PATH"]),
+        patch(
+            "workspace.subprocess.run",
+            return_value=subprocess.CompletedProcess(["x"], 1, "lint failed", ""),
+        ),
+    ):
+        passed, output = run_ci_checks(str(tmp_path), ["npm", "run", "lint"])
+
+    assert not passed
+    assert output.startswith("note: npm is not on PATH\n\n")
+    assert output.endswith("lint failed")
