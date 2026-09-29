@@ -274,6 +274,8 @@ def test_run_ci_checks_keeps_the_runner_from_the_tools_own_path(tmp_path):
     with (
         patch("workspace.ensure_verifier_venv", return_value=tmp_path / "venv"),
         patch("workspace.shutil.which", return_value="/tool/bin/cicaid") as which,
+        # Its own which("bash") lookup on Windows is covered separately.
+        patch("workspace._prefer_git_bash", side_effect=lambda path: path),
         patch("workspace.subprocess.run", side_effect=fake_run),
     ):
         run_ci_checks(str(tmp_path), ["cicaid", "run-ci-checks", "--all"])
@@ -576,3 +578,92 @@ def test_node_deps_stamps_a_project_with_no_dependencies(tmp_path, node_deps_on)
         workspace.ensure_node_deps(str(repo))
 
     step.assert_called_once()
+
+
+# --- Git Bash over a WSL bash.exe launcher (workspace._prefer_git_bash) -------
+
+
+def _fake_which(mapping):
+    """shutil.which stand-in: the first entry of ``path`` that maps ``name``."""
+
+    def which(name, path=None):
+        for entry in (path or "").split(os.pathsep):
+            hit = mapping.get((entry, name))
+            if hit:
+                return hit
+        return None
+
+    return which
+
+
+def _git_for_windows(root: Path) -> Path:
+    """A Git for Windows layout: cmd/git.exe plus usr/bin/bash.exe."""
+    (root / "cmd").mkdir(parents=True)
+    (root / "cmd" / "git.exe").write_text("")
+    (root / "usr" / "bin").mkdir(parents=True)
+    (root / "usr" / "bin" / "bash.exe").write_text("")
+    return root
+
+
+def test_prefer_git_bash_puts_git_bash_ahead_of_the_wsl_launcher(tmp_path):
+    git_root = _git_for_windows(tmp_path / "Git")
+    system32 = str(tmp_path / "Windows" / "System32")
+    git_cmd = str(git_root / "cmd")
+    path = os.pathsep.join((system32, git_cmd))
+    which = _fake_which(
+        {
+            (system32, "bash"): system32 + os.sep + "bash.exe",
+            (git_cmd, "git"): str(git_root / "cmd" / "git.exe"),
+        }
+    )
+
+    with patch("workspace.shutil.which", side_effect=which):
+        result = workspace._prefer_git_bash(path, is_windows=True)
+
+    assert result.split(os.pathsep) == [
+        str((git_root / "usr" / "bin").resolve()),
+        system32,
+        git_cmd,
+    ]
+
+
+def test_prefer_git_bash_adds_it_when_there_is_no_bash_at_all(tmp_path):
+    git_root = _git_for_windows(tmp_path / "Git")
+    git_cmd = str(git_root / "cmd")
+    which = _fake_which({(git_cmd, "git"): str(git_root / "cmd" / "git.exe")})
+
+    with patch("workspace.shutil.which", side_effect=which):
+        result = workspace._prefer_git_bash(git_cmd, is_windows=True)
+
+    assert result.split(os.pathsep)[0] == str((git_root / "usr" / "bin").resolve())
+
+
+def test_prefer_git_bash_leaves_a_working_bash_alone(tmp_path):
+    git_bin = str(tmp_path / "Git" / "usr" / "bin")
+    which = _fake_which({(git_bin, "bash"): git_bin + os.sep + "bash.exe"})
+
+    with patch("workspace.shutil.which", side_effect=which):
+        assert workspace._prefer_git_bash(git_bin, is_windows=True) == git_bin
+
+
+def test_prefer_git_bash_leaves_path_alone_without_git_for_windows(tmp_path):
+    system32 = str(tmp_path / "Windows" / "System32")
+    which = _fake_which({(system32, "bash"): system32 + os.sep + "bash.exe"})
+
+    with patch("workspace.shutil.which", side_effect=which):
+        assert workspace._prefer_git_bash(system32, is_windows=True) == system32
+
+
+def test_prefer_git_bash_is_a_no_op_off_windows(tmp_path):
+    with patch("workspace.shutil.which") as which:
+        assert workspace._prefer_git_bash("/usr/bin:/bin", is_windows=False) == "/usr/bin:/bin"
+    which.assert_not_called()
+
+
+def test_ci_check_env_applies_the_git_bash_preference(tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", "original")
+    with patch("workspace._prefer_git_bash", return_value="git-bash;original") as prefer:
+        env = ci_check_env(str(tmp_path), home=str(tmp_path / "home"))
+
+    prefer.assert_called_once_with("original")
+    assert env["PATH"] == "git-bash;original"

@@ -1815,6 +1815,50 @@ CI_GIT_IDENTITY_NAME = "issue-worm verifier"
 CI_GIT_IDENTITY_EMAIL = "verifier@issue-worm.invalid"
 
 
+def _is_wsl_bash_launcher(bash: str) -> bool:
+    """True for the ``bash.exe`` stubs Windows ships (System32's WSL relay,
+    the WindowsApps alias) - which fail outright with no distro installed
+    and, even with one, cannot see Windows paths the way a check expects."""
+    parts = {part.lower() for part in Path(bash).parts}
+    return "system32" in parts or "windowsapps" in parts
+
+
+def _git_bash_dir(path: str) -> str | None:
+    """Git for Windows' ``usr/bin`` (where its ``bash.exe`` lives), found
+    from the ``git`` on ``path`` - which sits in ``Git/cmd``, ``Git/bin`` or
+    ``Git/mingw64/bin`` depending on the install - or None."""
+    git = shutil.which("git", path=path)
+    if not git:
+        return None
+    for ancestor in list(Path(git).resolve().parents)[:3]:
+        candidate = ancestor / "usr" / "bin"
+        if (candidate / "bash.exe").is_file():
+            return str(candidate)
+    return None
+
+
+def _prefer_git_bash(path: str, *, is_windows: bool = os.name == "nt") -> str:
+    """``path`` with Git Bash's directory ahead of the rest, on Windows,
+    when ``bash`` would otherwise resolve to nothing or to a WSL launcher.
+
+    A dashboard started from PowerShell/cmd typically has ``Git/cmd`` on
+    PATH but not ``Git/usr/bin``, so a check that runs ``bash`` (bats, a
+    test shelling out to a script) hits ``System32/bash.exe`` and fails
+    with "execvpe(/bin/bash) failed" - on every attempt, whatever the
+    patch. Left alone when Git Bash already wins, off Windows, or when no
+    Git for Windows install can be found.
+    """
+    if not is_windows or not path:
+        return path
+    bash = shutil.which("bash", path=path)
+    if bash and not _is_wsl_bash_launcher(bash):
+        return path
+    git_bash_dir = _git_bash_dir(path)
+    if git_bash_dir is None:
+        return path
+    return os.pathsep.join((git_bash_dir, path))
+
+
 def ci_check_env(
     repo_path: str,
     extra_env: dict[str, str] | None = None,
@@ -1844,6 +1888,9 @@ def ci_check_env(
       :func:`ensure_verifier_venv`), that venv's scripts directory first on
       ``PATH`` and ``VIRTUAL_ENV`` set, so ``pytest``/``python`` inside a
       check resolve to the target's own isolated install, not the tool's;
+    - on Windows, Git Bash's directory ahead of a WSL ``bash.exe`` launcher
+      on ``PATH`` (:func:`_prefer_git_bash`), so a check that runs ``bash``
+      gets a working one;
     - ``PYTHONIOENCODING=utf-8`` so the child's output decodes the way
       :func:`run_ci_checks` reads it, whatever the console codepage;
     - a fixed git author/committer identity, because a target's tests that
@@ -1878,6 +1925,8 @@ def ci_check_env(
     if (repo / "src").is_dir():
         python_path.append(str(repo / "src"))
     env["PYTHONPATH"] = os.pathsep.join(python_path)
+    if env.get("PATH"):
+        env["PATH"] = _prefer_git_bash(env["PATH"])
     if venv_dir is not None:
         env["PATH"] = os.pathsep.join(
             part for part in (str(_venv_scripts_dir(venv_dir)), env.get("PATH")) if part
