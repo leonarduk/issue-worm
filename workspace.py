@@ -230,6 +230,9 @@ class WorkspaceResult:
 DEFAULT_GIT_TIMEOUT = 30.0
 CLONE_TIMEOUT = 600.0
 DEFAULT_CI_TIMEOUT = 600.0
+# Overrides DEFAULT_CI_TIMEOUT (and a repo's own verifier-timeout) for every
+# target - see resolve_ci_timeout.
+CI_TIMEOUT_ENV = "ISSUE_WORM_CI_TIMEOUT"
 # `git fetch origin` talks to the network; a big repo over a slow link
 # legitimately outlasts DEFAULT_GIT_TIMEOUT, but must still be bounded.
 FETCH_TIMEOUT = 120.0
@@ -2441,6 +2444,58 @@ def _test_extras(repo: Path) -> list[str]:
     return [name for name in _TEST_EXTRAS if name in declared]
 
 
+def _issue_worm_settings(repo: Path) -> dict:
+    """The target's ``[tool.issue-worm]`` table from its pyproject.toml, or
+    ``{}`` when there is none (or the file is missing/unparsable)."""
+    try:
+        data = tomllib.loads((repo / "pyproject.toml").read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+    table = (data.get("tool") or {}).get("issue-worm")
+    return table if isinstance(table, dict) else {}
+
+
+def _positive_seconds(value: object) -> float | None:
+    """``value`` as a positive number of seconds, or None if it isn't one."""
+    if isinstance(value, bool):
+        return None
+    try:
+        seconds = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds > 0 else None
+
+
+def resolve_ci_timeout(repo_path: str) -> float:
+    """How long :func:`run_ci_checks` gives the target's checks to finish.
+
+    ``ISSUE_WORM_CI_TIMEOUT`` (seconds) when set to a positive number, else
+    the target's own ``[tool.issue-worm] verifier-timeout`` in its
+    pyproject.toml, else :data:`DEFAULT_CI_TIMEOUT`. A repo whose full CI
+    legitimately runs longer than the default (allotmint: backend, frontend
+    and bats suites, ~10 minutes on a laptop) declares it; the env var lets
+    a machine that is slower still override every repo at once. An
+    unusable value is ignored with a warning, never an error.
+    """
+    raw_env = os.environ.get(CI_TIMEOUT_ENV)
+    if raw_env:
+        seconds = _positive_seconds(raw_env)
+        if seconds is not None:
+            return seconds
+        logger.warning("%s=%r is not a positive number of seconds; ignoring it", CI_TIMEOUT_ENV, raw_env)
+    declared = _issue_worm_settings(Path(repo_path).resolve()).get("verifier-timeout")
+    if declared is not None:
+        seconds = _positive_seconds(declared)
+        if seconds is not None:
+            return seconds
+        logger.warning(
+            "%s declares verifier-timeout=%r, not a positive number of seconds; ignoring it",
+            repo_path,
+            declared,
+        )
+    return DEFAULT_CI_TIMEOUT
+
+
 def _declared_verifier_requirements(repo: Path) -> list[str]:
     """Extra requirement files the target asks its verifier venv to install,
     from ``[tool.issue-worm] verifier-requirements`` in its pyproject.toml.
@@ -2451,11 +2506,7 @@ def _declared_verifier_requirements(repo: Path) -> list[str]:
     relative to the repo root, as pip's ``-r`` takes them from there. A
     malformed value is ignored rather than failing the verifier.
     """
-    try:
-        data = tomllib.loads((repo / "pyproject.toml").read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError):
-        return []
-    declared = ((data.get("tool") or {}).get("issue-worm") or {}).get("verifier-requirements")
+    declared = _issue_worm_settings(repo).get("verifier-requirements")
     if not isinstance(declared, list):
         return []
     return [item for item in declared if isinstance(item, str) and item]
@@ -2795,7 +2846,7 @@ def run_ci_checks(
     """
     _reject_base_environment_kwarg("run_ci_checks", kwargs)
     command = list(command) if command else list(DEFAULT_CI_COMMAND)
-    effective_timeout = DEFAULT_CI_TIMEOUT if timeout is None else timeout
+    effective_timeout = resolve_ci_timeout(repo_path) if timeout is None else timeout
 
     note = ""
     try:
