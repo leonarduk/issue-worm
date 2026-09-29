@@ -2295,6 +2295,11 @@ VERIFIER_VENV_DIR_ENV = "ISSUE_WORM_VERIFIER_VENV_DIR"
 VERIFIER_VENV_SETUP_TIMEOUT = 900.0
 _VERIFIER_VENV_DISABLED = ("0", "false", "no", "off")
 _VERIFIER_VENV_STAMP = "issue-worm-deps.sha256"
+# A target's JavaScript dependencies, for checks like `npm run lint` (#540):
+# `npm ci` in each directory holding both a package.json and a
+# package-lock.json, the way CI installs them. Same on/off switch values.
+VERIFIER_NODE_DEPS_ENV = "ISSUE_WORM_VERIFIER_NODE_DEPS"
+_NODE_DEPS_STAMP = ".issue-worm-lock.sha256"
 # Optional-dependency groups CI conventionally installs for a test run, in
 # the order they are requested.
 _TEST_EXTRAS = ("test", "tests", "testing", "dev")
@@ -2494,6 +2499,147 @@ def ensure_verifier_venv(repo_path: str) -> Path | None:
     return venv_dir
 
 
+def _node_project_dirs(repo: Path) -> list[Path]:
+    """The repo root and its direct subdirectories that hold both a
+    ``package.json`` and a ``package-lock.json`` - where CI would run
+    ``npm ci``. Deeper trees are left alone: a nested lockfile is far more
+    often a fixture or a vendored package than something CI installs. So
+    are dot-directories (``.github``, ``.venv``, ...), which hold tooling,
+    not the project, and symlinked directories, which may point outside
+    the checkout."""
+    candidates = [
+        repo,
+        *sorted(
+            p
+            for p in repo.iterdir()
+            if p.is_dir() and not p.is_symlink() and not p.name.startswith(".")
+        ),
+    ]
+    return [
+        d
+        for d in candidates
+        if d.name != "node_modules"
+        and (d / "package.json").is_file()
+        and (d / "package-lock.json").is_file()
+    ]
+
+
+def _node_deps_digest(project_dir: Path) -> str:
+    digest = hashlib.sha256()
+    for name in ("package.json", "package-lock.json"):
+        digest.update(name.encode("utf-8"))
+        digest.update((project_dir / name).read_bytes())
+    return digest.hexdigest()
+
+
+def ensure_node_deps(repo_path: str) -> list[str]:
+    """Install the target's JavaScript dependencies for its CI checks.
+
+    Runs ``npm ci`` in every :func:`_node_project_dirs` directory whose
+    ``node_modules`` is gitignored, so the install survives
+    :func:`reset_to_commit`'s ``git clean -fd`` between attempts and never
+    shows up as a dirty workspace. A directory whose ``node_modules`` is
+    *not* ignored is skipped for the same reason: installing there would
+    leave hundreds of untracked files in the checkout.
+
+    Cached per directory by a stamp inside its ``node_modules`` over
+    ``package.json`` + ``package-lock.json``, so it reinstalls only when
+    those change (or ``node_modules`` is gone). Without this, a check such
+    as ``npm --prefix frontend run lint`` fails with "'eslint' is not
+    recognized" on every attempt, whatever the patch.
+
+    Returns one human-readable note per directory that could not be
+    prepared (``npm`` missing, ``npm ci`` failing); empty when everything
+    is in place, there is nothing to install, or ``ISSUE_WORM_VERIFIER_NODE_DEPS``
+    is ``0``/``false``/``no``/``off``. Never raises for an install problem:
+    one broken directory must not stop the others, or the checks.
+    """
+    if os.environ.get(VERIFIER_NODE_DEPS_ENV, "").strip().lower() in _VERIFIER_VENV_DISABLED:
+        return []
+    repo = Path(repo_path).resolve()
+    try:
+        project_dirs = _node_project_dirs(repo)
+    except OSError:
+        return []
+    if not project_dirs:
+        return []
+
+    notes: list[str] = []
+    npm = shutil.which("npm")
+    env = _venv_setup_env()
+    for project_dir in project_dirs:
+        label = project_dir.relative_to(repo).as_posix() if project_dir != repo else "."
+        node_modules = project_dir / "node_modules"
+        try:
+            # 0 = ignored, 1 = not ignored, anything else = git itself failed.
+            ignore_rc = _run_git(
+                str(repo), "check-ignore", "-q", str(node_modules), check=False
+            ).returncode
+        except WorkspaceError as exc:
+            ignore_rc, ignore_error = None, str(exc)
+        else:
+            ignore_error = None
+        if ignore_rc != 0:
+            if ignore_rc == 1:
+                logger.info(
+                    "verifier node deps: skipping %s - its node_modules is not gitignored",
+                    label,
+                )
+            else:
+                logger.warning(
+                    "verifier node deps: skipping %s - could not tell whether its "
+                    "node_modules is gitignored (git check-ignore %s)",
+                    label,
+                    ignore_error or f"exited {ignore_rc}",
+                )
+            continue
+        stamp_path = node_modules / _NODE_DEPS_STAMP
+        try:
+            digest = _node_deps_digest(project_dir)
+        except OSError as exc:
+            notes.append(
+                f"note: issue-worm could not read {label}/package.json or "
+                f"package-lock.json ({exc}); its JavaScript dependencies were not "
+                f"installed and checks that need them may fail."
+            )
+            continue
+        try:
+            if stamp_path.read_text(encoding="utf-8") == digest:
+                continue
+        except OSError:
+            pass
+        if npm is None:
+            notes.append(
+                f"note: npm is not on PATH, so issue-worm could not install the "
+                f"JavaScript dependencies in {label}/; checks that need them will fail."
+            )
+            continue
+        logger.info("verifier node deps: npm ci in %s", project_dir)
+        try:
+            _run_venv_setup_step([npm, "ci", "--no-audit", "--no-fund"], project_dir, env)
+        except WorkspaceError as exc:
+            notes.append(
+                f"note: issue-worm could not install the JavaScript dependencies "
+                f"in {label}/ ({exc}); checks that need them will fail."
+            )
+            continue
+        try:
+            # A project with no dependencies gets no node_modules from npm ci.
+            node_modules.mkdir(exist_ok=True)
+            stamp_path.write_text(digest, encoding="utf-8")
+        except OSError as exc:
+            # The install itself worked, so the checks can still run; the
+            # only cost is reinstalling next time.
+            logger.warning(
+                "verifier node deps: could not write %s (%s); %s/ will be "
+                "reinstalled next time",
+                stamp_path,
+                exc,
+                label,
+            )
+    return notes
+
+
 def run_ci_checks(
     repo_path: str,
     command: list[str] | None = None,
@@ -2545,6 +2691,9 @@ def run_ci_checks(
             f"instead, where its installed packages are visible.\n\n"
         )
         venv_dir = None
+    node_notes = ensure_node_deps(repo_path)
+    if node_notes:
+        note += "\n".join(node_notes) + "\n\n"
     if venv_dir is not None and os.path.basename(command[0]) == command[0]:
         # The runner (`cicaid run-ci-checks`) is issue-worm's tool, not the
         # target's: resolve it against this process's PATH before the
