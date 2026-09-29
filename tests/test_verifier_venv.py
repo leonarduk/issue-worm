@@ -785,3 +785,66 @@ def test_run_ci_checks_strips_nul_characters_from_output(tmp_path):
         passed, output = run_ci_checks(str(tmp_path), ["bats"])
 
     assert not passed and output == "wsl!"
+
+
+# --- how long the checks may run (workspace.resolve_ci_timeout) ---------------
+
+
+def _declares_timeout(repo: Path, value: str) -> Path:
+    repo.mkdir(parents=True, exist_ok=True)
+    (repo / "pyproject.toml").write_text(
+        f"[tool.issue-worm]\nverifier-timeout = {value}\n", encoding="utf-8"
+    )
+    return repo
+
+
+@pytest.fixture
+def no_timeout_env(monkeypatch):
+    monkeypatch.delenv(workspace.CI_TIMEOUT_ENV, raising=False)
+
+
+def test_ci_timeout_defaults_without_a_declaration(tmp_path, no_timeout_env):
+    assert workspace.resolve_ci_timeout(str(tmp_path)) == workspace.DEFAULT_CI_TIMEOUT
+
+
+def test_ci_timeout_uses_the_repos_declared_verifier_timeout(tmp_path, no_timeout_env):
+    repo = _declares_timeout(tmp_path / "repo", "1500")
+    assert workspace.resolve_ci_timeout(str(repo)) == 1500.0
+
+
+def test_ci_timeout_env_var_overrides_the_repo(tmp_path, monkeypatch):
+    repo = _declares_timeout(tmp_path / "repo", "1500")
+    monkeypatch.setenv(workspace.CI_TIMEOUT_ENV, "2400")
+    assert workspace.resolve_ci_timeout(str(repo)) == 2400.0
+
+
+@pytest.mark.parametrize("bad_env", ["soon", "0", "-5"])
+def test_ci_timeout_ignores_an_unusable_env_var(tmp_path, monkeypatch, bad_env):
+    repo = _declares_timeout(tmp_path / "repo", "1500")
+    monkeypatch.setenv(workspace.CI_TIMEOUT_ENV, bad_env)
+    assert workspace.resolve_ci_timeout(str(repo)) == 1500.0
+
+
+@pytest.mark.parametrize("bad_value", ['"long"', "0", "true", "-10"])
+def test_ci_timeout_ignores_an_unusable_declaration(tmp_path, no_timeout_env, bad_value):
+    repo = _declares_timeout(tmp_path / "repo", bad_value)
+    assert workspace.resolve_ci_timeout(str(repo)) == workspace.DEFAULT_CI_TIMEOUT
+
+
+def test_run_ci_checks_uses_the_resolved_timeout(tmp_path, no_timeout_env):
+    repo = _declares_timeout(tmp_path / "repo", "1500")
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["timeout"] = kwargs["timeout"]
+        return subprocess.CompletedProcess(command, 0, "ok", "")
+
+    with (
+        patch("workspace.ensure_verifier_venv", return_value=None),
+        patch("workspace.ensure_node_deps", return_value=[]),
+        patch("workspace.subprocess.run", side_effect=fake_run),
+    ):
+        run_ci_checks(str(repo), ["pytest"])
+        assert captured["timeout"] == 1500.0
+        run_ci_checks(str(repo), ["pytest"], timeout=30)
+        assert captured["timeout"] == 30  # an explicit caller value still wins
