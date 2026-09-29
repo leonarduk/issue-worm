@@ -723,3 +723,65 @@ def test_ci_check_env_applies_the_git_bash_preference(tmp_path, monkeypatch):
 
     prefer.assert_called_once_with("original")
     assert env["PATH"] == "git-bash;original"
+
+
+# --- workflow steps: shell lookup on the child's PATH, NUL-free output --------
+
+
+def test_resolve_on_path_uses_the_childs_path(tmp_path):
+    with patch("workspace.shutil.which", return_value="/git/usr/bin/bash") as which:
+        resolved = workspace._resolve_on_path(["bash", "-c"], {"PATH": "child-path"})
+
+    which.assert_called_once_with("bash", path="child-path")
+    assert resolved == ["/git/usr/bin/bash", "-c"]
+
+
+def test_resolve_on_path_leaves_an_explicit_path_or_an_unknown_name_alone():
+    with patch("workspace.shutil.which", return_value=None):
+        assert workspace._resolve_on_path(["nope", "-c"], {"PATH": "p"}) == ["nope", "-c"]
+    explicit = [sys.executable, "-c"]
+    assert workspace._resolve_on_path(explicit, {"PATH": "p"}) == explicit
+
+
+def test_new_workflow_step_runs_the_shell_found_on_the_childs_path(tmp_path):
+    """subprocess on Windows resolves a bare name on the parent's PATH, so
+    without this a step's `bash` hit the WSL launcher despite ci_check_env
+    putting Git Bash first on the child's PATH."""
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        return subprocess.CompletedProcess(argv, 1, "o\x00u\x00t", "e\x00rr")
+
+    with (
+        patch(
+            "workspace._extract_new_workflow_run_scripts",
+            return_value=[(".github/workflows/ci.yml", "echo hi", None)],
+        ),
+        patch("workspace._unsupported_step_context", return_value=None),
+        patch("workspace.ci_check_env", return_value={"PATH": "child-path"}),
+        patch("workspace.shutil.which", return_value="/git/usr/bin/bash"),
+        patch("workspace.subprocess.run", side_effect=fake_run),
+    ):
+        passed, output = workspace._run_new_workflow_step_scripts(
+            str(tmp_path), "diff", None, timeout=30
+        )
+
+    assert captured["argv"][0] == "/git/usr/bin/bash"
+    assert captured["argv"][-1] == "echo hi"
+    assert not passed
+    assert "\x00" not in output and "outerr" in output
+
+
+def test_run_ci_checks_strips_nul_characters_from_output(tmp_path):
+    with (
+        patch("workspace.ensure_verifier_venv", return_value=None),
+        patch("workspace.ensure_node_deps", return_value=[]),
+        patch(
+            "workspace.subprocess.run",
+            return_value=subprocess.CompletedProcess(["x"], 1, "w\x00s\x00l", "\x00!"),
+        ),
+    ):
+        passed, output = run_ci_checks(str(tmp_path), ["bats"])
+
+    assert not passed and output == "wsl!"

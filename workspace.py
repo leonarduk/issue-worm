@@ -1995,6 +1995,32 @@ _SHELL_COMMANDS: dict[str | None, list[str]] = {
     "python3": [sys.executable, "-c"],
 }
 
+
+def _strip_nul(text: str) -> str:
+    """``text`` without NUL characters. WSL's ``bash.exe`` launcher (and
+    other Windows tools) can answer in UTF-16, which decodes here as text
+    full of NULs - and a NUL anywhere in a run's output later raised
+    "embedded null character" and crashed the whole run instead of failing
+    the attempt."""
+    return text.replace("\x00", "")
+
+
+def _resolve_on_path(command: list[str], env: dict[str, str]) -> list[str]:
+    """``command`` with a bare program name resolved against ``env``'s PATH.
+
+    On Windows, ``subprocess`` looks a bare name up on *this* process's
+    PATH, not the child's - so the Git Bash preference :func:`ci_check_env`
+    puts in the child's PATH never reached a workflow step's ``bash``, which
+    still hit the WSL launcher. Unchanged when the name is already a path or
+    isn't found there (the run then fails the normal way).
+    """
+    program = command[0]
+    if os.path.basename(program) != program:
+        return command
+    resolved = shutil.which(program, path=env.get("PATH"))
+    return [resolved, *command[1:]] if resolved else command
+
+
 # A step body is only a fair test of *its own* correctness when this
 # sandbox can supply everything it reads. Two things it cannot:
 #
@@ -2289,7 +2315,7 @@ def _run_new_workflow_step_scripts(
                 continue
             try:
                 result = subprocess.run(
-                    [*command, script],
+                    [*_resolve_on_path(command, env), script],
                     cwd=repo_path,
                     capture_output=True,
                     text=True,
@@ -2312,7 +2338,8 @@ def _run_new_workflow_step_scripts(
                 continue
             status = "passed" if result.returncode == 0 else "FAILED"
             output_parts.append(
-                f"[{path}] new workflow step {status}:\n{result.stdout}{result.stderr}"
+                f"[{path}] new workflow step {status}:\n"
+                f"{_strip_nul(result.stdout)}{_strip_nul(result.stderr)}"
             )
             if result.returncode != 0:
                 all_passed = False
@@ -2824,7 +2851,7 @@ def run_ci_checks(
                 f"CI command {' '.join(command)} timed out after "
                 f"{effective_timeout}s"
             ) from exc
-    return result.returncode == 0, note + result.stdout + result.stderr
+    return result.returncode == 0, note + _strip_nul(result.stdout + result.stderr)
 
 
 def run_revision_attempt(
