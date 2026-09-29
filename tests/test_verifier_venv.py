@@ -848,3 +848,128 @@ def test_run_ci_checks_uses_the_resolved_timeout(tmp_path, no_timeout_env):
         assert captured["timeout"] == 1500.0
         run_ci_checks(str(repo), ["pytest"], timeout=30)
         assert captured["timeout"] == 30  # an explicit caller value still wins
+
+
+# --- running only the checks a change touches (workspace.select_ci_checks) ----
+
+_CHECKS_WITH_PATHS = """
+[[checks]]
+name = "backend"
+commands = ["pytest"]
+paths = ["backend/**", "tests/**", "pyproject.toml"]
+
+[[checks]]
+name = "frontend"
+commands = ["npm test"]
+paths = ["frontend/**", "package.json"]
+
+[[checks]]
+name = "scripts"
+commands = ["bats tests/bash"]
+paths = ["**/*.sh", "tests/bash/**"]
+"""
+
+
+def _checks_config(repo: Path, text: str) -> Path:
+    repo.mkdir(parents=True, exist_ok=True)
+    (repo / workspace.CI_CHECKS_CONFIG).write_text(text, encoding="utf-8")
+    return repo
+
+
+def test_changed_paths_from_diff_lists_both_sides_of_a_rename():
+    diff = (
+        "diff --git a/frontend/src/api.ts b/frontend/src/api.ts\n+x\n"
+        "diff --git a/old/name.py b/new/name.py\n"
+    )
+    assert workspace.changed_paths_from_diff(diff) == [
+        "frontend/src/api.ts",
+        "old/name.py",
+        "new/name.py",
+    ]
+
+
+@pytest.mark.parametrize(
+    "path, glob, expected",
+    [
+        ("frontend/src/pages/A.tsx", "frontend/**", True),
+        ("run.sh", "**/*.sh", True),
+        ("scripts/bash/run.sh", "**/*.sh", True),
+        ("Dockerfile", "dockerfile*", True),
+        ("backend/app.py", "frontend/**", False),
+    ],
+)
+def test_path_matches(path, glob, expected):
+    assert workspace._path_matches(path, glob) is expected
+
+
+def test_select_runs_only_the_checks_whose_paths_match(tmp_path):
+    repo = _checks_config(tmp_path / "repo", _CHECKS_WITH_PATHS)
+    selected, note = workspace.select_ci_checks(
+        str(repo), ["frontend/src/api.ts", "frontend/tests/unit/a.test.tsx"]
+    )
+    assert selected == ["frontend"]
+    assert "ran only the checks this change touches (frontend)" in note
+    assert "skipped backend, scripts" in note
+
+
+def test_select_always_runs_a_check_that_declares_no_paths(tmp_path):
+    repo = _checks_config(
+        tmp_path / "repo",
+        _CHECKS_WITH_PATHS + '\n[[checks]]\nname = "deps"\ncommands = ["pip check"]\n',
+    )
+    selected, _ = workspace.select_ci_checks(str(repo), ["frontend/src/api.ts"])
+    assert selected == ["frontend", "deps"]
+
+
+@pytest.mark.parametrize(
+    "config, changed",
+    [
+        ('[[checks]]\nname = "all"\ncommands = ["pytest"]\n', ["frontend/a.ts"]),  # no paths anywhere
+        (_CHECKS_WITH_PATHS, ["README.md"]),  # nothing claims the change
+        (_CHECKS_WITH_PATHS, ["backend/a.py", "frontend/b.ts", "x.sh"]),  # every check matches
+        ("not [valid toml", ["frontend/a.ts"]),
+    ],
+    ids=["no-paths-declared", "nothing-matches", "everything-matches", "unreadable-config"],
+)
+def test_select_falls_back_to_running_everything(tmp_path, config, changed):
+    repo = _checks_config(tmp_path / "repo", config)
+    assert workspace.select_ci_checks(str(repo), changed) == (None, "")
+
+
+def test_run_ci_checks_passes_the_selected_checks_to_cicaid(tmp_path):
+    repo = _checks_config(tmp_path / "repo", _CHECKS_WITH_PATHS)
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        return subprocess.CompletedProcess(command, 0, "ok", "")
+
+    with (
+        patch("workspace.ensure_verifier_venv", return_value=None),
+        patch("workspace.ensure_node_deps", return_value=[]),
+        patch("workspace.shutil.which", return_value=None),
+        patch("workspace.subprocess.run", side_effect=fake_run),
+    ):
+        passed, output = run_ci_checks(str(repo), changed_paths=["frontend/src/api.ts"])
+
+    assert captured["command"] == ["cicaid", "run-ci-checks", "--check", "frontend"]
+    assert passed and output.startswith("note: ran only the checks")
+    assert output.endswith("ok")
+
+
+def test_run_ci_checks_leaves_an_explicit_command_alone(tmp_path):
+    repo = _checks_config(tmp_path / "repo", _CHECKS_WITH_PATHS)
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    with (
+        patch("workspace.ensure_verifier_venv", return_value=None),
+        patch("workspace.ensure_node_deps", return_value=[]),
+        patch("workspace.subprocess.run", side_effect=fake_run),
+    ):
+        run_ci_checks(str(repo), ["pytest", "-q"], changed_paths=["frontend/src/api.ts"])
+
+    assert captured["command"] == ["pytest", "-q"]
