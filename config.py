@@ -317,6 +317,12 @@ def _parse_coder_targets(targets_str: str) -> list[CoderTarget]:
     running, dispatch kept failing, and nothing surfaced the cause short
     of finding one WARNING line in the log.
 
+    Name uniqueness is checked case-insensitively: hostnames are
+    case-insensitive in DNS, so `desk:...` and `Desk:...` name the same
+    physical machine. TargetPool tracks busy/unavailable state by name,
+    so accepting both would let two pool entries point at one host and
+    route work to it twice.
+
     Args:
         targets_str: Comma-separated list of colon-separated target specs.
 
@@ -349,13 +355,14 @@ def _parse_coder_targets(targets_str: str) -> list[CoderTarget]:
                 f"CODER_TARGETS entry {spec!r} is invalid: port {port!r} "
                 f"is not numeric"
             )
-        if name in seen:
+        name_key = name.lower()
+        if name_key in seen:
             raise ConfigError(
                 f"CODER_TARGETS entry {spec!r} is invalid: name {name!r} "
-                f"already used by entry {seen[name]!r} (target names must "
-                f"be unique)"
+                f"already used by entry {seen[name_key]!r} (target names "
+                f"must be unique, case-insensitively)"
             )
-        seen[name] = spec
+        seen[name_key] = spec
         targets.append(CoderTarget(name=name, host=f"{host}:{port}", model=model))
 
     return targets

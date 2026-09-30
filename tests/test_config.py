@@ -593,6 +593,39 @@ def test_parse_coder_targets_duplicate_name_raises():
         )
 
 
+def test_parse_coder_targets_duplicate_name_is_case_insensitive():
+    """Hostnames are case-insensitive in DNS, so `desk` and `Desk` name the
+    same physical machine. TargetPool tracks state by name, so accepting
+    both would let two pool entries route work to one host - the duplicate
+    check must normalize case before comparing."""
+    with pytest.raises(ConfigError, match="name 'Desk' already used"):
+        _parse_coder_targets(
+            "desk:192.168.1.20:11434:qwen2.5-coder,Desk:192.168.1.50:11434:qwen2.5-coder"
+        )
+
+
+def test_parse_coder_targets_case_insensitive_duplicate_reports_first_entry():
+    """The error names the earlier entry that already claimed the name, so
+    the user can find the offending line without guessing."""
+    with pytest.raises(ConfigError) as exc_info:
+        _parse_coder_targets(
+            "Desk:192.168.1.20:11434:qwen2.5-coder,desk:192.168.1.50:11434:qwen2.5-coder"
+        )
+
+    assert "Desk:192.168.1.20:11434:qwen2.5-coder" in str(exc_info.value)
+
+
+def test_parse_coder_targets_distinct_names_differing_by_more_than_case_are_accepted():
+    """Case-insensitive dedup must not over-reach: names that differ by
+    more than case (e.g. `desk` vs `laptop`) are genuinely distinct
+    targets and must still be accepted."""
+    targets = _parse_coder_targets(
+        "desk:192.168.1.20:11434:qwen2.5-coder,laptop:192.168.1.50:11434:qwen2.5-coder"
+    )
+
+    assert [t.name for t in targets] == ["desk", "laptop"]
+
+
 def test_parse_coder_targets_ignores_trailing_comma():
     """A stray trailing/leading comma is a harmless formatting artifact,
     not a config error - it should not be treated as a malformed entry."""
