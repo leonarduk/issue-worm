@@ -612,7 +612,7 @@ def test_target_env_vars_preserves_model_tag():
     assert env_vars["OLLAMA_MODEL"] == "qwen2.5-coder:7b"
 
 
-def test_target_env_vars_preserves_existing_scheme():
+def test_target_env_vars_preserves_http_and_https_schemes():
     """A host that already carries a scheme must not be double-prefixed.
 
     target_env_vars() prepends "http://" only when the host lacks a
