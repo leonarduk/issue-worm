@@ -477,6 +477,25 @@ def test_target_env_vars_preserves_model_tag():
     assert env_vars["OLLAMA_MODEL"] == "qwen2.5-coder:7b"
 
 
+def test_target_env_vars_preserves_existing_scheme():
+    """A host that already carries a scheme must not be double-prefixed.
+
+    target_env_vars() prepends "http://" only when the host lacks a
+    scheme; a regression that always prepended would turn
+    "http://192.168.1.20:11434" into "http://http://192.168.1.20:11434",
+    an invalid URL that only fails at connect time.
+    """
+    http_target = CoderTarget(
+        name="desk", host="http://192.168.1.20:11434", model="qwen2.5-coder"
+    )
+    https_target = CoderTarget(
+        name="desk", host="https://192.168.1.20:11434", model="qwen2.5-coder"
+    )
+
+    assert target_env_vars(http_target)["OLLAMA_ENDPOINT"] == "http://192.168.1.20:11434"
+    assert target_env_vars(https_target)["OLLAMA_ENDPOINT"] == "https://192.168.1.20:11434"
+
+
 def test_parse_coder_targets_host_and_port():
     """The documented CODER_TARGETS format is name:host:port:model - port
     is a separate field, not folded into a free-form host, precisely so
