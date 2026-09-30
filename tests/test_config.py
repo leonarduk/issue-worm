@@ -468,6 +468,27 @@ def test_target_env_vars_adds_scheme_to_bare_host():
     assert env_vars["OLLAMA_ENDPOINT"] == "http://192.168.1.20:11434"
 
 
+def test_target_env_vars_leaves_existing_scheme_unchanged():
+    """A host that already carries a scheme must not get a second one
+    prepended - urlparse-based detection leaves any scheme (not just
+    http/https) intact, so "ollama://localhost:11434" isn't mangled into
+    "http://ollama://localhost:11434"."""
+    target = CoderTarget(name="desk", host="ollama://localhost:11434", model="qwen2.5-coder")
+
+    env_vars = target_env_vars(target)
+
+    assert env_vars["OLLAMA_ENDPOINT"] == "ollama://localhost:11434"
+
+
+def test_target_env_vars_preserves_http_scheme():
+    """An explicit http:// host is passed through untouched, not doubled."""
+    target = CoderTarget(name="desk", host="http://192.168.1.20:11434", model="qwen2.5-coder")
+
+    env_vars = target_env_vars(target)
+
+    assert env_vars["OLLAMA_ENDPOINT"] == "http://192.168.1.20:11434"
+
+
 def test_target_env_vars_preserves_model_tag():
     """The model field is passed through untouched, tag and all."""
     target = CoderTarget(name="desk", host="localhost:11434", model="qwen2.5-coder:7b")

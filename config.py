@@ -8,6 +8,7 @@ import os
 import threading
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -470,6 +471,11 @@ def target_env_vars(target: CoderTarget) -> dict[str, str]:
     .env.example) isn't itself a valid URL, so a scheme is added here if
     the host doesn't already have one.
 
+    Scheme detection uses urlparse rather than a "http://"/"https://"
+    prefix check: a host with any other scheme (e.g. "ollama://host:port")
+    already carries one, and prefix-matching would mangle it into
+    "http://ollama://host:port".
+
     Args:
         target: The CoderTarget to convert.
 
@@ -477,6 +483,6 @@ def target_env_vars(target: CoderTarget) -> dict[str, str]:
         Dict of environment variables to set when dispatching to the target.
     """
     host = target.host
-    if not host.startswith(("http://", "https://")):
+    if not urlparse(host).scheme:
         host = f"http://{host}"
     return {"OLLAMA_ENDPOINT": host, "OLLAMA_MODEL": target.model}
