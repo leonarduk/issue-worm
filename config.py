@@ -8,7 +8,6 @@ import os
 import threading
 from dataclasses import dataclass
 from typing import Optional
-from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -129,12 +128,50 @@ def load_config() -> dict:
         # dispatch slot. Synthesize one placeholder target per configured
         # concurrency slot instead, so non-local setups need no
         # CODER_TARGETS entry at all.
+        #
+        # The model_source is sanitized before interpolation: target names
+        # are consumed by downstream parsers (TargetPool keys by name, and
+        # external tools may match on it), so a value with spaces or shell
+        # metacharacters must not leak through verbatim.
+        safe_source = _sanitize_target_name(config["coder_config"].model_source)
         config["coder_targets"] = [
-            CoderTarget(name=f"{config['coder_config'].model_source}-{i + 1}", host="", model="")
+            CoderTarget(name=f"{safe_source}-{i + 1}", host="", model="")
             for i in range(config["max_concurrent_issues"])
         ]
 
     return config
+
+
+# Synthesized target names are built from a model_source value and consumed
+# by downstream parsers (TargetPool keys by name; external tools may match
+# on it). Restrict to a conservative whitelist so a value with spaces or
+# shell metacharacters can't leak into a name that a parser or shell later
+# chokes on.
+_TARGET_NAME_MAX_LENGTH = 64
+_TARGET_NAME_FALLBACK = "target"
+
+
+def _sanitize_target_name(raw: str) -> str:
+    """Sanitize a value for use in a synthesized target name.
+
+    Replaces any character outside ``[A-Za-z0-9_-]`` with ``-``, collapses
+    runs of ``-``, strips leading/trailing ``-``, truncates to
+    ``_TARGET_NAME_MAX_LENGTH``, and falls back to ``_TARGET_NAME_FALLBACK``
+    when the result is empty (e.g. an all-whitespace or all-special input).
+
+    Valid values like "cloud", "claude", and "lmstudio" pass through
+    unchanged.
+    """
+    sanitized = "".join(
+        ch if (ch.isalnum() or ch in "-_") else "-" for ch in raw
+    )
+    # Collapse runs of "-" so "my cloud model" -> "my-cloud-model" rather
+    # than "my---cloud---model".
+    while "--" in sanitized:
+        sanitized = sanitized.replace("--", "-")
+    sanitized = sanitized.strip("-")
+    sanitized = sanitized[:_TARGET_NAME_MAX_LENGTH].strip("-")
+    return sanitized or _TARGET_NAME_FALLBACK
 
 
 def _parse_max_concurrent_issues(raw: str) -> int:
@@ -350,13 +387,17 @@ def _parse_coder_targets(targets_str: str) -> list[CoderTarget]:
                 f"CODER_TARGETS entry {spec!r} is invalid: port {port!r} "
                 f"is not numeric"
             )
-        if name in seen:
+        # Hostnames are case-insensitive in DNS, so "desk" and "Desk" name
+        # the same physical host. Detect duplicates on the lowercased name
+        # (the original case is preserved on the CoderTarget itself).
+        name_key = name.lower()
+        if name_key in seen:
             raise ConfigError(
                 f"CODER_TARGETS entry {spec!r} is invalid: name {name!r} "
-                f"already used by entry {seen[name]!r} (target names must "
+                f"already used by entry {seen[name_key]!r} (target names must "
                 f"be unique)"
             )
-        seen[name] = spec
+        seen[name_key] = spec
         targets.append(CoderTarget(name=name, host=f"{host}:{port}", model=model))
 
     return targets
@@ -471,8 +512,8 @@ def target_env_vars(target: CoderTarget) -> dict[str, str]:
     .env.example) isn't itself a valid URL, so a scheme is added here if
     the host doesn't already have one.
 
-    Scheme detection uses urlparse rather than a "http://"/"https://"
-    prefix check: a host with any other scheme (e.g. "ollama://host:port")
+    Scheme detection looks for "://" rather than an "http://"/"https://"
+    prefix: a host with any other scheme (e.g. "ollama://host:port")
     already carries one, and prefix-matching would mangle it into
     "http://ollama://host:port".
 
@@ -483,6 +524,10 @@ def target_env_vars(target: CoderTarget) -> dict[str, str]:
         Dict of environment variables to set when dispatching to the target.
     """
     host = target.host
-    if not urlparse(host).scheme:
+    # "://" marks an existing scheme of any kind (case-insensitively, since
+    # the check doesn't care what precedes it). urlparse(host).scheme is
+    # unsuitable here: it reads the hostname in "localhost:11434" as a
+    # scheme, so a bare host:port would skip the http:// prefix.
+    if "://" not in host:
         host = f"http://{host}"
     return {"OLLAMA_ENDPOINT": host, "OLLAMA_MODEL": target.model}
