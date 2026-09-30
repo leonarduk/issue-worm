@@ -1134,6 +1134,21 @@ def parse_coder_output(output: str, declared_files: list[str]) -> list[FileChang
             # strip it before writing, the same way MODE_DIFF already does
             # for its own fencing (issue #248).
             body = _strip_edge_fences(body)
+            if not body.strip():
+                # A body that was nothing but a fence (e.g. "```python\n```")
+                # strips to nothing. Writing that would silently truncate an
+                # existing file to zero bytes with no signal that the model
+                # produced no content - surface it instead. Warn rather than
+                # raise: an empty body is a plausible (if unusual) intent for
+                # a brand-new file, and the CI checks that follow are the
+                # backstop for a genuinely wrong write.
+                logger.warning(
+                    "parse_coder_output: MODE: %s section for %r has an empty "
+                    "body after fence stripping - the model returned no "
+                    "content (writing an empty file)",
+                    mode,
+                    path,
+                )
 
         loop = _detect_line_repetition(body)
         if loop is not None:
