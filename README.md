@@ -20,11 +20,15 @@ about what it does and doesn't do: AI writes the code, you do the rest.
 
 <video src="docs/assets/demo-2026-08-31-free.mp4" controls width="720"></video>
 
+[View transcript](docs/assets/demo-transcripts.md#free-version-demo)
+
 For comparison, [issue-worm-pro](https://github.com/leonarduk/issue-worm-pro)
 runs AI through the whole pipeline — triage, coding, judging its own
 failures, and drafting the PR description:
 
 <video src="docs/assets/demo-2026-08-31-pro.mp4" controls width="720"></video>
+
+[View transcript](docs/assets/demo-transcripts.md#pro-version-demo)
 
 Watch both: this free tier is genuinely useful on its own for a
 well-scoped task, but pro is what "AI does the whole loop" looks like.
