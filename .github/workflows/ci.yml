@@ -55,6 +55,22 @@ jobs:
           args: --no-progress --offline '**/*.md'
           fail: true
 
+  media-refs:
+    name: README media reference check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Verify referenced local media files exist
+        run: python scripts/check_media_refs.py README.md
+
   docs-commands:
     name: Docs/CLI command drift check
     runs-on: ubuntu-latest
