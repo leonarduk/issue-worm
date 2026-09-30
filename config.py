@@ -128,12 +128,50 @@ def load_config() -> dict:
         # dispatch slot. Synthesize one placeholder target per configured
         # concurrency slot instead, so non-local setups need no
         # CODER_TARGETS entry at all.
+        #
+        # The model_source is sanitized before interpolation: target names
+        # are consumed by downstream parsers (TargetPool keys by name, and
+        # external tools may match on it), so a value with spaces or shell
+        # metacharacters must not leak through verbatim.
+        safe_source = _sanitize_target_name(config["coder_config"].model_source)
         config["coder_targets"] = [
-            CoderTarget(name=f"{config['coder_config'].model_source}-{i + 1}", host="", model="")
+            CoderTarget(name=f"{safe_source}-{i + 1}", host="", model="")
             for i in range(config["max_concurrent_issues"])
         ]
 
     return config
+
+
+# Synthesized target names are built from a model_source value and consumed
+# by downstream parsers (TargetPool keys by name; external tools may match
+# on it). Restrict to a conservative whitelist so a value with spaces or
+# shell metacharacters can't leak into a name that a parser or shell later
+# chokes on.
+_TARGET_NAME_MAX_LENGTH = 64
+_TARGET_NAME_FALLBACK = "target"
+
+
+def _sanitize_target_name(raw: str) -> str:
+    """Sanitize a value for use in a synthesized target name.
+
+    Replaces any character outside ``[A-Za-z0-9_-]`` with ``-``, collapses
+    runs of ``-``, strips leading/trailing ``-``, truncates to
+    ``_TARGET_NAME_MAX_LENGTH``, and falls back to ``_TARGET_NAME_FALLBACK``
+    when the result is empty (e.g. an all-whitespace or all-special input).
+
+    Valid values like "cloud", "claude", and "lmstudio" pass through
+    unchanged.
+    """
+    sanitized = "".join(
+        ch if (ch.isalnum() or ch in "-_") else "-" for ch in raw
+    )
+    # Collapse runs of "-" so "my cloud model" -> "my-cloud-model" rather
+    # than "my---cloud---model".
+    while "--" in sanitized:
+        sanitized = sanitized.replace("--", "-")
+    sanitized = sanitized.strip("-")
+    sanitized = sanitized[:_TARGET_NAME_MAX_LENGTH].strip("-")
+    return sanitized or _TARGET_NAME_FALLBACK
 
 
 def _parse_max_concurrent_issues(raw: str) -> int:

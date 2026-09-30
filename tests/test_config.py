@@ -10,6 +10,7 @@ from config import (
     TargetPool,
     _parse_coder_backend,
     _parse_coder_targets,
+    _sanitize_target_name,
     get_role_env_vars,
     load_config,
     target_env_vars,
@@ -121,6 +122,119 @@ def test_load_config_synthesized_targets_match_max_concurrent_issues(monkeypatch
 
     assert len(targets) == 3
     assert [t.name for t in targets] == ["claude-1", "claude-2", "claude-3"]
+
+
+def test_load_config_synthesized_target_names_are_sanitized(monkeypatch):
+    """A model_source with spaces or shell metacharacters must not leak
+    verbatim into synthesized target names - downstream parsers (TargetPool
+    keys by name, external tools may match on it) expect a conservative
+    ``[A-Za-z0-9_-]`` shape."""
+    monkeypatch.setenv("CODER_MODEL_SOURCE", "cloud")
+    monkeypatch.setenv("MAX_CONCURRENT_ISSUES", "2")
+    monkeypatch.delenv("CODER_TARGETS", raising=False)
+
+    # Bypass the model_source validator by patching the loaded RoleConfig
+    # directly: the validator would reject a value like "model;rm -rf"
+    # before it ever reached the synthesized-name path.
+    import config as config_module
+
+    original_load_role_config = config_module._load_role_config
+
+    def _patched(role_prefix):
+        role = original_load_role_config(role_prefix)
+        if role_prefix == "CODER":
+            role.model_source = "model;rm -rf"
+        return role
+
+    monkeypatch.setattr(config_module, "_load_role_config", _patched)
+
+    targets = load_config()["coder_targets"]
+
+    assert [t.name for t in targets] == ["model-rm-rf-1", "model-rm-rf-2"]
+    for target in targets:
+        assert all(ch.isalnum() or ch in "-_" for ch in target.name)
+
+
+def test_load_config_synthesized_target_names_handle_spaces(monkeypatch):
+    """A model_source with spaces becomes a hyphenated, parseable name."""
+    monkeypatch.setenv("CODER_MODEL_SOURCE", "cloud")
+    monkeypatch.setenv("MAX_CONCURRENT_ISSUES", "1")
+    monkeypatch.delenv("CODER_TARGETS", raising=False)
+
+    import config as config_module
+
+    original_load_role_config = config_module._load_role_config
+
+    def _patched(role_prefix):
+        role = original_load_role_config(role_prefix)
+        if role_prefix == "CODER":
+            role.model_source = "my cloud model"
+        return role
+
+    monkeypatch.setattr(config_module, "_load_role_config", _patched)
+
+    targets = load_config()["coder_targets"]
+
+    assert [t.name for t in targets] == ["my-cloud-model-1"]
+
+
+def test_load_config_synthesized_target_names_fall_back_when_empty(monkeypatch):
+    """An all-whitespace model_source yields the generic fallback name
+    rather than an empty prefix like "-1"."""
+    monkeypatch.setenv("CODER_MODEL_SOURCE", "cloud")
+    monkeypatch.setenv("MAX_CONCURRENT_ISSUES", "1")
+    monkeypatch.delenv("CODER_TARGETS", raising=False)
+
+    import config as config_module
+
+    original_load_role_config = config_module._load_role_config
+
+    def _patched(role_prefix):
+        role = original_load_role_config(role_prefix)
+        if role_prefix == "CODER":
+            role.model_source = "   "
+        return role
+
+    monkeypatch.setattr(config_module, "_load_role_config", _patched)
+
+    targets = load_config()["coder_targets"]
+
+    assert [t.name for t in targets] == ["target-1"]
+
+
+def test_sanitize_target_name_passes_through_valid_values():
+    """Legitimate model_source values are unchanged by sanitization."""
+    for value in ("cloud", "claude", "lmstudio", "remote"):
+        assert _sanitize_target_name(value) == value
+
+
+def test_sanitize_target_name_replaces_special_characters():
+    """Whitespace and shell metacharacters become hyphens."""
+    assert _sanitize_target_name("my cloud model") == "my-cloud-model"
+    assert _sanitize_target_name("model;rm -rf") == "model-rm-rf"
+    assert _sanitize_target_name("a|b&c") == "a-b-c"
+
+
+def test_sanitize_target_name_collapses_and_strips_hyphens():
+    """Runs of hyphens collapse and leading/trailing hyphens are stripped."""
+    assert _sanitize_target_name("--a---b--") == "a-b"
+    assert _sanitize_target_name("  spaced  ") == "spaced"
+
+
+def test_sanitize_target_name_truncates_long_values():
+    """A very long model_source is truncated to a bounded length."""
+    long_value = "a" * 200
+    result = _sanitize_target_name(long_value)
+
+    assert len(result) <= 64
+    assert result == "a" * 64
+
+
+def test_sanitize_target_name_falls_back_when_empty():
+    """An empty or all-special input yields the generic fallback."""
+    assert _sanitize_target_name("") == "target"
+    assert _sanitize_target_name("   ") == "target"
+    assert _sanitize_target_name(";;;") == "target"
 
 
 def test_load_config_explicit_coder_targets_not_overridden_for_cloud_source(monkeypatch):
