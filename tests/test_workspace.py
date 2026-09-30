@@ -287,6 +287,49 @@ def test_apply_full_change_wrapped_in_markdown_fence_writes_valid_content(repo):
     assert (Path(repo) / "a.py").read_text() == "value = 2\n"
 
 
+def test_parse_full_section_fenced_without_trailing_newline_normalizes():
+    """A MODE: FULL body ending in "\\n```" (no trailing newline after the
+    closing fence) must produce a body with the same shape as one ending in
+    "\\n```\\n" - exactly one trailing newline once written, matching the
+    MODE: DIFF path's normalization (follow-up from PR #105 review)."""
+    output = (
+        "=== FILE: a.py ===\n=== MODE: FULL ===\n```python\nvalue = 2\n```"
+    )
+
+    (change,) = parse_coder_output(output, ["a.py"])
+
+    assert change.mode == "FULL"
+    assert "```" not in change.body
+    assert change.body == "value = 2"
+
+
+def test_apply_full_change_fenced_without_trailing_newline_writes_one_newline(repo):
+    """End-to-end: a fenced FULL body whose closing fence has no trailing
+    newline still writes a file ending in exactly one newline, not zero and
+    not two."""
+    output = (
+        "=== FILE: a.py ===\n=== MODE: FULL ===\n```python\nvalue = 2\n```"
+    )
+    (change,) = parse_coder_output(output, ["a.py"])
+
+    apply_file_change(repo, change)
+
+    assert (Path(repo) / "a.py").read_text() == "value = 2\n"
+
+
+def test_apply_full_change_fenced_with_trailing_newline_writes_one_newline(repo):
+    """The sibling case: a fenced FULL body whose closing fence *does* have
+    a trailing newline must not gain a second one."""
+    output = (
+        "=== FILE: a.py ===\n=== MODE: FULL ===\n```python\nvalue = 2\n```\n"
+    )
+    (change,) = parse_coder_output(output, ["a.py"])
+
+    apply_file_change(repo, change)
+
+    assert (Path(repo) / "a.py").read_text() == "value = 2\n"
+
+
 def test_parse_full_section_preserves_fence_like_content_lines():
     """A full-file rewrite of a file that legitimately contains triple
     backticks (e.g. a Markdown or docs file) must keep interior fence-like

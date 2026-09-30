@@ -1134,6 +1134,19 @@ def parse_coder_output(output: str, declared_files: list[str]) -> list[FileChang
             # strip it before writing, the same way MODE_DIFF already does
             # for its own fencing (issue #248).
             body = _strip_edge_fences(body)
+            # Normalize trailing newlines the same way _extract_diff does
+            # for MODE_DIFF, so a fenced body ending in "\n```" (no trailing
+            # newline) and one ending in "\n```\n" both yield exactly one
+            # trailing newline. Without this, MODE_FULL's file ending
+            # depended on the model's own formatting, while MODE_DIFF's was
+            # always exactly one newline.
+            if body:
+                body = body.rstrip("\n") + "\n"
+                # apply_file_change appends the final newline for MODE_FULL
+                # when it is missing; strip it back off here so the two
+                # paths agree on the body's shape and the write stays
+                # idempotent.
+                body = body.rstrip("\n")
 
         loop = _detect_line_repetition(body)
         if loop is not None:
