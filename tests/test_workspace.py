@@ -287,6 +287,35 @@ def test_apply_full_change_wrapped_in_markdown_fence_writes_valid_content(repo):
     assert (Path(repo) / "a.py").read_text() == "value = 2\n"
 
 
+def test_parse_full_section_wrapped_in_bare_markdown_fence_strips_it():
+    """A MODE: FULL body wrapped in a bare ``` fence (no language tag) is
+    the most common Markdown fence form; the fence markers are not part of
+    the file's real content and must be stripped, exactly as for a
+    language-tagged fence (issue #401 follow-up)."""
+    output = (
+        "=== FILE: a.py ===\n=== MODE: FULL ===\n```\nvalue = 2\n```\n=== END FILE ===\n"
+    )
+
+    (change,) = parse_coder_output(output, ["a.py"])
+
+    assert change.mode == "FULL"
+    assert "```" not in change.body
+    assert change.body == "value = 2"
+
+
+def test_apply_full_change_wrapped_in_bare_markdown_fence_writes_valid_content(repo):
+    """End-to-end: a bare-fenced FULL body must write clean file content,
+    not a file containing the fence markers themselves."""
+    output = (
+        "=== FILE: a.py ===\n=== MODE: FULL ===\n```\nvalue = 2\n```\n=== END FILE ===\n"
+    )
+    (change,) = parse_coder_output(output, ["a.py"])
+
+    apply_file_change(repo, change)
+
+    assert (Path(repo) / "a.py").read_text() == "value = 2\n"
+
+
 def test_parse_full_section_preserves_fence_like_content_lines():
     """A full-file rewrite of a file that legitimately contains triple
     backticks (e.g. a Markdown or docs file) must keep interior fence-like
