@@ -349,13 +349,17 @@ def _parse_coder_targets(targets_str: str) -> list[CoderTarget]:
                 f"CODER_TARGETS entry {spec!r} is invalid: port {port!r} "
                 f"is not numeric"
             )
-        if name in seen:
+        # Hostnames are case-insensitive in DNS, so "desk" and "Desk" name
+        # the same physical host. Detect duplicates on the lowercased name
+        # (the original case is preserved on the CoderTarget itself).
+        name_key = name.lower()
+        if name_key in seen:
             raise ConfigError(
                 f"CODER_TARGETS entry {spec!r} is invalid: name {name!r} "
-                f"already used by entry {seen[name]!r} (target names must "
+                f"already used by entry {seen[name_key]!r} (target names must "
                 f"be unique)"
             )
-        seen[name] = spec
+        seen[name_key] = spec
         targets.append(CoderTarget(name=name, host=f"{host}:{port}", model=model))
 
     return targets
