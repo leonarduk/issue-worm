@@ -468,6 +468,27 @@ def test_target_env_vars_adds_scheme_to_bare_host():
     assert env_vars["OLLAMA_ENDPOINT"] == "http://192.168.1.20:11434"
 
 
+def test_target_env_vars_preserves_existing_scheme():
+    """A host that already carries a scheme is passed through untouched -
+    prepending another "http://" would produce a malformed URL."""
+    target = CoderTarget(name="desk", host="http://192.168.1.20:11434", model="qwen2.5-coder")
+
+    env_vars = target_env_vars(target)
+
+    assert env_vars["OLLAMA_ENDPOINT"] == "http://192.168.1.20:11434"
+
+
+def test_target_env_vars_scheme_detection_is_case_insensitive():
+    """RFC 3986 schemes are case-insensitive, so "HTTP://" / "HTTPS://"
+    already count as having a scheme and must not be double-prefixed."""
+    for host in ("HTTP://192.168.1.20:11434", "HTTPS://192.168.1.20:11434"):
+        target = CoderTarget(name="desk", host=host, model="qwen2.5-coder")
+
+        env_vars = target_env_vars(target)
+
+        assert env_vars["OLLAMA_ENDPOINT"] == host
+
+
 def test_target_env_vars_preserves_model_tag():
     """The model field is passed through untouched, tag and all."""
     target = CoderTarget(name="desk", host="localhost:11434", model="qwen2.5-coder:7b")

@@ -477,6 +477,9 @@ def target_env_vars(target: CoderTarget) -> dict[str, str]:
         Dict of environment variables to set when dispatching to the target.
     """
     host = target.host
-    if not host.startswith(("http://", "https://")):
+    # Scheme detection is case-insensitive: RFC 3986 schemes are
+    # case-insensitive, so "HTTP://host" already has a scheme and must not
+    # be double-prefixed into "http://HTTP://host".
+    if not host.lower().startswith(("http://", "https://")):
         host = f"http://{host}"
     return {"OLLAMA_ENDPOINT": host, "OLLAMA_MODEL": target.model}
