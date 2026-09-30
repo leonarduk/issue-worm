@@ -1,0 +1,53 @@
+WEBVTT
+
+NOTE Pro version demo — issue-worm-pro full pipeline
+NOTE Transcript: docs/assets/demo-transcripts.md#pro-version-demo
+
+00:00:00.000 --> 00:00:04.000
+This is issue-worm-pro, the full pipeline.
+
+00:00:04.000 --> 00:00:09.000
+Same starting point: a GitHub issue.
+
+00:00:09.000 --> 00:00:14.000
+But here the scheduler picks it up,
+
+00:00:14.000 --> 00:00:21.000
+and the triage step decides whether it's ready to work — is it scoped,
+is it actionable, does it need more information first?
+
+00:00:21.000 --> 00:00:26.000
+Once triage passes, the coder writes the changes.
+
+00:00:26.000 --> 00:00:31.000
+Then the verifier runs —
+
+00:00:31.000 --> 00:00:38.000
+it checks the coder's work against the issue's DONE: criteria and the
+repo's own CI checks.
+
+00:00:38.000 --> 00:00:45.000
+If the verifier fails, its feedback goes back to the coder as an
+Analyser note, and the coder gets another attempt.
+
+00:00:45.000 --> 00:00:52.000
+That loop is bounded — three attempts here — so a genuinely stuck issue
+fails cleanly instead of spinning forever.
+
+00:00:52.000 --> 00:00:59.000
+When the verifier passes, pro drafts the PR description from the issue
+and the diff, opens the PR,
+
+00:00:59.000 --> 00:01:05.000
+and updates the issue with a live progress comment as each stage
+finishes.
+
+00:01:05.000 --> 00:01:12.000
+So the difference from the free shell is the loop:
+
+00:01:12.000 --> 00:01:18.000
+the free tier writes the code once and hands it back to you;
+
+00:01:18.000 --> 00:01:25.000
+pro judges its own failures, retries with real feedback, and only opens
+the PR once the verifier is satisfied.
