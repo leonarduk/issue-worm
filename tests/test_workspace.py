@@ -287,13 +287,13 @@ def test_apply_full_change_wrapped_in_markdown_fence_writes_valid_content(repo):
     assert (Path(repo) / "a.py").read_text() == "value = 2\n"
 
 
-def test_parse_full_section_fenced_without_trailing_newline_normalizes():
-    """A MODE: FULL body ending in "\\n```" (no trailing newline after the
-    closing fence) must produce a body with the same shape as one ending in
-    "\\n```\\n" - exactly one trailing newline once written, matching the
-    MODE: DIFF path's normalization (follow-up from PR #105 review)."""
+def test_parse_full_section_wrapped_in_bare_markdown_fence_strips_it():
+    """A MODE: FULL body wrapped in a bare ``` fence (no language tag) is
+    the most common Markdown fence form; the fence markers are not part of
+    the file's real content and must be stripped, exactly as for a
+    language-tagged fence (issue #401 follow-up)."""
     output = (
-        "=== FILE: a.py ===\n=== MODE: FULL ===\n```python\nvalue = 2\n```"
+        "=== FILE: a.py ===\n=== MODE: FULL ===\n```\nvalue = 2\n```\n=== END FILE ===\n"
     )
 
     (change,) = parse_coder_output(output, ["a.py"])
@@ -303,10 +303,39 @@ def test_parse_full_section_fenced_without_trailing_newline_normalizes():
     assert change.body == "value = 2"
 
 
+def test_apply_full_change_wrapped_in_bare_markdown_fence_writes_valid_content(repo):
+    """End-to-end: a bare-fenced FULL body must write clean file content,
+    not a file containing the fence markers themselves."""
+    output = (
+        "=== FILE: a.py ===\n=== MODE: FULL ===\n```\nvalue = 2\n```\n=== END FILE ===\n"
+    )
+    (change,) = parse_coder_output(output, ["a.py"])
+
+    apply_file_change(repo, change)
+
+    assert (Path(repo) / "a.py").read_text() == "value = 2\n"
+
+
+def test_parse_full_section_fence_without_trailing_newline_matches_with_one():
+    """A MODE: FULL body whose closing fence has no trailing newline parses
+    to the same body as one whose closing fence does, so the file ending
+    never depends on how the model terminated its reply."""
+    unterminated = (
+        "=== FILE: a.py ===\n=== MODE: FULL ===\n```python\nvalue = 2\n```"
+    )
+    terminated = unterminated + "\n"
+
+    (bare,) = parse_coder_output(unterminated, ["a.py"])
+    (with_newline,) = parse_coder_output(terminated, ["a.py"])
+
+    assert "```" not in bare.body
+    assert bare.body == with_newline.body
+
+
 def test_apply_full_change_fenced_without_trailing_newline_writes_one_newline(repo):
     """End-to-end: a fenced FULL body whose closing fence has no trailing
-    newline still writes a file ending in exactly one newline, not zero and
-    not two."""
+    newline still writes a file ending in exactly one newline, matching the
+    MODE: DIFF path."""
     output = (
         "=== FILE: a.py ===\n=== MODE: FULL ===\n```python\nvalue = 2\n```"
     )
