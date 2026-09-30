@@ -55,6 +55,22 @@ jobs:
           args: --no-progress --offline '**/*.md'
           fail: true
 
+  media-refs:
+    name: README media reference check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Verify referenced local media files exist
+        run: python scripts/check_media_refs.py README.md
+
   docs-commands:
     name: Docs/CLI command drift check
     runs-on: ubuntu-latest
@@ -74,3 +90,79 @@ jobs:
 
       - name: Check documented commands exist in the CLI
         run: python scripts/check_docs_commands.py
+
+  no-local-deps:
+    name: No local file:// or path:// dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Reject local file:// or path:// dependencies in pyproject.toml
+        run: |
+          python - <<'PY'
+          import sys
+          import tomllib
+          from pathlib import Path
+
+          pyproject = Path("pyproject.toml")
+          if not pyproject.is_file():
+              print("pyproject.toml not found; nothing to check.")
+              sys.exit(0)
+
+          with pyproject.open("rb") as f:
+              data = tomllib.load(f)
+
+          project = data.get("project", {})
+          sections = {
+              "project.dependencies": project.get("dependencies", []) or [],
+              "project.optional-dependencies": project.get("optional-dependencies", {}) or {},
+          }
+
+          offenders = []
+
+          def check_spec(spec, where):
+              if not isinstance(spec, str):
+                  return
+              # Only inspect the dependency spec itself, not comments or unrelated strings.
+              # A dependency spec looks like: name[extras] @ file://... or name @ path://...
+              # We look for the URL portion after an '@' marker, or a bare file:// / path:// spec.
+              lowered = spec.strip().lower()
+              # Strip environment markers (everything after ';') to avoid false positives.
+              spec_no_marker = lowered.split(";", 1)[0].strip()
+              if spec_no_marker.startswith("file://") or spec_no_marker.startswith("path://"):
+                  offenders.append((where, spec))
+                  return
+              # Check for PEP 508 direct references: name @ file://... / name @ path://...
+              if "@" in spec_no_marker:
+                  _, _, url = spec_no_marker.partition("@")
+                  url = url.strip()
+                  if url.startswith("file://") or url.startswith("path://"):
+                      offenders.append((where, spec))
+
+          for spec in sections["project.dependencies"]:
+              check_spec(spec, "project.dependencies")
+
+          for group, specs in sections["project.optional-dependencies"].items():
+              if not isinstance(specs, list):
+                  continue
+              for spec in specs:
+                  check_spec(spec, f"project.optional-dependencies.{group}")
+
+          if offenders:
+              print("Error: local file:// or path:// dependency found in pyproject.toml")
+              for where, spec in offenders:
+                  print(f"  - [{where}] {spec}")
+              print()
+              print("Local path dependencies are machine-specific and must not be committed.")
+              print("Remove them before merging.")
+              sys.exit(1)
+
+          print("OK: no file:// or path:// dependencies found in pyproject.toml")
+          PY
