@@ -8,12 +8,6 @@ durable if the videos are ever re-recorded.
 - [Free version demo](#free-version-demo) — `demo-2026-08-31-free.mp4`
 - [Pro version demo](#pro-version-demo) — `demo-2026-08-31-pro.mp4`
 
-Captions for each video are also available as WebVTT files, referenced
-from the `<video>` elements in the README:
-
-- `demo-2026-08-31-free.vtt`
-- `demo-2026-08-31-pro.vtt`
-
 ## Free version demo
 
 **Video:** `docs/assets/demo-2026-08-31-free.mp4`
@@ -79,6 +73,11 @@ PR description — with a bounded retry loop and a scheduler.
 
 ## Notes on accuracy
 
-These transcripts are paraphrased from the narration in each video. If
-the videos are re-recorded, update both the transcript above and the
-matching `.vtt` caption file so the two stay in sync.
+These transcripts are paraphrased from the narration in each video, not
+word-for-word. If the videos are re-recorded, update the transcript to
+match.
+
+There are no `.vtt` caption files: cue timings have to come from the
+actual audio (the free demo runs about 2m04s and the pro demo about 3m),
+so add them only once they can be generated from, or checked against, the
+recordings.
