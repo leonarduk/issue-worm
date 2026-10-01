@@ -626,6 +626,16 @@ def test_target_env_vars_adds_scheme_to_named_host_with_port():
         assert env_vars["OLLAMA_ENDPOINT"] == f"http://{host}"
 
 
+def test_target_env_vars_does_not_mistake_delimiter_in_path_for_scheme():
+    """A "://" that isn't preceded by a valid scheme (here, after a path)
+    is not a scheme, so the host still gets http:// prepended."""
+    target = CoderTarget(name="desk", host="myhost:11434/a://b", model="qwen2.5-coder")
+
+    env_vars = target_env_vars(target)
+
+    assert env_vars["OLLAMA_ENDPOINT"] == "http://myhost:11434/a://b"
+
+
 def test_target_env_vars_preserves_model_tag():
     """The model field is passed through untouched, tag and all."""
     target = CoderTarget(name="desk", host="localhost:11434", model="qwen2.5-coder:7b")
