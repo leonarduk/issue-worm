@@ -359,6 +359,19 @@ def test_apply_full_change_fenced_with_trailing_newline_writes_one_newline(repo)
     assert (Path(repo) / "a.py").read_text() == "value = 2\n"
 
 
+def test_apply_full_change_fenced_with_blank_lines_before_fence_writes_one_newline(repo):
+    """Blank lines between the content and the closing fence must not pile
+    up as extra trailing newlines - the unfenced path already drops them."""
+    output = (
+        "=== FILE: a.py ===\n=== MODE: FULL ===\n```python\nvalue = 2\n\n\n```\n"
+    )
+    (change,) = parse_coder_output(output, ["a.py"])
+
+    apply_file_change(repo, change)
+
+    assert (Path(repo) / "a.py").read_text() == "value = 2\n"
+
+
 def test_parse_full_section_preserves_fence_like_content_lines():
     """A full-file rewrite of a file that legitimately contains triple
     backticks (e.g. a Markdown or docs file) must keep interior fence-like
