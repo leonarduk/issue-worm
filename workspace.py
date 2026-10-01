@@ -1133,7 +1133,10 @@ def parse_coder_output(output: str, declared_files: list[str]) -> list[FileChang
             # resulting SyntaxError the way issue-worm-pro's loop would -
             # strip it before writing, the same way MODE_DIFF already does
             # for its own fencing (issue #248).
-            body = _strip_edge_fences(body)
+            # Blank lines before the closing fence survive the strip, which
+            # left a fenced body with more than one trailing newline in the
+            # written file (apply_file_change adds the final one itself).
+            body = _strip_edge_fences(body).rstrip("\n")
             if not body.strip():
                 # A body that was nothing but a fence (e.g. "```python\n```")
                 # strips to nothing. Writing that would silently truncate an
