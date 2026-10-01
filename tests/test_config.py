@@ -582,6 +582,18 @@ def test_target_env_vars_adds_scheme_to_bare_host():
     assert env_vars["OLLAMA_ENDPOINT"] == "http://192.168.1.20:11434"
 
 
+def test_target_env_vars_leaves_existing_scheme_unchanged():
+    """A host that already carries a scheme must not get a second one
+    prepended - detection leaves any scheme (not just
+    http/https) intact, so "ollama://localhost:11434" isn't mangled into
+    "http://ollama://localhost:11434"."""
+    target = CoderTarget(name="desk", host="ollama://localhost:11434", model="qwen2.5-coder")
+
+    env_vars = target_env_vars(target)
+
+    assert env_vars["OLLAMA_ENDPOINT"] == "ollama://localhost:11434"
+
+
 def test_target_env_vars_preserves_existing_scheme():
     """A host that already carries a scheme is passed through untouched -
     prepending another "http://" would produce a malformed URL."""
@@ -601,6 +613,27 @@ def test_target_env_vars_scheme_detection_is_case_insensitive():
         env_vars = target_env_vars(target)
 
         assert env_vars["OLLAMA_ENDPOINT"] == host
+
+
+def test_target_env_vars_adds_scheme_to_named_host_with_port():
+    """urlparse("localhost:11434").scheme is "localhost", so scheme
+    detection based on it would skip the prefix for a bare hostname:port."""
+    for host in ("localhost:11434", "desk.local:11434"):
+        target = CoderTarget(name="desk", host=host, model="qwen2.5-coder")
+
+        env_vars = target_env_vars(target)
+
+        assert env_vars["OLLAMA_ENDPOINT"] == f"http://{host}"
+
+
+def test_target_env_vars_does_not_mistake_delimiter_in_path_for_scheme():
+    """A "://" that isn't preceded by a valid scheme (here, after a path)
+    is not a scheme, so the host still gets http:// prepended."""
+    target = CoderTarget(name="desk", host="myhost:11434/a://b", model="qwen2.5-coder")
+
+    env_vars = target_env_vars(target)
+
+    assert env_vars["OLLAMA_ENDPOINT"] == "http://myhost:11434/a://b"
 
 
 def test_target_env_vars_preserves_model_tag():
