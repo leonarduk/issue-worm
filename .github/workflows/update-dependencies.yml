@@ -127,6 +127,11 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # CICAID_PRO_TOKEN is scoped to this step (and the Check step) because
+      # it grants read access to the private leonarduk/cicaid-pro repo, whose
+      # releases API the pin-rewriting script calls. No other step touches
+      # that repo, so the token is not lifted to workflow level. The default
+      # GITHUB_TOKEN cannot read private repos, hence the override here.
       - name: Update pins on a dependency branch
         if: steps.check.outputs.new_version != '' && steps.skip.outputs.skip != 'true'
         env:
