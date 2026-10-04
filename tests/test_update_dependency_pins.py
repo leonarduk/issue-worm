@@ -181,20 +181,34 @@ def test_pins_file_comments_are_not_treated_as_pins(repo):
     assert "CICAID_REF=v0.9.0" in text
 
 
-def test_pins_file_main_ref_raises_pin_error(repo):
-    """Documents the mismatch between the workflow's accepted ref patterns
-    and the update script's version-matching regex.
+def test_pins_file_main_ref_is_accepted_and_rewritten(repo):
+    """CICAID_REF=main is a valid ref, and this is the test that says so.
 
-    The workflow _ai-pr-review.yml permits CICAID_REF=main (its grep pattern
-    is (?:main|v[0-9][A-Za-z0-9.+-]*)), but the update script's regex only
-    matches version tags starting with 'v'. Setting CICAID_REF=main causes
-    _rewrite to fail with PinError because it cannot find a version to
-    substitute. A follow-up should align the two.
+    This case used to assert the opposite -- that CICAID_REF=main made
+    _rewrite fail with PinError, because the review workflow's install step
+    accepted "main" while the update script's regex matched only v-prefixed
+    tags. That mismatch is what this change aligns, so the assertion is now
+    that main is recognised and rewritten to a version tag, keeping the
+    original name's "main ref" case rather than deleting the coverage.
     """
-    main_ref_text = CICAID_PINS_TEXT.replace("CICAID_REF=v0.8.1", "CICAID_REF=main")
-    repo.joinpath(*CICAID_PINS.split("/")).write_bytes(main_ref_text.encode("utf-8"))
-    with pytest.raises(PinError):
-        apply_update("cicaid-devtools", "0.9.0", root=repo)
+    pins_path = repo.joinpath(*CICAID_PINS.split("/"))
+    pins_path.write_bytes(
+        CICAID_PINS_TEXT.replace("CICAID_REF=v0.8.1", "CICAID_REF=main").encode("utf-8")
+    )
+    # The other two files still pin 0.8.1, so the pin is found but drifts --
+    # main is a readable ref, not an unreadable one.
+    with pytest.raises(PinError, match="drifted"):
+        current_pin("cicaid-devtools", root=repo)
+
+    assert apply_update("cicaid-devtools", "0.9.0", root=repo) == [
+        "requirements.txt",
+        "pyproject.toml",
+        CICAID_PINS,
+    ]
+    text = _read(pins_path)
+    assert "CICAID_REF=v0.9.0" in text
+    assert "CICAID_REF=main" not in text
+    assert "CICAID_PRO_REF=v0.11.4" in text
 
 
 def test_pro_update_does_not_touch_the_free_pin(repo):
@@ -202,6 +216,49 @@ def test_pro_update_does_not_touch_the_free_pin(repo):
     text = _read(repo.joinpath(*CICAID_PINS.split("/")))
     assert "CICAID_PRO_REF=v0.14.1" in text
     assert "CICAID_REF=v0.8.1" in text
+
+
+@pytest.mark.parametrize("bad_ref", ["mainline", "maintenance"])
+def test_refs_merely_starting_with_main_are_not_pins(tmp_path, bad_ref):
+    """The "main" alternative must match the whole value, not a prefix of it.
+
+    "mainline" is not a ref this repo accepts. Matching its "main" prefix
+    would silently rewrite it to a corrupted pin ("CICAID_REF=v0.9.0line")
+    rather than reporting the bad value, so the pins-file branch is anchored
+    and this must surface as a missing pin instead.
+    """
+    files = dict(PIN_FILES)
+    files[CICAID_PINS] = CICAID_PINS_TEXT.replace(
+        "CICAID_REF=v0.8.1", f"CICAID_REF={bad_ref}"
+    )
+    _write_repo(tmp_path, files)
+
+    with pytest.raises(PinError, match="no cicaid-devtools pin found"):
+        current_pin("cicaid-devtools", root=tmp_path)
+    with pytest.raises(PinError, match="could not find the cicaid-devtools pin"):
+        apply_update("cicaid-devtools", "0.9.0", root=tmp_path)
+    # The malformed value is left exactly as it was: no partial rewrite.
+    assert f"CICAID_REF={bad_ref}" in _read(tmp_path.joinpath(*CICAID_PINS.split("/")))
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_main_ref_is_rewritten_with_either_line_ending(tmp_path, newline):
+    r"""The pins-file branch anchors to the line end, so the optional "\r" of
+    a CRLF pins file must still be recognised as CICAID_REF=main.
+    """
+    files = {
+        name: text.replace("\n", newline) for name, text in PIN_FILES.items()
+    }
+    files[CICAID_PINS] = files[CICAID_PINS].replace(
+        "CICAID_REF=v0.8.1", "CICAID_REF=main"
+    )
+    _write_repo(tmp_path, files)
+
+    apply_update("cicaid-devtools", "0.9.0", root=tmp_path)
+
+    text = _read(tmp_path.joinpath(*CICAID_PINS.split("/")))
+    assert f"CICAID_REF=v0.9.0{newline}" in text
+    assert "CICAID_REF=main" not in text
 
 
 def test_update_preserves_crlf(tmp_path):

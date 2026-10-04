@@ -82,32 +82,70 @@ OLLAMA_TOOLS_RELEASES_API = (
 )
 
 # Each dependency is pinned in two syntaxes now: a git+https URL in
-# requirements.txt/pyproject.toml, and a KEY=v<version> line in the pins
-# file. One alternation per dependency keeps a single pattern per spec (and
-# so the existing cross-file drift check) rather than a regex per file.
-# Group 1 is whichever prefix matched and group 2 the version, so _rewrite
-# stays prefix-agnostic. MULTILINE is what makes the "^" in the pins-file
-# branch anchor per line rather than to the start of the file.
+# requirements.txt/pyproject.toml, and a KEY=<ref> line in the pins file.
+# The pins-file ref is either a v-prefixed version tag or the literal
+# string "main" (the review workflow accepts both). One alternation per
+# dependency keeps a single pattern per spec (and so the existing cross-file
+# drift check) rather than a regex per file. Group 1 is whichever prefix
+# matched, so _rewrite stays prefix-agnostic. MULTILINE is what makes the "^"
+# in the pins-file branch anchor per line rather than to the start of the
+# file.
 #
 # The negative lookahead on cicaid-devtools' URL branch (not immediately
 # followed by "-pro") keeps it from also matching the cicaid-devtools-pro
 # pin - both share a "cicaid" prefix. Its pins-file branch needs no such
 # guard: "^CICAID_REF=" cannot match the CICAID_PRO_REF line.
+#
+# A pins-file value runs to the end of its line, unlike a git+https URL,
+# which is followed by either end-of-line (requirements.txt) or a closing
+# quote (pyproject.toml). "main" is the value that needs saying so: as a
+# literal it would otherwise match the "main" prefix of "mainline" and
+# rewrite it to "v0.9.0line" rather than raising PinError, so it carries a
+# (?=\r?$) of its own. The optional "\r" is there for a CRLF pins file (see
+# _read_text). A version needs no such guard, because its character class is
+# greedy and stops at whatever follows -- "0.8.1 " yields "0.8.1", leaving
+# the space where it was, and a malformed value still fails to match.
+#
+# "main" is also its own alternative ahead of the version form rather than a
+# value the version form could match, because "main" does match
+# [A-Za-z0-9.+-]* -- and once the boundary check there had failed, the
+# engine would not come back and try it as "main".
+#
+# Only update-dependencies.yml validates the ref as it reads it, with the
+# same (?:main|v[0-9][A-Za-z0-9.+-]*)(?=\r?$) this pattern matches; the
+# review workflow parses the line with awk and takes whatever follows the
+# "=". So this pattern, not that reader, is what keeps a malformed value
+# out of the pins file.
+#
+# The groups are always the same three, so _rewrite can index them without
+# knowing which dependency it is handling: group 1 is the prefix before the
+# version (a URL's "@v", or a KEY=), group 2 is a "v" sitting after that
+# prefix (only a pins-file tag has one) and group 3 is the value itself,
+# which is "main" or a bare version number with no "v". Group 1 + group 2
+# is therefore the "v"-carrying prefix a version is written after, and
+# current_pin reads group 3 to compare the files' values directly.
 _CICAID_FREE_PIN_RE = re.compile(
-    r"(git\+https://github\.com/leonarduk/cicaid(?!-pro)\.git@v|^CICAID_REF=v)"
-    r"([0-9][A-Za-z0-9.+-]*)",
+    r"(git\+https://github\.com/leonarduk/cicaid(?!-pro)\.git@v"
+    r"|^CICAID_REF=)"
+    r"(v?)"
+    r"(main(?=\r?$)|[0-9][A-Za-z0-9.+-]*)",
     re.MULTILINE,
 )
 _CICAID_PRO_PIN_RE = re.compile(
-    r"(git\+https://github\.com/leonarduk/cicaid-pro\.git@v|^CICAID_PRO_REF=v)"
-    r"([0-9][A-Za-z0-9.+-]*)",
+    r"(git\+https://github\.com/leonarduk/cicaid-pro\.git@v"
+    r"|^CICAID_PRO_REF=)"
+    r"(v?)"
+    r"(main(?=\r?$)|[0-9][A-Za-z0-9.+-]*)",
     re.MULTILINE,
 )
 # ollama-tools has one pin location only (pyproject.toml's `vram` extra),
 # so no pins-file alternative branch is needed here, unlike the cicaid pair.
+# Group 3 keeps a "main" alternative so every spec's pattern has the same
+# group layout, which _rewrite indexes without knowing the dependency.
 _OLLAMA_TOOLS_PIN_RE = re.compile(
     r"(git\+https://github\.com/leonarduk/laptop-egpu-llm\.git@v)"
-    r"([0-9][A-Za-z0-9.+-]*)",
+    r"(v?)"
+    r"(main(?=\r?$)|[0-9][A-Za-z0-9.+-]*)",
     re.MULTILINE,
 )
 
@@ -279,7 +317,7 @@ def current_pin(dep: str, root: Path | None = None) -> str:
         match = spec.pin_re.search(text)
         if match is None:
             raise PinError(f"no {dep} pin found in {name}")
-        found[name] = match.group(2)
+        found[name] = match.group(3)
     if len(set(found.values())) > 1:
         detail = ", ".join(f"{name} has v{version}" for name, version in found.items())
         raise PinError(f"{dep} pins drifted: {detail}")
@@ -290,7 +328,14 @@ def _rewrite(dep: str, text: str, new_version: str) -> str:
     spec = _spec(dep)
 
     def replace(match: re.Match) -> str:
-        return f"{match.group(1)}{new_version}"
+        # A version branch carries its own "v" in group 1 (a URL's "@v") or
+        # group 2 (a pins-file tag's "v"), and either way group 1 + group 2
+        # rebuilds the prefix the new value is written after. "main" is the
+        # one value with no "v" among them, so it needs one prepended to
+        # produce "CICAID_REF=v<version>".
+        if match.group(3) == "main":
+            return f"{match.group(1)}v{new_version}"
+        return f"{match.group(1)}{match.group(2)}{new_version}"
 
     new_text, count = spec.pin_re.subn(replace, text)
     if count == 0:
