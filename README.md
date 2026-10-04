@@ -36,7 +36,8 @@ well-scoped task, but pro is what "AI does the whole loop" looks like.
 For a deeper look at pro's retry loop and scheduler in action — real
 transcripts, a bounded 3-attempt retry with genuine Analyser feedback,
 and a real PR opened end to end — see
-[docs/demo-2026-08-30-issue-388.md](docs/demo-2026-08-30-issue-388.md).
+[docs/demo-2026-08-30-issue-388.md](docs/demo-2026-08-30-issue-388.md)
+*(pro-only features; not representative of the free tier)*.
 
 ## What this package does today
 

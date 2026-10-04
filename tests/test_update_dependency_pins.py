@@ -209,6 +209,20 @@ def test_pins_file_main_ref_is_accepted_and_rewritten(repo):
     assert "CICAID_REF=v0.9.0" in text
     assert "CICAID_REF=main" not in text
     assert "CICAID_PRO_REF=v0.11.4" in text
+def test_pins_file_main_ref_raises_pin_error(repo):
+    """Documents the mismatch between the workflow's accepted ref patterns
+    and the update script's version-matching regex.
+
+    The workflow _ai-pr-review.yml permits CICAID_REF=main (its grep pattern
+    is (?:main|v[0-9][A-Za-z0-9.+-]*)), but the update script's regex only
+    matches version tags starting with 'v'. Setting CICAID_REF=main causes
+    _rewrite to fail with PinError because it cannot find a version to
+    substitute. A follow-up should align the two.
+    """
+    main_ref_text = CICAID_PINS_TEXT.replace("CICAID_REF=v0.8.1", "CICAID_REF=main")
+    repo.joinpath(*CICAID_PINS.split("/")).write_bytes(main_ref_text.encode("utf-8"))
+    with pytest.raises(PinError):
+        apply_update("cicaid-devtools", "0.9.0", root=repo)
 
 
 def test_pro_update_does_not_touch_the_free_pin(repo):
