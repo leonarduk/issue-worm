@@ -111,9 +111,11 @@ OLLAMA_TOOLS_RELEASES_API = (
 # [A-Za-z0-9.+-]* -- and once the boundary check there had failed, the
 # engine would not come back and try it as "main".
 #
-# This accepts exactly what the workflow's own validation does in
-# .github/workflows/_ai-pr-review.yml:
-# CICAID_REF=(?:main|v[0-9][A-Za-z0-9.+-]*)(?=\r?$).
+# Only update-dependencies.yml validates the ref as it reads it, with the
+# same (?:main|v[0-9][A-Za-z0-9.+-]*)(?=\r?$) this pattern matches; the
+# review workflow parses the line with awk and takes whatever follows the
+# "=". So this pattern, not that reader, is what keeps a malformed value
+# out of the pins file.
 #
 # The groups are always the same three, so _rewrite can index them without
 # knowing which dependency it is handling: group 1 is the prefix before the

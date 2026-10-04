@@ -184,9 +184,10 @@ jobs:
           # _ai-pr-review.yml's real install works because it passes both
           # packages' git+https URLs to one pip invocation, same as here --
           # reading the cicaid-devtools pin from the same pins file it does.
-          # The trailing (?=\r?$) anchor matches _ai-pr-review.yml: without it
-          # a value like "mainline" would yield "main" and install the wrong
-          # ref instead of failing.
+          # The trailing (?=\r?$) anchor keeps a malformed value from being
+          # read as its valid prefix: without it "mainline" would yield
+          # "main" and install a ref the pins file never named. This is the
+          # same ref pattern scripts/update_dependency_pins.py matches.
           CICAID_PIN=$(grep -oP '^CICAID_REF=\K(?:main|v[0-9][A-Za-z0-9.+-]*)(?=\r?$)' .github/cicaid-pins.env)
           bash .github/scripts/pip_install_cicaid_pro.sh python -m pip install \
             "cicaid-devtools @ git+https://github.com/leonarduk/cicaid.git@${CICAID_PIN}" \
