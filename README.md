@@ -254,6 +254,12 @@ comment is worth checking that scope for.
   to issue-worm-pro's scheduler; this action only opens (or updates) the
   PR and lets the job's own success/failure be the signal.
 
+### Repository secrets
+
+| Secret | Purpose | Required scopes |
+|---|---|---|
+| `PIN_UPDATE_TOKEN` | Fine-grained PAT used by the pin-updater workflow to push updated version pins into `.github/workflows/` files, bypassing the `GITHUB_TOKEN` restriction on that path. | `Contents: Read and write`, `Workflows: Read and write` |
+
 ## Working with private repositories
 
 `issue-worm build` — the free-tier one; issue-worm-pro's resolves its own
