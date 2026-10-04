@@ -91,12 +91,12 @@ jobs:
             echo "::error::$PINS is missing. Run 'cicaid setup-review-actions' in this repo to restore it." >&2
             exit 1
           fi
-          CICAID_REF=$(grep -oP '^CICAID_REF=\K(?:main|v[0-9][A-Za-z0-9.+-]*)(?=\r?$)' "$PINS" || true)
+          CICAID_REF=$(awk -F= '/^CICAID_REF=/{print $2; exit}' "$PINS" | tr -d '\r' || true)
           if [ -z "${CICAID_REF}" ]; then
             echo "::error::no valid CICAID_REF=<tag> line in $PINS." >&2
             exit 1
           fi
-          CICAID_PRO_REF=$(grep -oP '^CICAID_PRO_REF=\K(?:main|v[0-9][A-Za-z0-9.+-]*)(?=\r?$)' "$PINS" || true)
+          CICAID_PRO_REF=$(awk -F= '/^CICAID_PRO_REF=/{print $2; exit}' "$PINS" | tr -d '\r' || true)
           if [ -z "${CICAID_PRO_REF}" ]; then
             echo "::error::no valid CICAID_PRO_REF=<tag> line in $PINS." >&2
             exit 1
