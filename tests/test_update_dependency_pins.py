@@ -181,34 +181,41 @@ def test_pins_file_comments_are_not_treated_as_pins(repo):
     assert "CICAID_REF=v0.9.0" in text
 
 
-def test_pro_update_does_not_touch_the_free_pin(repo):
-    apply_update("cicaid-devtools-pro", "0.14.1", root=repo)
-    text = _read(repo.joinpath(*CICAID_PINS.split("/")))
-    assert "CICAID_PRO_REF=v0.14.1" in text
-    assert "CICAID_REF=v0.8.1" in text
+def test_pins_file_main_ref_is_accepted_and_rewritten(repo):
+    """CICAID_REF=main is a valid ref, and this is the test that says so.
 
-
-def test_main_ref_is_recognized_and_rewritten(repo):
-    """CICAID_REF=main is a valid pin value (the review workflow accepts it);
-    the update script must recognise it and rewrite it to a version tag.
+    This case used to assert the opposite -- that CICAID_REF=main made
+    _rewrite fail with PinError, because the workflow _ai-pr-review.yml
+    permits "main" while the update script's regex matched only v-prefixed
+    tags. That mismatch is what this change aligns, so the assertion is now
+    that main is recognised and rewritten to a version tag, keeping the
+    original name's "main ref" case rather than deleting the coverage.
     """
     pins_path = repo.joinpath(*CICAID_PINS.split("/"))
     pins_path.write_bytes(
         CICAID_PINS_TEXT.replace("CICAID_REF=v0.8.1", "CICAID_REF=main").encode("utf-8")
     )
-    # current_pin should find the pin (not raise "no pin found") but report
-    # drift because the git-URL pins still say 0.8.1 while the pins file
-    # says main.
+    # The other two files still pin 0.8.1, so the pin is found but drifts --
+    # main is a readable ref, not an unreadable one.
     with pytest.raises(PinError, match="drifted"):
         current_pin("cicaid-devtools", root=repo)
-    # apply_update rewrites main to the new version tag with the v prefix.
-    changed = apply_update("cicaid-devtools", "0.9.0", root=repo)
-    assert CICAID_PINS in changed
+
+    assert apply_update("cicaid-devtools", "0.9.0", root=repo) == [
+        "requirements.txt",
+        "pyproject.toml",
+        CICAID_PINS,
+    ]
     text = _read(pins_path)
     assert "CICAID_REF=v0.9.0" in text
     assert "CICAID_REF=main" not in text
-    # The pro pin is untouched.
     assert "CICAID_PRO_REF=v0.11.4" in text
+
+
+def test_pro_update_does_not_touch_the_free_pin(repo):
+    apply_update("cicaid-devtools-pro", "0.14.1", root=repo)
+    text = _read(repo.joinpath(*CICAID_PINS.split("/")))
+    assert "CICAID_PRO_REF=v0.14.1" in text
+    assert "CICAID_REF=v0.8.1" in text
 
 
 @pytest.mark.parametrize("bad_ref", ["mainline", "maintenance"])
