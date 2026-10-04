@@ -211,6 +211,49 @@ def test_main_ref_is_recognized_and_rewritten(repo):
     assert "CICAID_PRO_REF=v0.11.4" in text
 
 
+@pytest.mark.parametrize("bad_ref", ["mainline", "maintenance"])
+def test_refs_merely_starting_with_main_are_not_pins(tmp_path, bad_ref):
+    """The "main" alternative must match the whole value, not a prefix of it.
+
+    "mainline" is not a ref this repo accepts. Matching its "main" prefix
+    would silently rewrite it to a corrupted pin ("CICAID_REF=v0.9.0line")
+    rather than reporting the bad value, so the pins-file branch is anchored
+    and this must surface as a missing pin instead.
+    """
+    files = dict(PIN_FILES)
+    files[CICAID_PINS] = CICAID_PINS_TEXT.replace(
+        "CICAID_REF=v0.8.1", f"CICAID_REF={bad_ref}"
+    )
+    _write_repo(tmp_path, files)
+
+    with pytest.raises(PinError, match="no cicaid-devtools pin found"):
+        current_pin("cicaid-devtools", root=tmp_path)
+    with pytest.raises(PinError, match="could not find the cicaid-devtools pin"):
+        apply_update("cicaid-devtools", "0.9.0", root=tmp_path)
+    # The malformed value is left exactly as it was: no partial rewrite.
+    assert f"CICAID_REF={bad_ref}" in _read(tmp_path.joinpath(*CICAID_PINS.split("/")))
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_main_ref_is_rewritten_with_either_line_ending(tmp_path, newline):
+    r"""The pins-file branch anchors to the line end, so the optional "\r" of
+    a CRLF pins file must still be recognised as CICAID_REF=main.
+    """
+    files = {
+        name: text.replace("\n", newline) for name, text in PIN_FILES.items()
+    }
+    files[CICAID_PINS] = files[CICAID_PINS].replace(
+        "CICAID_REF=v0.8.1", "CICAID_REF=main"
+    )
+    _write_repo(tmp_path, files)
+
+    apply_update("cicaid-devtools", "0.9.0", root=tmp_path)
+
+    text = _read(tmp_path.joinpath(*CICAID_PINS.split("/")))
+    assert f"CICAID_REF=v0.9.0{newline}" in text
+    assert "CICAID_REF=main" not in text
+
+
 def test_update_preserves_crlf(tmp_path):
     _write_repo(
         tmp_path, {name: text.replace("\n", "\r\n") for name, text in PIN_FILES.items()}
