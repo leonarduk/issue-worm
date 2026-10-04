@@ -188,6 +188,29 @@ def test_pro_update_does_not_touch_the_free_pin(repo):
     assert "CICAID_REF=v0.8.1" in text
 
 
+def test_main_ref_is_recognized_and_rewritten(repo):
+    """CICAID_REF=main is a valid pin value (the review workflow accepts it);
+    the update script must recognise it and rewrite it to a version tag.
+    """
+    pins_path = repo.joinpath(*CICAID_PINS.split("/"))
+    pins_path.write_bytes(
+        CICAID_PINS_TEXT.replace("CICAID_REF=v0.8.1", "CICAID_REF=main").encode("utf-8")
+    )
+    # current_pin should find the pin (not raise "no pin found") but report
+    # drift because the git-URL pins still say 0.8.1 while the pins file
+    # says main.
+    with pytest.raises(PinError, match="drifted"):
+        current_pin("cicaid-devtools", root=repo)
+    # apply_update rewrites main to the new version tag with the v prefix.
+    changed = apply_update("cicaid-devtools", "0.9.0", root=repo)
+    assert CICAID_PINS in changed
+    text = _read(pins_path)
+    assert "CICAID_REF=v0.9.0" in text
+    assert "CICAID_REF=main" not in text
+    # The pro pin is untouched.
+    assert "CICAID_PRO_REF=v0.11.4" in text
+
+
 def test_update_preserves_crlf(tmp_path):
     _write_repo(
         tmp_path, {name: text.replace("\n", "\r\n") for name, text in PIN_FILES.items()}

@@ -82,20 +82,26 @@ OLLAMA_TOOLS_RELEASES_API = (
 )
 
 # Each dependency is pinned in two syntaxes now: a git+https URL in
-# requirements.txt/pyproject.toml, and a KEY=v<version> line in the pins
-# file. One alternation per dependency keeps a single pattern per spec (and
-# so the existing cross-file drift check) rather than a regex per file.
-# Group 1 is whichever prefix matched and group 2 the version, so _rewrite
-# stays prefix-agnostic. MULTILINE is what makes the "^" in the pins-file
-# branch anchor per line rather than to the start of the file.
+# requirements.txt/pyproject.toml, and a KEY=<ref> line in the pins file.
+# The pins-file ref is either a v-prefixed version tag or the literal
+# string "main" (the review workflow accepts both). One alternation per
+# dependency keeps a single pattern per spec (and so the existing cross-file
+# drift check) rather than a regex per file. Group 1 is whichever prefix
+# matched and group 2 the version (or "main"), so _rewrite stays
+# prefix-agnostic. MULTILINE is what makes the "^" in the pins-file branch
+# anchor per line rather than to the start of the file.
 #
 # The negative lookahead on cicaid-devtools' URL branch (not immediately
 # followed by "-pro") keeps it from also matching the cicaid-devtools-pro
 # pin - both share a "cicaid" prefix. Its pins-file branch needs no such
 # guard: "^CICAID_REF=" cannot match the CICAID_PRO_REF line.
+#
+# The pins-file branch has three alternatives: the v-prefixed form (tried
+# first so it wins over the bare prefix), and the bare prefix for the
+# "main" case. The value group accepts either a dotted version or "main".
 _CICAID_FREE_PIN_RE = re.compile(
-    r"(git\+https://github\.com/leonarduk/cicaid(?!-pro)\.git@v|^CICAID_REF=v)"
-    r"([0-9][A-Za-z0-9.+-]*)",
+    r"(git\+https://github\.com/leonarduk/cicaid(?!-pro)\.git@v|^CICAID_REF=v|^CICAID_REF=)"
+    r"([0-9][A-Za-z0-9.+-]*|main)",
     re.MULTILINE,
 )
 _CICAID_PRO_PIN_RE = re.compile(
@@ -290,6 +296,11 @@ def _rewrite(dep: str, text: str, new_version: str) -> str:
     spec = _spec(dep)
 
     def replace(match: re.Match) -> str:
+        # When the current pin is "main" the prefix captured is the bare
+        # "CICAID_REF=" (no "v"), so the new version tag needs the "v"
+        # prepended to produce "CICAID_REF=v<version>".
+        if match.group(2) == "main":
+            return f"{match.group(1)}v{new_version}"
         return f"{match.group(1)}{new_version}"
 
     new_text, count = spec.pin_re.subn(replace, text)
