@@ -2,41 +2,34 @@
 
 ## Logo
 
-The file [`logo.jpg`](./logo.jpg) is the project's official logo asset.
+[`logo.jpg`](./logo.jpg) is issue-worm's logo.
 
-### Description
+### Where it is used
 
-`logo.jpg` is a raster image (JPEG) used as the project's primary visual identifier. It is intended for display in contexts where a compact, recognizable representation of the project is needed.
+- The footer of every pull request issue-worm opens: [`action.yml`](../action.yml)
+  embeds it from `https://github.com/leonarduk/issue-worm/raw/main/docs/logo.jpg`.
+  Moving or renaming the file breaks that image in existing and future PRs, so
+  keep it at this path.
 
-### Usage Guidelines
-
-The logo **may** be used in the following contexts:
-
-- The project's main `README.md` and other documentation pages
-- Project documentation, wiki pages, and help guides
-- Conference talks, blog posts, and presentations that reference this project
-- Issue templates, pull-request templates, and other in-repo metadata
-- Community materials (e.g., stickers, badges) that clearly attribute the project
-
-The logo **must not** be:
-
-- Modified, cropped, recolored, or otherwise altered without explicit maintainer approval
-- Used to imply endorsement of third-party products or services
-- Used in a commercial context (e.g., for sale, in paid advertising) without prior written permission from the project maintainers
-- Used in a way that misrepresents the project's purpose, governance, or affiliation
-
-If you are unsure whether a particular use is appropriate, open an issue or contact a maintainer before proceeding.
+It is also fine to use the logo to refer to issue-worm, for example in
+documentation, blog posts, talks, or a badge linking back to this repository.
+Please don't use it in a way that suggests the project endorses a third-party
+product or service.
 
 ### License
 
-The logo is distributed under the same license as the rest of this project. See the [`LICENSE`](../LICENSE) file at the repository root for the full license text and terms.
+No separate license has been established for the logo. The only license in this
+repository is the [MIT License](../LICENSE) (Copyright (c) 2026 Steve Leonard),
+which covers "this software and associated documentation files". That file does
+not mention the logo by name, so whether it covers the logo has not been stated
+explicitly.
 
-> **Note:** If the project's license file does not explicitly cover binary assets, the logo should be considered subject to the project's general license terms by default. If you require a different or more permissive license for a specific use case, please open an issue to discuss.
+If you need a definite answer for a particular use, for example commercial
+redistribution of the logo on its own, open an issue and ask the maintainer.
 
 ### Attribution
 
-When using the logo outside this repository, include a brief attribution such as:
+When using the logo outside this repository, a line such as the following is
+appreciated:
 
-> Logo © [Project Name] contributors. Licensed under [Project License].
-
-Replace `[Project Name]` and `[Project License]` with the actual project name and license identifier (e.g., MIT, Apache-2.0) as stated in the root `LICENSE` file.
+> issue-worm logo © 2026 Steve Leonard, from https://github.com/leonarduk/issue-worm
