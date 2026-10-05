@@ -46,6 +46,7 @@ repository check from an error to a warning, for a workspace whose
 
 from __future__ import annotations
 
+import contextlib
 import fnmatch
 import hashlib
 import logging
@@ -1723,6 +1724,67 @@ def ensure_base_clone(repo_path: str, repo: str, *, fresh: bool = False) -> str:
 WORM_GITIGNORE_PATTERNS = ("/.issue-worm/", ".env")
 
 
+@contextlib.contextmanager
+def _exclusive_file_lock(lock_path: Path):
+    """Cross-platform exclusive file lock using only the standard library
+    (``fcntl.flock`` on POSIX, ``msvcrt.locking`` on Windows).
+
+    Best-effort: yields even when the lock cannot be acquired (logged),
+    matching :func:`ensure_gitignored`'s failure-open posture. Proceeding
+    unlocked only reopens the duplicate-pattern race, which git tolerates;
+    failing the caller's whole pass over a lock error would be worse.
+
+    On Windows, ``LK_LOCK`` retries for ~10 seconds and then raises
+    ``OSError``, so a stuck holder can't hang waiters indefinitely; POSIX
+    ``flock`` locks are released by the kernel when the holder exits.
+    """
+    fd = -1
+    acquired = False
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT)
+        if os.name == "nt":
+            import msvcrt
+
+            # msvcrt.locking needs at least one byte to lock.
+            os.lseek(fd, 0, os.SEEK_END)
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"\0")
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        acquired = True
+    except OSError as exc:
+        logger.warning(
+            "Could not acquire lock on %s (%s); proceeding without lock "
+            "(concurrent callers may append duplicate patterns)",
+            lock_path,
+            exc,
+        )
+        if fd >= 0:
+            os.close(fd)
+            fd = -1
+    try:
+        yield
+    finally:
+        if acquired:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(fd)
+
+
 def ensure_gitignored(
     repo_path: str, patterns: tuple[str, ...] = WORM_GITIGNORE_PATTERNS
 ) -> None:
@@ -1767,33 +1829,38 @@ def ensure_gitignored(
         )
         return
     exclude_path = Path(repo_path) / result.stdout.strip()
-    try:
-        exclude_path.parent.mkdir(parents=True, exist_ok=True)
-        existing = (
-            exclude_path.read_text(encoding="utf-8") if exclude_path.exists() else ""
-        )
-    except OSError as exc:
-        logger.warning(
-            "Could not read %s (%s); leaving it untouched",
-            exclude_path,
-            exc,
-        )
-        return
-    existing_lines = {line.strip() for line in existing.splitlines()}
-    missing = [p for p in patterns if p not in existing_lines]
-    if not missing:
-        return
-    prefix = "\n" if existing and not existing.endswith("\n") else ""
-    try:
-        with exclude_path.open("a", encoding="utf-8") as f:
-            f.write(prefix + "\n".join(missing) + "\n")
-    except OSError as exc:
-        logger.warning(
-            "Could not add %s to %s (%s); leaving it untouched",
-            missing,
-            exclude_path,
-            exc,
-        )
+    # Sibling of info/exclude, so always inside the git dir (never the
+    # working tree). Deliberately not "exclude.lock": "<file>.lock" is
+    # git's own lockfile convention, and a stale one could confuse tooling.
+    lock_path = exclude_path.with_name(exclude_path.name + ".issue-worm-lock")
+    with _exclusive_file_lock(lock_path):
+        try:
+            exclude_path.parent.mkdir(parents=True, exist_ok=True)
+            existing = (
+                exclude_path.read_text(encoding="utf-8") if exclude_path.exists() else ""
+            )
+        except OSError as exc:
+            logger.warning(
+                "Could not read %s (%s); leaving it untouched",
+                exclude_path,
+                exc,
+            )
+            return
+        existing_lines = {line.strip() for line in existing.splitlines()}
+        missing = [p for p in patterns if p not in existing_lines]
+        if not missing:
+            return
+        prefix = "\n" if existing and not existing.endswith("\n") else ""
+        try:
+            with exclude_path.open("a", encoding="utf-8") as f:
+                f.write(prefix + "\n".join(missing) + "\n")
+        except OSError as exc:
+            logger.warning(
+                "Could not add %s to %s (%s); leaving it untouched",
+                missing,
+                exclude_path,
+                exc,
+            )
 
 
 # --- CI-check subprocess environment (allowlist, fail closed) ---------------

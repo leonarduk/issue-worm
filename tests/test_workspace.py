@@ -36,6 +36,7 @@ from workspace import (
     apply_file_change,
     ci_check_env,
     ensure_base_clone,
+    WORM_GITIGNORE_PATTERNS,
     ensure_gitignored,
     get_current_commit,
     get_working_diff,
@@ -1640,6 +1641,64 @@ def test_ensure_gitignored_survives_a_hard_reset(repo):
     (Path(repo) / ".issue-worm" / "usage.jsonl").write_text("{}\n", encoding="utf-8")
 
     assert _git(repo, "status", "--porcelain").stdout.strip() == ""
+
+
+def _ensure_gitignored_worker(repo_path: str, patterns: tuple[str, ...], barrier):
+    """Top-level worker for the concurrency test (must be picklable for
+    multiprocessing's spawn context on Windows)."""
+    from workspace import ensure_gitignored
+
+    barrier.wait()
+    ensure_gitignored(repo_path, patterns)
+
+
+def test_ensure_gitignored_concurrent_calls_produce_no_duplicates(repo):
+    """Multiple processes calling ensure_gitignored simultaneously must not
+    produce duplicate patterns in the exclude file (#174 follow-up)."""
+    import multiprocessing
+
+    patterns = ("/.issue-worm/", ".env", "/.test-concurrent/")
+    n = 4
+    ctx = multiprocessing.get_context()
+    barrier = ctx.Barrier(n)
+    procs = [
+        ctx.Process(target=_ensure_gitignored_worker, args=(repo, patterns, barrier))
+        for _ in range(n)
+    ]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(timeout=30)
+        assert p.exitcode == 0, f"worker {p.pid} exited with code {p.exitcode}"
+
+    lines = _exclude_path(repo).read_text(encoding="utf-8").splitlines()
+    assert len(lines) == len(set(lines)), f"duplicate patterns found: {lines}"
+    for pattern in patterns:
+        assert pattern in lines
+
+
+def test_ensure_gitignored_lock_file_stays_out_of_working_tree(repo):
+    """The lock lives beside info/exclude inside .git/, so it never shows
+    up in ``git status`` (which would trip _workspace_is_dirty)."""
+    ensure_gitignored(repo)
+
+    lock = _exclude_path(repo).with_name("exclude.issue-worm-lock")
+    assert lock.exists()
+    assert not (_exclude_path(repo).with_name("exclude.lock")).exists()
+    assert _git(repo, "status", "--porcelain").stdout.strip() == ""
+
+
+def test_ensure_gitignored_still_writes_when_lock_unavailable(repo, caplog):
+    """A lock failure is logged and the patterns are still written
+    (failure-open), rather than failing the caller's pass."""
+    with patch("workspace.os.open", side_effect=OSError("denied")):
+        with caplog.at_level(logging.WARNING, logger="workspace"):
+            ensure_gitignored(repo)
+
+    lines = _exclude_path(repo).read_text(encoding="utf-8").splitlines()
+    for pattern in WORM_GITIGNORE_PATTERNS:
+        assert pattern in lines
+    assert "proceeding without lock" in caplog.text
 
 
 def test_run_ci_checks_passes_default_timeout(repo):
