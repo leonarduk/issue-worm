@@ -387,9 +387,9 @@ def test_remote_propose_posts_openai_chat_completions_shape(tmp_path):
     assert payload["model"] == "gpt-5"
     assert len(payload["messages"]) == 1
     assert payload["messages"][0]["role"] == "user"
-    assert "do the thing" in payload["messages"][0]["content"]
-    assert "print(1)" in payload["messages"][0]["content"]
-    assert "do the thing" in payload["messages"][0]["content"]
+    content = payload["messages"][0]["content"]
+    assert "do the thing" in content
+    assert "--- a.py ---\nprint(1)\n" in content
     headers = mock_post.call_args[1]["headers"]
     assert headers["Authorization"] == "Bearer sk-test"
 
