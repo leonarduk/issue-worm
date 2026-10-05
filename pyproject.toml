@@ -36,6 +36,11 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
+    # Pinned exactly so CI's lint job, local runs and issue-worm's verifier
+    # venv (which installs this extra) all apply the same rule set - a
+    # floating ruff can start failing every build on a release that adds
+    # checks to the default selection.
+    "ruff==0.15.20",
 ]
 # Lets coder._default_ollama_model() auto-pick a local coder model sized to
 # the VRAM actually attached, instead of the fixed DEFAULT_OLLAMA_MODEL

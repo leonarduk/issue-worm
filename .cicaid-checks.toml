@@ -1,5 +1,5 @@
 # Verifier check list for `cicaid run-ci-checks --all`.
-# Mirrors .github/workflows/ci.yml's `test` and `docs-commands` jobs.
+# Mirrors .github/workflows/ci.yml's `test`, `lint` and `docs-commands` jobs.
 # Without this file, cicaid falls back to DEFAULT_CHECKS (allotmint's own
 # CI profile), which references scripts this repo doesn't have and fails
 # every build/poll run regardless of the change under test.
@@ -24,3 +24,9 @@ name = "docs-commands"
 description = "documented commands exist in the CLI"
 workflow = ".github/workflows/ci.yml"
 commands = ["python scripts/check_docs_commands.py"]
+
+[[checks]]
+name = "lint"
+description = "ruff lint"
+workflow = ".github/workflows/ci.yml"
+commands = ["ruff check ."]
