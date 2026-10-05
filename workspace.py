@@ -1730,9 +1730,13 @@ def _exclusive_file_lock(lock_path: Path):
     (``fcntl.flock`` on POSIX, ``msvcrt.locking`` on Windows).
 
     Best-effort: yields even when the lock cannot be acquired (logged),
-    matching :func:`ensure_gitignored`'s failure-open posture. The lock
-    file is a sibling of the file being modified and lives inside
-    ``.git/``, so it never appears in ``git status``.
+    matching :func:`ensure_gitignored`'s failure-open posture. Proceeding
+    unlocked only reopens the duplicate-pattern race, which git tolerates;
+    failing the caller's whole pass over a lock error would be worse.
+
+    On Windows, ``LK_LOCK`` retries for ~10 seconds and then raises
+    ``OSError``, so a stuck holder can't hang waiters indefinitely; POSIX
+    ``flock`` locks are released by the kernel when the holder exits.
     """
     fd = -1
     acquired = False
@@ -1755,7 +1759,8 @@ def _exclusive_file_lock(lock_path: Path):
         acquired = True
     except OSError as exc:
         logger.warning(
-            "Could not acquire lock on %s (%s); proceeding without lock",
+            "Could not acquire lock on %s (%s); proceeding without lock "
+            "(concurrent callers may append duplicate patterns)",
             lock_path,
             exc,
         )
@@ -1824,7 +1829,10 @@ def ensure_gitignored(
         )
         return
     exclude_path = Path(repo_path) / result.stdout.strip()
-    lock_path = exclude_path.with_name(exclude_path.name + ".lock")
+    # Sibling of info/exclude, so always inside the git dir (never the
+    # working tree). Deliberately not "exclude.lock": "<file>.lock" is
+    # git's own lockfile convention, and a stale one could confuse tooling.
+    lock_path = exclude_path.with_name(exclude_path.name + ".issue-worm-lock")
     with _exclusive_file_lock(lock_path):
         try:
             exclude_path.parent.mkdir(parents=True, exist_ok=True)
