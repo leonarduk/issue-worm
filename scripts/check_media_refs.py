@@ -8,7 +8,13 @@ Parses markdown files (default: README.md) for references to local files via:
 
 External URLs (http://, https://, mailto:, tel:, data:, etc.) and pure anchors
 (#section) are ignored. Each remaining local path is resolved relative to the
-repository root and checked for existence. Exits non-zero if any are missing.
+directory of the markdown file that contains it -- the same rule GitHub uses
+when it renders a relative link -- so docs/README.md's ``./logo.jpg`` means
+docs/logo.jpg. A reference that resolves outside the repository is skipped.
+
+Exits non-zero if any referenced file is missing, or if a markdown file passed
+on the command line does not exist (a typo there must fail CI, not pass it
+silently with nothing checked).
 """
 
 from __future__ import annotations
@@ -104,12 +110,13 @@ def normalize_path(url: str) -> str | None:
 
 
 def check_file(md_path: Path, repo_root: Path) -> list[tuple[str, str]]:
-    """Return list of (reference, resolved_path) for missing files."""
-    try:
-        text = md_path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        print(f"warning: {md_path} not found; skipping", file=sys.stderr)
-        return []
+    """Return list of (reference, resolved_path) for missing files.
+
+    Raises FileNotFoundError when ``md_path`` itself does not exist: every
+    file this checks was named explicitly, so a missing one is a broken
+    invocation, not something to skip (#593).
+    """
+    text = md_path.read_text(encoding="utf-8")
 
     missing: list[tuple[str, str]] = []
     seen: set[str] = set()
@@ -118,12 +125,13 @@ def check_file(md_path: Path, repo_root: Path) -> list[tuple[str, str]]:
         if rel is None or rel in seen:
             continue
         seen.add(rel)
-        # Resolve relative to the markdown file's directory (standard for docs).
+        # File-relative, not repo-root-relative: see the module docstring.
         candidate = (md_path.parent / rel).resolve()
         try:
             candidate.relative_to(repo_root.resolve())
         except ValueError:
-            # Reference escapes the repo; skip rather than fail.
+            # Deliberately skipped, not failed: a path outside the checkout
+            # (e.g. a sibling repo) can't be validated from here.
             continue
         if not candidate.exists():
             missing.append((raw, str(candidate.relative_to(repo_root.resolve()))))
@@ -131,12 +139,17 @@ def check_file(md_path: Path, repo_root: Path) -> list[tuple[str, str]]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument(
         "files",
         nargs="*",
         default=["README.md"],
-        help="Markdown files to check (default: README.md)",
+        help=(
+            "Markdown files to check (default: README.md). Each must exist. "
+            "References resolve relative to the file that contains them."
+        ),
     )
     parser.add_argument(
         "--repo-root",
@@ -149,12 +162,21 @@ def main(argv: list[str] | None = None) -> int:
     files = args.files or ["README.md"]
 
     all_missing: list[tuple[str, str, str]] = []
+    not_found: list[str] = []
     for f in files:
         md_path = Path(f)
         if not md_path.is_absolute():
             md_path = repo_root / md_path
-        for ref, resolved in check_file(md_path, repo_root):
+        try:
+            missing = check_file(md_path, repo_root)
+        except FileNotFoundError:
+            not_found.append(f)
+            continue
+        for ref, resolved in missing:
             all_missing.append((str(md_path.relative_to(repo_root)), ref, resolved))
+
+    for f in not_found:
+        print(f"error: markdown file not found: {f}", file=sys.stderr)
 
     if all_missing:
         print("Error: referenced local media files are missing from the repository:")
@@ -162,6 +184,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  - {md}: {ref}  ->  {resolved}")
         print()
         print("Commit the missing files or update the references.")
+        return 1
+    if not_found:
         return 1
 
     print(f"OK: all local media references in {', '.join(files)} exist.")
