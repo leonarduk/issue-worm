@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
+import workspace
 from workspace import (
     CATEGORY_OUTPUT_SHAPE,
     CATEGORY_TEST_FAILURE,
@@ -331,6 +332,90 @@ def test_parse_full_section_fence_without_trailing_newline_matches_with_one():
 
     assert "```" not in bare.body
     assert bare.body == with_newline.body
+    # A concrete value too, so a symmetric bug in both parses can't pass (#605).
+    assert bare.body == "value = 2"
+
+
+def test_parse_full_section_in_a_bare_fence_keeps_an_inner_fence_opener():
+    """A full-file body that itself contains fenced examples (a Markdown
+    doc, a docstring) must lose only the *outer* bare fence: the inner
+    ```python opener and its closer are real content (#584)."""
+    inner = "# Usage\n\n```python\nimport a\n```\n\nDone."
+    output = f"=== FILE: README.md ===\n=== MODE: FULL ===\n```\n{inner}\n```\n=== END FILE ===\n"
+
+    (change,) = parse_coder_output(output, ["README.md"])
+
+    assert change.mode == "FULL"
+    assert change.body == inner
+    assert "```python" in change.body.splitlines()
+
+
+def test_parse_full_section_whose_first_line_is_a_fence_opener():
+    """The hardest case for edge stripping: the file's own first line is a
+    fence opener, right after the outer bare fence. Only one line may go
+    from each edge (#584)."""
+    inner = "```python\nimport a\n```"
+    output = f"=== FILE: snippet.md ===\n=== MODE: FULL ===\n```\n{inner}\n```\n=== END FILE ===\n"
+
+    (change,) = parse_coder_output(output, ["snippet.md"])
+
+    assert change.body == inner
+
+
+def test_apply_full_change_in_a_bare_fence_writes_the_inner_fences(repo):
+    inner = "# Usage\n\n```python\nimport a\n```"
+    output = f"=== FILE: README.md ===\n=== MODE: FULL ===\n```\n{inner}\n```\n=== END FILE ===\n"
+    (change,) = parse_coder_output(output, ["README.md"])
+
+    apply_file_change(repo, change)
+
+    assert (Path(repo) / "README.md").read_text() == inner + "\n"
+
+
+@pytest.mark.parametrize("body", ["```python\n```", "```\n\n   \n```", "```\n```"])
+def test_parse_full_section_that_strips_to_empty_warns(caplog, body):
+    """A FULL body that is nothing but a fence would write an empty file;
+    the warning, at WARNING level and naming the path and mode, is the only
+    signal the model returned no content (#586)."""
+    output = f"=== FILE: a.py ===\n=== MODE: FULL ===\n{body}\n=== END FILE ===\n"
+
+    with caplog.at_level(logging.DEBUG, logger="workspace"):
+        (change,) = parse_coder_output(output, ["a.py"])
+
+    assert change.body.strip() == ""
+    records = [r for r in caplog.records if "empty body after fence stripping" in r.getMessage()]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    assert "'a.py'" in records[0].getMessage()
+    assert "MODE: FULL" in records[0].getMessage()
+
+
+def test_parse_full_section_with_content_does_not_warn(caplog):
+    with caplog.at_level(logging.WARNING, logger="workspace"):
+        parse_coder_output(_full_file_output("a.py", "value = 2"), ["a.py"])
+    assert "empty body" not in caplog.text
+
+
+_DIFF_HUNK = "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-value = 1\n+value = 2"
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "\n```",  # no newline after the closing fence
+        "\n```\n",  # one newline after it
+        "\n\n\n```\n",  # blank lines before the closing fence
+        "\n```\n\n\n",  # blank lines after it
+    ],
+)
+def test_extract_diff_ends_in_exactly_one_newline(tail):
+    """The DIFF path's output must end in exactly one newline (git apply
+    wants a terminated patch), however the fenced block was closed (#606)."""
+    assert workspace._extract_diff(f"```diff\n{_DIFF_HUNK}{tail}") == _DIFF_HUNK + "\n"
+
+
+def test_extract_diff_without_a_fence_ends_in_exactly_one_newline():
+    assert workspace._extract_diff(_DIFF_HUNK + "\n\n") == _DIFF_HUNK + "\n"
 
 
 def test_apply_full_change_fenced_without_trailing_newline_writes_one_newline(repo):
