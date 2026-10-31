@@ -161,10 +161,12 @@ def _sanitize_target_name(raw: str) -> str:
     when the result is empty (e.g. an all-whitespace or all-special input).
 
     Valid values like "cloud", "claude", and "lmstudio" pass through
-    unchanged.
+    unchanged. "ASCII" is meant literally: ``str.isalnum`` alone also
+    accepts non-ASCII letters and digits ("café", "日本語"), which would
+    break the contract for ASCII-only consumers (#598).
     """
     sanitized = "".join(
-        ch if (ch.isalnum() or ch in "-_") else "-" for ch in raw
+        ch if ((ch.isascii() and ch.isalnum()) or ch in "-_") else "-" for ch in raw
     )
     # Collapse runs of "-" so "my cloud model" -> "my-cloud-model" rather
     # than "my---cloud---model".

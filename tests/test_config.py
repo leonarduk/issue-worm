@@ -152,7 +152,45 @@ def test_load_config_synthesized_target_names_are_sanitized(monkeypatch):
 
     assert [t.name for t in targets] == ["model-rm-rf-1", "model-rm-rf-2"]
     for target in targets:
-        assert all(ch.isalnum() or ch in "-_" for ch in target.name)
+        # isascii() too: isalnum() alone accepts Unicode letters (#598).
+        assert all((ch.isascii() and ch.isalnum()) or ch in "-_" for ch in target.name)
+
+
+@pytest.mark.parametrize(
+    ("model_source", "expected"),
+    [
+        ("café", "caf-1"),
+        ("my café model", "my-caf-model-1"),
+        ("日本語", "target-1"),  # nothing ASCII survives -> the fallback
+        ("modèle２", "mod-le-1"),  # accented letter and a full-width digit
+    ],
+)
+def test_load_config_synthesized_target_names_are_ascii_only(
+    monkeypatch, model_source, expected
+):
+    """Through the real config-loading path: a non-ASCII model_source must
+    not leak non-ASCII letters or digits into a synthesized target name
+    (#598, #599)."""
+    monkeypatch.setenv("CODER_MODEL_SOURCE", "cloud")
+    monkeypatch.setenv("MAX_CONCURRENT_ISSUES", "1")
+    monkeypatch.delenv("CODER_TARGETS", raising=False)
+
+    import config as config_module
+
+    original_load_role_config = config_module._load_role_config
+
+    def _patched(role_prefix):
+        role = original_load_role_config(role_prefix)
+        if role_prefix == "CODER":
+            role.model_source = model_source
+        return role
+
+    monkeypatch.setattr(config_module, "_load_role_config", _patched)
+
+    (target,) = load_config()["coder_targets"]
+
+    assert target.name == expected
+    assert target.name.isascii()
 
 
 def test_load_config_synthesized_target_names_handle_spaces(monkeypatch):
@@ -749,6 +787,16 @@ def test_parse_coder_targets_duplicate_name_is_case_insensitive():
         _parse_coder_targets(
             "desk:192.168.1.20:11434:qwen2.5-coder,Desk:192.168.1.50:11434:qwen2.5-coder"
         )
+
+
+def test_parse_coder_targets_keeps_the_names_original_case():
+    """Duplicates are detected on the lowercased name, but the stored name
+    is exactly as written - only the lookup key is normalized (#601)."""
+    targets = _parse_coder_targets(
+        "Desk:192.168.1.20:11434:qwen2.5-coder,GPU-Box:192.168.1.50:11434:qwen2.5-coder"
+    )
+
+    assert [t.name for t in targets] == ["Desk", "GPU-Box"]
 
 
 def test_parse_coder_targets_case_insensitive_duplicate_reports_first_entry():
