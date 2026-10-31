@@ -1724,15 +1724,31 @@ def ensure_base_clone(repo_path: str, repo: str, *, fresh: bool = False) -> str:
 WORM_GITIGNORE_PATTERNS = ("/.issue-worm/", ".env")
 
 
+# Lock file persistence (#634): ensure_gitignored serialises its
+# read-modify-write of info/exclude through a sibling lock file,
+# ``.git/info/exclude.issue-worm-lock``. It is created on first use and
+# deliberately never deleted after release: it is zero-byte (one NUL byte on
+# Windows, which msvcrt.locking needs), lives inside the git dir so it never
+# shows up in ``git status``, and - like git's own ``.lock`` files left behind
+# on a crash - is harmless to leave in place. Do NOT add cleanup: unlinking a
+# lock file while another process waits on the old inode lets two callers
+# "hold" the lock at once (one on the unlinked inode, one on a fresh file),
+# reopening exactly the race the lock exists to close.
+# test_ensure_gitignored_lock_file_stays_out_of_working_tree pins this.
 @contextlib.contextmanager
 def _exclusive_file_lock(lock_path: Path):
     """Cross-platform exclusive file lock using only the standard library
     (``fcntl.flock`` on POSIX, ``msvcrt.locking`` on Windows).
 
-    Best-effort: yields even when the lock cannot be acquired (logged),
-    matching :func:`ensure_gitignored`'s failure-open posture. Proceeding
-    unlocked only reopens the duplicate-pattern race, which git tolerates;
-    failing the caller's whole pass over a lock error would be worse.
+    Best-effort: yields even when the lock cannot be acquired with an
+    ``OSError`` (logged), matching :func:`ensure_gitignored`'s failure-open
+    posture. Proceeding unlocked only reopens the duplicate-pattern race,
+    which git tolerates; failing the caller's whole pass over a lock error
+    would be worse. Any other exception from acquisition propagates.
+
+    The fd is closed unconditionally on every exit path (#628) - including a
+    non-``OSError`` raised by the lock call after ``os.open`` succeeded - and
+    a failing close never masks an exception from the ``with`` body.
 
     On Windows, ``LK_LOCK`` retries for ~10 seconds and then raises
     ``OSError``, so a stuck holder can't hang waiters indefinitely; POSIX
@@ -1741,37 +1757,42 @@ def _exclusive_file_lock(lock_path: Path):
     fd = -1
     acquired = False
     try:
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT)
-        if os.name == "nt":
-            import msvcrt
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            # Explicitly close-on-exec (#633): a subprocess spawned while the
+            # lock is held (e.g. git) must not inherit the fd and keep the
+            # flock alive past this process. Python >= 3.4 already defaults
+            # to non-inheritable fds; this states the intent rather than
+            # relying on that default. O_CLOEXEC is POSIX-only, hence the
+            # getattr; set_inheritable covers platforms without it.
+            flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+            fd = os.open(str(lock_path), flags)
+            os.set_inheritable(fd, False)
+            if os.name == "nt":
+                import msvcrt
 
-            # msvcrt.locking needs at least one byte to lock.
-            os.lseek(fd, 0, os.SEEK_END)
-            if os.fstat(fd).st_size == 0:
-                os.write(fd, b"\0")
-            os.lseek(fd, 0, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
-        else:
-            import fcntl
+                # msvcrt.locking needs at least one byte to lock.
+                os.lseek(fd, 0, os.SEEK_END)
+                if os.fstat(fd).st_size == 0:
+                    os.write(fd, b"\0")
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
 
-            fcntl.flock(fd, fcntl.LOCK_EX)
-        acquired = True
-    except OSError as exc:
-        logger.warning(
-            "Could not acquire lock on %s (%s); proceeding without lock "
-            "(concurrent callers may append duplicate patterns)",
-            lock_path,
-            exc,
-        )
-        if fd >= 0:
-            os.close(fd)
-            fd = -1
-    try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            acquired = True
+        except OSError as exc:
+            logger.warning(
+                "Could not acquire lock on %s (%s); proceeding without lock "
+                "(concurrent callers may append duplicate patterns)",
+                lock_path,
+                exc,
+            )
         yield
     finally:
         if acquired:
-            try:
+            with contextlib.suppress(OSError):
                 if os.name == "nt":
                     import msvcrt
 
@@ -1780,9 +1801,10 @@ def _exclusive_file_lock(lock_path: Path):
                     import fcntl
 
                     fcntl.flock(fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            os.close(fd)
+        if fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            fd = -1
 
 
 def ensure_gitignored(

@@ -1659,6 +1659,13 @@ def test_ensure_gitignored_concurrent_calls_produce_no_duplicates(repo):
 
     patterns = ("/.issue-worm/", ".env", "/.test-concurrent/")
     n = 4
+    # Snapshot whatever git's template put in info/exclude (comment lines,
+    # possibly repeated) so the assertions below check only what the
+    # workers wrote, not pre-existing fixture content (#630).
+    exclude = _exclude_path(repo)
+    before = (
+        exclude.read_text(encoding="utf-8").splitlines() if exclude.exists() else []
+    )
     ctx = multiprocessing.get_context()
     barrier = ctx.Barrier(n)
     procs = [
@@ -1671,10 +1678,15 @@ def test_ensure_gitignored_concurrent_calls_produce_no_duplicates(repo):
         p.join(timeout=30)
         assert p.exitcode == 0, f"worker {p.pid} exited with code {p.exitcode}"
 
-    lines = _exclude_path(repo).read_text(encoding="utf-8").splitlines()
-    assert len(lines) == len(set(lines)), f"duplicate patterns found: {lines}"
+    lines = exclude.read_text(encoding="utf-8").splitlines()
+    # Every worker's pattern present exactly once: catches both a duplicate
+    # append (the race) and a lost write, which global uniqueness can't.
     for pattern in patterns:
-        assert pattern in lines
+        assert lines.count(pattern) == 1, f"{pattern!r} not exactly once: {lines}"
+    # Nothing else was added or dropped: the file is the pre-existing
+    # content plus exactly one line per pattern.
+    assert [line for line in lines if line not in patterns] == before
+    assert len(lines) == len(before) + len(patterns)
 
 
 def test_ensure_gitignored_lock_file_stays_out_of_working_tree(repo):
@@ -1699,6 +1711,102 @@ def test_ensure_gitignored_still_writes_when_lock_unavailable(repo, caplog):
     for pattern in WORM_GITIGNORE_PATTERNS:
         assert pattern in lines
     assert "proceeding without lock" in caplog.text
+
+
+def _recording_os_open(opened):
+    """Wrap os.open so a test can see which fds the lock helper opened."""
+    real_open = os.open
+
+    def _open(*args, **kwargs):
+        fd = real_open(*args, **kwargs)
+        opened.append(fd)
+        return fd
+
+    return _open
+
+
+def _assert_fds_closed(fds):
+    assert fds, "expected the lock helper to open a lock fd"
+    for fd in fds:
+        with pytest.raises(OSError):
+            os.fstat(fd)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="patches POSIX fcntl.flock")
+def test_ensure_gitignored_writes_when_lock_acquisition_fails(repo, caplog):
+    """os.open succeeds but flock raises OSError: still failure-open (the
+    patterns are written) and the already-open fd is closed (#629)."""
+    import fcntl
+
+    opened: list[int] = []
+    with (
+        patch("workspace.os.open", side_effect=_recording_os_open(opened)),
+        patch.object(fcntl, "flock", side_effect=OSError("flock denied")),
+        caplog.at_level(logging.WARNING, logger="workspace"),
+    ):
+        ensure_gitignored(repo)
+
+    lines = _exclude_path(repo).read_text(encoding="utf-8").splitlines()
+    for pattern in WORM_GITIGNORE_PATTERNS:
+        assert pattern in lines
+    assert "proceeding without lock" in caplog.text
+    _assert_fds_closed(opened)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="patches POSIX fcntl.flock")
+def test_exclusive_file_lock_closes_fd_on_non_oserror_from_lock_call(tmp_path):
+    """A non-OSError from the lock call after os.open succeeded propagates
+    (not swallowed) and does not leak the fd (#628, #629)."""
+    import fcntl
+
+    from workspace import _exclusive_file_lock
+
+    opened: list[int] = []
+    with (
+        patch("workspace.os.open", side_effect=_recording_os_open(opened)),
+        patch.object(fcntl, "flock", side_effect=ValueError("boom")),
+        pytest.raises(ValueError, match="boom"),
+    ):
+        with _exclusive_file_lock(tmp_path / "x.lock"):
+            pytest.fail("body must not run when acquisition raises")
+
+    _assert_fds_closed(opened)
+
+
+def test_exclusive_file_lock_close_failure_does_not_mask_body_error(tmp_path):
+    """An os.close failure on exit must not replace the exception raised
+    by the with-body (#628)."""
+    from workspace import _exclusive_file_lock
+
+    real_close = os.close
+    closed: list[int] = []
+
+    def _failing_close(fd):
+        real_close(fd)  # really release it so the test leaks nothing
+        closed.append(fd)
+        raise OSError("close failed")
+
+    with (
+        patch("workspace.os.close", side_effect=_failing_close),
+        pytest.raises(RuntimeError, match="from body"),
+    ):
+        with _exclusive_file_lock(tmp_path / "x.lock"):
+            raise RuntimeError("from body")
+
+    assert len(closed) == 1
+
+
+def test_exclusive_file_lock_fd_is_not_inheritable(tmp_path):
+    """The lock fd is close-on-exec so a subprocess spawned while the lock
+    is held can't keep it alive (#633)."""
+    from workspace import _exclusive_file_lock
+
+    opened: list[int] = []
+    with patch("workspace.os.open", side_effect=_recording_os_open(opened)):
+        with _exclusive_file_lock(tmp_path / "x.lock"):
+            assert len(opened) == 1
+            assert os.get_inheritable(opened[0]) is False
+    _assert_fds_closed(opened)
 
 
 def test_run_ci_checks_passes_default_timeout(repo):
