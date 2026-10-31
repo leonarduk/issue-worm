@@ -7,7 +7,10 @@ drifting apart.
 """
 
 import ast
+import os
 import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -444,6 +447,139 @@ def test_real_repo_pins_are_readable_and_agree():
     assert current_pin("cicaid-devtools", root=REPO_ROOT)
     assert current_pin("cicaid-devtools-pro", root=REPO_ROOT)
     assert current_pin("ollama-tools", root=REPO_ROOT)
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_current_pin_returns_main_when_every_location_says_main(tmp_path, newline):
+    r"""current_pin's return path for "main", not just _rewrite's (#621).
+
+    Only cicaid-devtools-pro can have every location agree on "main": its
+    sole pin lives in the pins file. cicaid-devtools' URL pins are always
+    "@v<version>", so CICAID_REF=main there is necessarily drift (see
+    test_pins_file_main_ref_is_accepted_and_rewritten).
+    """
+    files = {name: text.replace("\n", newline) for name, text in PIN_FILES.items()}
+    files[CICAID_PINS] = files[CICAID_PINS].replace(
+        "CICAID_PRO_REF=v0.11.4", "CICAID_PRO_REF=main"
+    )
+    _write_repo(tmp_path, files)
+
+    assert current_pin("cicaid-devtools-pro", root=tmp_path) == "main"
+    # The neighbouring free pin is unaffected by the pro line saying main.
+    assert current_pin("cicaid-devtools", root=tmp_path) == "0.8.1"
+
+
+# A literal tag written straight into a git+https URL in a workflow: the
+# shape both review-workflow pins had before they moved into the pins file
+# (#142, #156). "@${CICAID_REF}" or "@v${{ steps... }}" are reads of a pin,
+# not pins, and must not match.
+_INLINE_WORKFLOW_PIN_RE = re.compile(
+    r"git\+https://github\.com/leonarduk/"
+    r"(?:cicaid|cicaid-pro|laptop-egpu-llm)\.git@(?:v[0-9]|main\b)"
+)
+
+
+def test_no_workflow_hardcodes_a_dependency_pin():
+    """Workflows must read the cicaid pins from the pins file, never inline
+    them (#645).
+
+    test_real_repo_pins_are_readable_and_agree is the CI check that every
+    file the updater manages names the same tag; this covers the one place it
+    cannot see. A tag hardcoded in a workflow is invisible to the updater,
+    so it silently drifts from the others -- and the default GITHUB_TOKEN
+    could not push a bump to it anyway.
+    """
+    workflows = sorted((REPO_ROOT / ".github" / "workflows").glob("*.y*ml"))
+    assert workflows, "no workflow files found"
+    offenders = [
+        f"{path.name}:{lineno}: {line.strip()}"
+        for path in workflows
+        for lineno, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(), start=1
+        )
+        if _INLINE_WORKFLOW_PIN_RE.search(line)
+    ]
+    assert not offenders, (
+        f"hardcoded dependency pin(s) in workflows; read {CICAID_PINS} "
+        "instead:\n" + "\n".join(offenders)
+    )
+
+
+def test_inline_workflow_pin_regex_catches_a_hardcoded_tag():
+    """Guard the guard: the regex above must actually flag an inline tag."""
+    assert _INLINE_WORKFLOW_PIN_RE.search(
+        '"cicaid-devtools @ git+https://github.com/leonarduk/cicaid.git@v0.6.0"'
+    )
+    assert _INLINE_WORKFLOW_PIN_RE.search(
+        "git+https://github.com/leonarduk/cicaid-pro.git@main "
+    )
+    assert not _INLINE_WORKFLOW_PIN_RE.search(
+        "git+https://github.com/leonarduk/cicaid.git@${CICAID_REF}"
+    )
+    assert not _INLINE_WORKFLOW_PIN_RE.search(
+        "git+https://github.com/leonarduk/cicaid-pro.git@v${{ steps.check.outputs.v }}"
+    )
+
+
+REVIEW_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "_ai-pr-review.yml"
+
+
+def _review_workflow_ref_reader(key: str) -> str:
+    """The shell the review workflow reads ``key`` from the pins file with.
+
+    Read out of the workflow, like CHECK_RE above, so the test exercises the
+    command that actually runs rather than a copy of it.
+    """
+    text = REVIEW_WORKFLOW.read_text(encoding="utf-8")
+    match = re.search(rf"^\s*{key}=\$\((.*)\)\s*$", text, re.MULTILINE)
+    assert match, f"no {key}=$(...) assignment found in {REVIEW_WORKFLOW}"
+    return match.group(1)
+
+
+@pytest.mark.skipif(
+    shutil.which("bash") is None or shutil.which("awk") is None,
+    reason="needs bash and awk, as the workflow's ubuntu runner has",
+)
+@pytest.mark.parametrize("key", ["CICAID_REF", "CICAID_PRO_REF"])
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("{key}=main\n", "main"),
+        ("{key}=v1.2.3\n", "v1.2.3"),
+        ("{key}=v0.99.0+abc123\n", "v0.99.0+abc123"),
+        ("{key}=main\r\n", "main"),
+        ("{key}=v1.2.3\r\n", "v1.2.3"),
+        # Rejected: prints nothing, so the workflow's [ -z ] check fails it.
+        ("{key}=garbage\n", ""),
+        ("{key}=v1.2.3=extra\n", ""),
+        ("{key}=mainline\n", ""),
+        ("{key}=1.2.3\n", ""),
+        ("{key}=v1.2.3; rm -rf /\n", ""),
+        ("{key}=\n", ""),
+        ("# {key}=v9.9.9\n", ""),
+    ],
+)
+def test_review_workflow_validates_pins_file_refs(tmp_path, key, line, expected):
+    """The review workflow's install step only accepts main or vX.Y.Z (#614).
+
+    An unvalidated awk -F= extraction once let any value -- and the first
+    "="-separated field of a malformed one -- flow into the pip command.
+    """
+    other = "CICAID_PRO_REF" if key == "CICAID_REF" else "CICAID_REF"
+    pins = tmp_path / "cicaid-pins.env"
+    # The other key's line sits alongside, so a reader keyed on the wrong
+    # name (or matching CICAID_REF inside CICAID_PRO_REF) would show up.
+    pins.write_bytes(
+        (f"# header\n{line.format(key=key)}{other}=v7.7.7\n").encode("utf-8")
+    )
+    result = subprocess.run(
+        ["bash", "-c", _review_workflow_ref_reader(key)],
+        env={**os.environ, "PINS": str(pins)},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.stdout.strip("\n") == expected
 
 
 def test_script_imports_only_stdlib():

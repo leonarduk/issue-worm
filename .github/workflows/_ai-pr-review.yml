@@ -91,14 +91,21 @@ jobs:
             echo "::error::$PINS is missing. Run 'cicaid setup-review-actions' in this repo to restore it." >&2
             exit 1
           fi
-          CICAID_REF=$(awk -F= '/^CICAID_REF=/{print $2; exit}' "$PINS" | tr -d '\r' || true)
+          # Take everything after the first "=" (not awk -F='s $2, which
+          # would read "v1.2.3=extra" as "v1.2.3") and accept it only if it
+          # is "main" or a v-prefixed tag -- the same
+          # (?:main|v[0-9][A-Za-z0-9.+-]*) scripts/update_dependency_pins.py
+          # and update-dependencies.yml enforce (#614). Anything else prints
+          # nothing, so the empty check below rejects it before it reaches
+          # pip. sub() strips a CRLF pins file's "\r" before validating.
+          CICAID_REF=$(awk '/^CICAID_REF=/{v=substr($0, index($0, "=") + 1); sub(/\r$/, "", v); if (v == "main" || v ~ /^v[0-9][A-Za-z0-9.+-]*$/) print v; exit}' "$PINS" | tr -d '\r' || true)
           if [ -z "${CICAID_REF}" ]; then
-            echo "::error::no valid CICAID_REF=<tag> line in $PINS." >&2
+            echo "::error::no valid CICAID_REF=<tag> line in $PINS (expected main or vX.Y.Z)." >&2
             exit 1
           fi
-          CICAID_PRO_REF=$(awk -F= '/^CICAID_PRO_REF=/{print $2; exit}' "$PINS" | tr -d '\r' || true)
+          CICAID_PRO_REF=$(awk '/^CICAID_PRO_REF=/{v=substr($0, index($0, "=") + 1); sub(/\r$/, "", v); if (v == "main" || v ~ /^v[0-9][A-Za-z0-9.+-]*$/) print v; exit}' "$PINS" | tr -d '\r' || true)
           if [ -z "${CICAID_PRO_REF}" ]; then
-            echo "::error::no valid CICAID_PRO_REF=<tag> line in $PINS." >&2
+            echo "::error::no valid CICAID_PRO_REF=<tag> line in $PINS (expected main or vX.Y.Z)." >&2
             exit 1
           fi
           bash .github/scripts/pip_install_cicaid_pro.sh pip install --retries 10 \
