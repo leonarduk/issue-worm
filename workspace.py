@@ -50,6 +50,7 @@ import contextlib
 import fnmatch
 import hashlib
 import logging
+import math
 import os
 import re
 import shutil
@@ -2564,14 +2565,17 @@ def _issue_worm_settings(repo: Path) -> dict:
 
 
 def _positive_seconds(value: object) -> float | None:
-    """``value`` as a positive number of seconds, or None if it isn't one."""
+    """``value`` as a positive, finite number of seconds, or None if it
+    isn't one. ``inf`` is rejected like any other unusable value (#567):
+    accepting it would silently disable the timeout it is meant to set
+    (``nan`` already fails ``> 0``, but is named here for clarity)."""
     if isinstance(value, bool):
         return None
     try:
         seconds = float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
-    return seconds if seconds > 0 else None
+    return seconds if math.isfinite(seconds) and seconds > 0 else None
 
 
 def resolve_ci_timeout(repo_path: str) -> float:
@@ -2583,10 +2587,18 @@ def resolve_ci_timeout(repo_path: str) -> float:
     legitimately runs longer than the default (allotmint: backend, frontend
     and bats suites, ~10 minutes on a laptop) declares it; the env var lets
     a machine that is slower still override every repo at once. An
-    unusable value is ignored with a warning, never an error.
+    unusable value (non-numeric, zero, negative, ``inf``/``nan``) is ignored
+    with a warning, never an error.
+
+    An empty or whitespace-only ``ISSUE_WORM_CI_TIMEOUT`` counts as unset,
+    silently (#568): ``ISSUE_WORM_CI_TIMEOUT=`` is the usual way to clear an
+    inherited value, so warning about it would be noise.
+
+    ``repo_path`` is resolved here, as every helper :func:`run_ci_checks`
+    hands a ``repo_path`` string to does for itself (#569).
     """
     raw_env = os.environ.get(CI_TIMEOUT_ENV)
-    if raw_env:
+    if raw_env is not None and raw_env.strip():
         seconds = _positive_seconds(raw_env)
         if seconds is not None:
             return seconds
