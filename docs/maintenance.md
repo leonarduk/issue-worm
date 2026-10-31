@@ -2,9 +2,10 @@
 
 ## Dependency pins
 
-issue-worm pins three git-only dependencies by tag. The table lists every
-location a pin lives in, and is the complete list: nothing else in the repo
-names a tag for these packages.
+issue-worm pins three git-only packages by tag, across five locations
+(cicaid-devtools appears in three files). The table lists every location a pin
+lives in, and is the complete list: nothing else in the repo names a tag for
+these packages.
 
 | Dependency | File | What to change |
 |---|---|---|
@@ -90,8 +91,8 @@ bump.
 ### Supported versions
 
 The only supported pair is the one
-[`.github/cicaid-pins.env`](../.github/cicaid-pins.env) names on `main`. At the
-time of writing that is `CICAID_PRO_REF=v0.20.1` with `CICAID_REF=v0.6.0`.
+[`.github/cicaid-pins.env`](../.github/cicaid-pins.env) names on `main`, as
+`CICAID_PRO_REF` with `CICAID_REF`.
 
 No wider range is claimed. Other versions have not been validated, and pro's
 release notes are in a private repo, so they can't be checked from a public
