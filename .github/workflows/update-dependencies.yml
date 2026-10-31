@@ -204,16 +204,16 @@ jobs:
           # get the full end-to-end exercise from the DeepSeek review job
           # itself; this step covers the bot's update PR, which no other
           # workflow runs on (GITHUB_TOKEN-created events trigger nothing).
-          MODULES=$(
-            {
-              grep -ohP 'python3 -m \Kcicaid_devtools\.lib\.[a-z_]+' .github/workflows/_ai-pr-review.yml
-              grep -ohP 'review_module: \Kcicaid_devtools\.lib\.[a-z_]+' .github/workflows/*.yml
-            } | sort -u
-          )
-          if [ -z "$MODULES" ]; then
-            echo "::error::found no cicaid_devtools.lib modules in the review workflows to smoke-test" >&2
+          # Each source must contribute at least one module: if a refactor
+          # changes how either is written, a silently partial list would
+          # smoke-test only part of the contract.
+          SHARED=$(grep -ohP 'python3 -m \Kcicaid_devtools\.lib\.[a-z0-9_]+' .github/workflows/_ai-pr-review.yml || true)
+          PROVIDERS=$(grep -ohP 'review_module: \Kcicaid_devtools\.lib\.[a-z0-9_]+' .github/workflows/*.yml || true)
+          if [ -z "$SHARED" ] || [ -z "$PROVIDERS" ]; then
+            echo "::error::could not read the review modules to smoke-test from the workflows (shared: '${SHARED//$'\n'/ }', providers: '${PROVIDERS//$'\n'/ }')" >&2
             exit 1
           fi
+          MODULES=$(printf '%s\n%s\n' "$SHARED" "$PROVIDERS" | sort -u)
           FAILED=""
           for module in $MODULES; do
             if ! python -c "import importlib, sys; importlib.import_module(sys.argv[1])" "$module"; then
