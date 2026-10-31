@@ -1154,6 +1154,75 @@ def test_changed_paths_from_diff_lists_both_sides_of_a_rename():
     ]
 
 
+def _real_git_diff(tmp_path: Path, names: list[str], rename: tuple[str, str] | None = None) -> str:
+    """``git diff`` as git itself prints it - quoting and all - for edits to
+    ``names`` (and optionally one rename), so the parser is tested against
+    real output rather than a hand-written guess at it."""
+    repo = tmp_path / "quoted"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    all_names = [*names, *([rename[0]] if rename else [])]
+    for name in all_names:
+        (repo / name).parent.mkdir(parents=True, exist_ok=True)
+        (repo / name).write_text("a\n", encoding="utf-8")
+    git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", "init"], check=True)
+    for name in names:
+        (repo / name).write_text("a\nb\n", encoding="utf-8")
+    if rename:
+        (repo / rename[1]).parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run([*git, "mv", rename[0], rename[1]], check=True)
+    subprocess.run([*git, "add", "-A"], check=True)
+    return subprocess.run(
+        [*git, "-c", "core.quotePath=true", "diff", "--cached", "-M"],
+        check=True, capture_output=True, text=True, encoding="utf-8",
+    ).stdout
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "café.py",  # non-ASCII: git quotes it with \ooo octal UTF-8 bytes
+        "日本/語.ts",
+        'q"uote.txt',  # a double quote: quoted and backslash-escaped
+        "my file.txt",  # spaces alone: git does NOT quote these
+        "x b/y.txt",  # an embedded " b/": the old regex split here
+        "plain.py",
+    ],
+)
+def test_changed_paths_from_diff_reads_every_path_git_prints(tmp_path, name):
+    """A path changed_paths_from_diff drops is a change select_ci_checks
+    never sees, so it could skip the check that change needed (#577)."""
+    diff = _real_git_diff(tmp_path, [name])
+    assert workspace.changed_paths_from_diff(diff) == [name]
+
+
+def test_changed_paths_from_diff_mixed_quoted_and_unquoted(tmp_path):
+    names = ["frontend/café.ts", "backend/app.py", "x b/y.sh"]
+    diff = _real_git_diff(tmp_path, names)
+    assert sorted(workspace.changed_paths_from_diff(diff)) == sorted(names)
+
+
+def test_changed_paths_from_diff_rename_to_a_quoted_name(tmp_path):
+    """git prints this header half-quoted: ``a/old name.txt "b/n\\303\\251w..."``."""
+    diff = _real_git_diff(tmp_path, [], rename=("old name.txt", "docs/néw name.txt"))
+    assert workspace.changed_paths_from_diff(diff) == ["old name.txt", "docs/néw name.txt"]
+
+
+@pytest.mark.parametrize(
+    ("token", "expected"),
+    [
+        ("plain/path.py", "plain/path.py"),
+        ('"a/caf\\303\\251.py"', "a/café.py"),
+        ('"a/q\\"uote"', 'a/q"uote'),
+        ('"a/back\\\\slash"', "a/back\\slash"),
+        ('"a/tab\\there"', "a/tab\there"),
+    ],
+)
+def test_git_unquote(token, expected):
+    assert workspace._git_unquote(token) == expected
+
+
 @pytest.mark.parametrize(
     "path, glob, expected",
     [
@@ -1185,6 +1254,41 @@ def test_select_always_runs_a_check_that_declares_no_paths(tmp_path):
     )
     selected, _ = workspace.select_ci_checks(str(repo), ["frontend/src/api.ts"])
     assert selected == ["frontend", "deps"]
+
+
+def test_select_never_runs_a_check_with_empty_paths_when_others_match(tmp_path):
+    """``paths = []`` claims no change, so that check is skipped whenever
+    another check is selected (#579)."""
+    repo = _checks_config(
+        tmp_path / "repo",
+        _CHECKS_WITH_PATHS + '\n[[checks]]\nname = "never"\ncommands = ["x"]\npaths = []\n',
+    )
+    selected, note = workspace.select_ci_checks(str(repo), ["frontend/src/api.ts"])
+    assert selected == ["frontend"]
+    assert "never" in note  # reported as skipped
+
+
+def test_select_runs_everything_when_every_check_has_empty_paths(tmp_path):
+    """No check claims the change, so the conservative fallback runs them
+    all - an empty selection must never mean "run nothing" (#579)."""
+    config = (
+        '[[checks]]\nname = "a"\ncommands = ["x"]\npaths = []\n'
+        '[[checks]]\nname = "b"\ncommands = ["y"]\npaths = []\n'
+    )
+    repo = _checks_config(tmp_path / "repo", config)
+    assert workspace.select_ci_checks(str(repo), ["frontend/a.ts"]) == (None, "")
+
+
+def test_select_treats_a_non_list_paths_as_always_run(tmp_path):
+    """``paths = "frontend/**"`` (a bare string, not a list) is malformed;
+    the check runs regardless rather than being skipped or crashing (#579)."""
+    repo = _checks_config(
+        tmp_path / "repo",
+        _CHECKS_WITH_PATHS + '\n[[checks]]\nname = "stringy"\ncommands = ["x"]\n'
+        'paths = "frontend/**"\n',
+    )
+    selected, _ = workspace.select_ci_checks(str(repo), ["backend/app.py"])
+    assert selected == ["backend", "stringy"]
 
 
 @pytest.mark.parametrize(

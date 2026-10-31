@@ -2956,16 +2956,112 @@ def ensure_node_deps(repo_path: str) -> list[str]:
 CI_CHECKS_CONFIG = ".cicaid-checks.toml"
 
 
+_GIT_QUOTE_ESCAPES = {
+    "a": 0x07, "b": 0x08, "f": 0x0C, "n": 0x0A, "r": 0x0D, "t": 0x09,
+    "v": 0x0B, "\\": 0x5C, '"': 0x22,
+}
+
+
+def _git_unquote(token: str) -> str:
+    """A path as git printed it, unquoted (#577).
+
+    With ``core.quotePath`` (the default) git wraps a path holding non-ASCII
+    bytes, ``"``, ``\\`` or control characters in double quotes and C-escapes
+    it, writing each non-ASCII byte as ``\\ooo`` octal - so the escapes are
+    UTF-8 *bytes*, decoded here as such. A path with only spaces is never
+    quoted. An unquoted token is returned unchanged.
+    """
+    if len(token) < 2 or not (token.startswith('"') and token.endswith('"')):
+        return token
+    body, out, i = token[1:-1], bytearray(), 0
+    while i < len(body):
+        ch = body[i]
+        if ch != "\\" or i + 1 == len(body):
+            out += ch.encode("utf-8")
+            i += 1
+        elif body[i + 1] in "01234567":
+            j = i + 1
+            while j < len(body) and j < i + 4 and body[j] in "01234567":
+                j += 1
+            out.append(int(body[i + 1 : j], 8) & 0xFF)
+            i = j
+        else:
+            out.append(_GIT_QUOTE_ESCAPES.get(body[i + 1], ord(body[i + 1])))
+            i += 2
+    return out.decode("utf-8", errors="replace")
+
+
+def _split_quoted(text: str) -> tuple[str, str] | None:
+    """``"..."`` at the start of ``text`` and whatever follows it."""
+    i = 1
+    while i < len(text):
+        if text[i] == "\\":
+            i += 2
+            continue
+        if text[i] == '"':
+            return text[: i + 1], text[i + 1 :]
+        i += 1
+    return None
+
+
+def _diff_header_paths(rest: str) -> tuple[str, str] | None:
+    """The a/ and b/ paths of a ``diff --git <rest>`` header line.
+
+    Either side may be quoted (see :func:`_git_unquote`). When neither is,
+    a path containing " b/" makes the split ambiguous, so the split that
+    names the same path on both sides wins - which every non-rename is.
+    """
+    if rest.startswith('"'):
+        split = _split_quoted(rest)
+        if split is None or not split[1].startswith(" "):
+            return None
+        left, right = split[0], split[1][1:]
+    elif rest.endswith('"') and ' "' in rest:
+        cut = rest.rindex(' "')
+        left, right = rest[:cut], rest[cut + 1 :]
+    else:
+        # "a/P b/P" is 2 * len("a/P") + 1 long: the separator's space sits
+        # exactly in the middle.
+        half = (len(rest) - 1) // 2
+        if rest[half : half + 3] == " b/" and rest[2:half] == rest[half + 3 :]:
+            left, right = rest[:half], rest[half + 1 :]
+        elif " b/" in rest:
+            left, right = rest.split(" b/", 1)
+            right = "b/" + right
+        else:
+            return None
+    left, right = _git_unquote(left), _git_unquote(right)
+    if not (left.startswith("a/") and right.startswith("b/")):
+        return None
+    return left[2:], right[2:]
+
+
 def changed_paths_from_diff(diff_output: str) -> list[str]:
     """The repo-relative paths a git diff touches, in order, both sides of a
-    rename included."""
+    rename included.
+
+    Handles git's quoted paths (non-ASCII, ``"``, ``\\``) and unquoted paths
+    with spaces or an embedded " b/" (#577): a path this drops is a change
+    :func:`select_ci_checks` never sees, so it could skip the very check
+    that change needed. A rename's ``rename from``/``rename to`` lines name
+    each side unambiguously and override the header's guess.
+    """
     paths: list[str] = []
+
+    def add(path: str) -> None:
+        if path and path not in paths:
+            paths.append(path)
+
     for line in diff_output.splitlines():
-        match = re.match(r"diff --git a/(.+?) b/(.+)$", line)
-        if match:
-            for path in match.groups():
-                if path not in paths:
-                    paths.append(path)
+        if line.startswith("diff --git "):
+            parsed = _diff_header_paths(line[len("diff --git ") :])
+            if parsed:
+                for path in parsed:
+                    add(path)
+        elif line.startswith("rename from "):
+            add(_git_unquote(line[len("rename from ") :]))
+        elif line.startswith("rename to "):
+            add(_git_unquote(line[len("rename to ") :]))
     return paths
 
 
@@ -2993,6 +3089,9 @@ def select_ci_checks(repo_path: str, changed_paths: list[str]) -> tuple[list[str
     claims is still fully checked. A frontend-only fix then skips the
     backend, infrastructure and shell suites instead of paying ~10 minutes
     per attempt for them; the PR's own CI still runs everything.
+
+    Glob semantics (case-insensitive, ``**/`` also matching at the repo
+    root) are documented for config authors in docs/ci-check-selection.md.
     """
     try:
         data = tomllib.loads((Path(repo_path) / CI_CHECKS_CONFIG).read_text(encoding="utf-8"))
