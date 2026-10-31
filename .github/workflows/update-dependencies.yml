@@ -1,7 +1,7 @@
 name: Update Dependencies
 
 # Nothing else keeps the cicaid pins current -- they are hardcoded git tags
-# in pyproject.toml, requirements.txt and _ai-pr-review.yml, and the
+# in pyproject.toml, requirements.txt and .github/cicaid-pins.env, and the
 # cicaid-devtools-pro one silently drifted backwards once already (issue
 # #135 / PR #136). This checks the latest release of each daily, rewrites
 # every file that pins it, runs the tests, and opens a PR when it's behind.
@@ -189,9 +189,42 @@ jobs:
           # "main" and install a ref the pins file never named. This is the
           # same ref pattern scripts/update_dependency_pins.py matches.
           CICAID_PIN=$(grep -oP '^CICAID_REF=\K(?:main|v[0-9][A-Za-z0-9.+-]*)(?=\r?$)' .github/cicaid-pins.env)
+          PRO_REF="v${{ steps.check.outputs.new_version }}"
           bash .github/scripts/pip_install_cicaid_pro.sh python -m pip install \
             "cicaid-devtools @ git+https://github.com/leonarduk/cicaid.git@${CICAID_PIN}" \
-            "cicaid-devtools-pro @ git+https://github.com/leonarduk/cicaid-pro.git@v${{ steps.check.outputs.new_version }}"
+            "cicaid-devtools-pro @ git+https://github.com/leonarduk/cicaid-pro.git@${PRO_REF}"
+
+          # Resolving is not enough (#572): import every module the review
+          # workflows run with `python3 -m`, so a bump that removes, renames
+          # or breaks one fails here instead of on the first PR after merge.
+          # The list is read from the workflows themselves (the shared
+          # _ai-pr-review.yml plus each caller's review_module), so it cannot
+          # drift from what actually runs. This is the contract surface
+          # docs/maintenance.md describes. Human PRs that touch the pins file
+          # get the full end-to-end exercise from the DeepSeek review job
+          # itself; this step covers the bot's update PR, which no other
+          # workflow runs on (GITHUB_TOKEN-created events trigger nothing).
+          # Each source must contribute at least one module: if a refactor
+          # changes how either is written, a silently partial list would
+          # smoke-test only part of the contract.
+          SHARED=$(grep -ohP 'python3 -m \Kcicaid_devtools\.lib\.[a-z0-9_]+' .github/workflows/_ai-pr-review.yml || true)
+          PROVIDERS=$(grep -ohP 'review_module: \Kcicaid_devtools\.lib\.[a-z0-9_]+' .github/workflows/*.yml || true)
+          if [ -z "$SHARED" ] || [ -z "$PROVIDERS" ]; then
+            echo "::error::could not read the review modules to smoke-test from the workflows (shared: '${SHARED//$'\n'/ }', providers: '${PROVIDERS//$'\n'/ }')" >&2
+            exit 1
+          fi
+          MODULES=$(printf '%s\n%s\n' "$SHARED" "$PROVIDERS" | sort -u)
+          FAILED=""
+          for module in $MODULES; do
+            if ! python -c "import importlib, sys; importlib.import_module(sys.argv[1])" "$module"; then
+              FAILED="$FAILED $module"
+            fi
+          done
+          if [ -n "$FAILED" ]; then
+            echo "::error::cicaid-devtools-pro ${PRO_REF} (with cicaid-devtools ${CICAID_PIN}) cannot import:${FAILED}" >&2
+            exit 1
+          fi
+          echo "cicaid-devtools-pro ${PRO_REF}: imported $(echo "$MODULES" | wc -l) review modules"
 
       # ollama-tools is an optional extra (`vram`), installed by no other
       # step in this repo's CI - this is the only thing that proves a new

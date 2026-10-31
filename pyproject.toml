@@ -24,8 +24,9 @@ dependencies = [
     # reason a bump here needs the matching bump in issue-worm-pro: an
     # installer that pulls in both wants the same ref from each.
     # Kept current by .github/workflows/update-dependencies.yml, which also
-    # rewrites the copies in requirements.txt and _ai-pr-review.yml - the
-    # three must always name the same tag.
+    # rewrites the copies in requirements.txt and .github/cicaid-pins.env
+    # (CICAID_REF, which _ai-pr-review.yml reads) - the three must always
+    # name the same tag. Manual bumps: see docs/maintenance.md.
     "cicaid-devtools[dotenv] @ git+https://github.com/leonarduk/cicaid.git@v0.6.0",
     "python-dotenv>=1.0",
     # Direct imports in version_checker.py (the update check).

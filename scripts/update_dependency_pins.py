@@ -37,6 +37,9 @@ The scheduled workflow (.github/workflows/update-dependencies.yml) uses
 ``--check`` to decide whether to open an update PR, then runs the script
 again without ``--check`` on its own branch to rewrite the pins.
 
+The manual upgrade procedure, and the compatibility contract a
+cicaid-devtools-pro bump is reviewed against, are in docs/maintenance.md.
+
 Adapted from issue-worm-pro's script of the same name, which tracks the same
 two pins across that repo's own files.
 """
@@ -111,11 +114,11 @@ OLLAMA_TOOLS_RELEASES_API = (
 # [A-Za-z0-9.+-]* -- and once the boundary check there had failed, the
 # engine would not come back and try it as "main".
 #
-# Only update-dependencies.yml validates the ref as it reads it, with the
-# same (?:main|v[0-9][A-Za-z0-9.+-]*)(?=\r?$) this pattern matches; the
-# review workflow parses the line with awk and takes whatever follows the
-# "=". So this pattern, not that reader, is what keeps a malformed value
-# out of the pins file.
+# Both readers of the pins file validate the ref the same way this pattern
+# does -- update-dependencies.yml with (?:main|v[0-9][A-Za-z0-9.+-]*)(?=\r?$),
+# the review workflow's install step with the equivalent awk test (#614,
+# pinned by test_review_workflow_validates_pins_file_refs) -- so a malformed
+# value is rejected wherever it is read, not only when this script runs.
 #
 # The groups are always the same three, so _rewrite can index them without
 # knowing which dependency it is handling: group 1 is the prefix before the
