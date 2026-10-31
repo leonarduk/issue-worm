@@ -921,17 +921,64 @@ def test_ci_timeout_env_var_overrides_the_repo(tmp_path, monkeypatch):
     assert workspace.resolve_ci_timeout(str(repo)) == 2400.0
 
 
-@pytest.mark.parametrize("bad_env", ["soon", "0", "-5"])
-def test_ci_timeout_ignores_an_unusable_env_var(tmp_path, monkeypatch, bad_env):
+@pytest.mark.parametrize(
+    "bad_env", ["soon", "0", "-5", "inf", "-inf", "Infinity", "nan", "1e400"]
+)
+def test_ci_timeout_ignores_an_unusable_env_var(tmp_path, monkeypatch, caplog, bad_env):
+    """An infinite timeout would silently disable the guard (#567); "1e400"
+    overflows float() to inf, so it is rejected the same way."""
     repo = _declares_timeout(tmp_path / "repo", "1500")
     monkeypatch.setenv(workspace.CI_TIMEOUT_ENV, bad_env)
-    assert workspace.resolve_ci_timeout(str(repo)) == 1500.0
+    with caplog.at_level(logging.WARNING, logger="workspace"):
+        assert workspace.resolve_ci_timeout(str(repo)) == 1500.0
+    assert "not a positive number of seconds" in caplog.text
 
 
-@pytest.mark.parametrize("bad_value", ['"long"', "0", "true", "-10"])
-def test_ci_timeout_ignores_an_unusable_declaration(tmp_path, no_timeout_env, bad_value):
+# TOML has bare inf/nan float literals as well as the quoted strings, and
+# float() parses both - so each spelling must be rejected (#567).
+@pytest.mark.parametrize(
+    "bad_value", ['"long"', "0", "true", "-10", "inf", "+inf", "-inf", "nan", '"inf"', '"nan"']
+)
+def test_ci_timeout_ignores_an_unusable_declaration(
+    tmp_path, no_timeout_env, caplog, bad_value
+):
     repo = _declares_timeout(tmp_path / "repo", bad_value)
-    assert workspace.resolve_ci_timeout(str(repo)) == workspace.DEFAULT_CI_TIMEOUT
+    with caplog.at_level(logging.WARNING, logger="workspace"):
+        assert workspace.resolve_ci_timeout(str(repo)) == workspace.DEFAULT_CI_TIMEOUT
+    assert "not a positive number of seconds" in caplog.text
+
+
+@pytest.mark.parametrize("value", ["1500", "1500.0", "1e3", " 900 "])
+def test_ci_timeout_accepts_finite_spellings(tmp_path, monkeypatch, value):
+    """The finiteness check must not reject a valid value in any spelling
+    float() accepts, surrounding whitespace included."""
+    monkeypatch.setenv(workspace.CI_TIMEOUT_ENV, value)
+    assert workspace.resolve_ci_timeout(str(tmp_path)) == float(value)
+
+
+@pytest.mark.parametrize("empty", ["", "   ", "\t"])
+def test_ci_timeout_treats_an_empty_env_var_as_unset(
+    tmp_path, monkeypatch, caplog, empty
+):
+    """ISSUE_WORM_CI_TIMEOUT= is how a shell clears an inherited value, so it
+    falls through to the repo's declaration without a warning (#568)."""
+    repo = _declares_timeout(tmp_path / "repo", "1500")
+    monkeypatch.setenv(workspace.CI_TIMEOUT_ENV, empty)
+    with caplog.at_level(logging.WARNING, logger="workspace"):
+        assert workspace.resolve_ci_timeout(str(repo)) == 1500.0
+    assert caplog.text == ""
+
+
+def test_ci_timeout_finds_the_declaration_from_a_relative_repo_path(
+    tmp_path, no_timeout_env, monkeypatch
+):
+    """A relative repo_path resolves against the working directory, the same
+    way every other helper run_ci_checks calls resolves it (#569)."""
+    _declares_timeout(tmp_path / "repo", "1500")
+    monkeypatch.chdir(tmp_path)
+    assert workspace.resolve_ci_timeout("repo") == 1500.0
+    monkeypatch.chdir(tmp_path / "repo")
+    assert workspace.resolve_ci_timeout(".") == 1500.0
 
 
 def test_run_ci_checks_uses_the_resolved_timeout(tmp_path, no_timeout_env):
