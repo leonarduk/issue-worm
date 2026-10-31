@@ -786,6 +786,66 @@ def test_prefer_git_bash_puts_git_bash_ahead_of_the_wsl_launcher(tmp_path):
     ]
 
 
+def test_prefer_git_bash_treats_the_windowsapps_alias_as_a_wsl_launcher(tmp_path):
+    """The WindowsApps ``bash.exe`` alias is the other stub Windows ships
+    besides System32's relay; it must be overridden the same way (#552)."""
+    git_root = _git_for_windows(tmp_path / "Git")
+    windowsapps = str(tmp_path / "AppData" / "Local" / "Microsoft" / "WindowsApps")
+    git_cmd = str(git_root / "cmd")
+    path = os.pathsep.join((windowsapps, git_cmd))
+    which = _fake_which(
+        {
+            (windowsapps, "bash"): windowsapps + os.sep + "bash.exe",
+            (git_cmd, "git"): str(git_root / "cmd" / "git.exe"),
+        }
+    )
+
+    assert workspace._is_wsl_bash_launcher(windowsapps + os.sep + "bash.exe")
+    with patch("workspace.shutil.which", side_effect=which):
+        result = workspace._prefer_git_bash(path, is_windows=True)
+
+    assert result.split(os.pathsep) == [
+        str((git_root / "usr" / "bin").resolve()),
+        windowsapps,
+        git_cmd,
+    ]
+
+
+@pytest.mark.parametrize(
+    "git_dir",
+    [
+        ("cmd",),
+        ("bin",),
+        ("mingw64", "bin"),
+        # 4 levels below the root: outside the old [:3] walk (#551).
+        ("mingw64", "libexec", "git-core"),
+    ],
+)
+def test_git_bash_dir_finds_the_root_from_every_git_layout(tmp_path, git_dir):
+    root = tmp_path / "Git"
+    (root / "usr" / "bin").mkdir(parents=True)
+    (root / "usr" / "bin" / "bash.exe").write_text("")
+    git_exe = root.joinpath(*git_dir, "git.exe")
+    git_exe.parent.mkdir(parents=True, exist_ok=True)
+    git_exe.write_text("")
+
+    with patch("workspace.shutil.which", return_value=str(git_exe)):
+        assert workspace._git_bash_dir("whatever") == str((root / "usr" / "bin").resolve())
+
+
+def test_git_bash_dir_does_not_walk_past_the_limit(tmp_path):
+    """A usr/bin/bash.exe more than _GIT_BASH_ANCESTOR_LIMIT levels above
+    git.exe belongs to something else (an MSYS2 root, say), not this git."""
+    (tmp_path / "usr" / "bin").mkdir(parents=True)
+    (tmp_path / "usr" / "bin" / "bash.exe").write_text("")
+    deep = tmp_path.joinpath(*(["d"] * workspace._GIT_BASH_ANCESTOR_LIMIT), "git.exe")
+    deep.parent.mkdir(parents=True)
+    deep.write_text("")
+
+    with patch("workspace.shutil.which", return_value=str(deep)):
+        assert workspace._git_bash_dir("whatever") is None
+
+
 def test_prefer_git_bash_adds_it_when_there_is_no_bash_at_all(tmp_path):
     git_root = _git_for_windows(tmp_path / "Git")
     git_cmd = str(git_root / "cmd")
@@ -828,6 +888,46 @@ def test_ci_check_env_applies_the_git_bash_preference(tmp_path, monkeypatch):
     assert env["PATH"] == "git-bash;original"
 
 
+def test_ci_check_env_orders_venv_then_git_bash_then_the_original_path(
+    tmp_path, monkeypatch
+):
+    """End to end through the real _prefer_git_bash (#553): the venv's
+    scripts must come first, Git Bash's usr/bin next, then the inherited
+    PATH - swapping the two prepends in ci_check_env must fail this.
+
+    _prefer_git_bash is still the real function; only its is_windows
+    default is pinned to True, because ci_check_env takes the platform from
+    os.name and this runs on Linux CI too."""
+    git_root = _git_for_windows(tmp_path / "Git")
+    system32 = str(tmp_path / "Windows" / "System32")
+    git_cmd = str(git_root / "cmd")
+    monkeypatch.setenv("PATH", os.pathsep.join((system32, git_cmd)))
+    which = _fake_which(
+        {
+            (system32, "bash"): system32 + os.sep + "bash.exe",
+            (git_cmd, "git"): str(git_root / "cmd" / "git.exe"),
+        }
+    )
+    venv = tmp_path / "venv"
+    real_prefer = workspace._prefer_git_bash
+
+    with (
+        patch("workspace.shutil.which", side_effect=which),
+        patch(
+            "workspace._prefer_git_bash",
+            side_effect=lambda path: real_prefer(path, is_windows=True),
+        ),
+    ):
+        env = ci_check_env(str(tmp_path), home=str(tmp_path / "home"), venv_dir=str(venv))
+
+    assert env["PATH"].split(os.pathsep) == [
+        str(workspace._venv_scripts_dir(venv)),
+        str((git_root / "usr" / "bin").resolve()),
+        system32,
+        git_cmd,
+    ]
+
+
 # --- workflow steps: shell lookup on the child's PATH, NUL-free output --------
 
 
@@ -837,6 +937,16 @@ def test_resolve_on_path_uses_the_childs_path(tmp_path):
 
     which.assert_called_once_with("bash", path="child-path")
     assert resolved == ["/git/usr/bin/bash", "-c"]
+
+
+@pytest.mark.parametrize("env", [{}, {"PATH": None}])
+def test_resolve_on_path_never_falls_back_to_this_processs_path(env):
+    """shutil.which(path=None) would search *this* process's PATH - the bug
+    _resolve_on_path exists to fix - so a child env without PATH leaves the
+    command alone and which is never asked (#558)."""
+    with patch("workspace.shutil.which", return_value="/parent/bin/bash") as which:
+        assert workspace._resolve_on_path(["bash", "-c"], env) == ["bash", "-c"]
+    which.assert_not_called()
 
 
 def test_resolve_on_path_leaves_an_explicit_path_or_an_unknown_name_alone():
@@ -870,8 +980,14 @@ def test_new_workflow_step_runs_the_shell_found_on_the_childs_path(tmp_path):
             str(tmp_path), "diff", None, timeout=30
         )
 
-    assert captured["argv"][0] == "/git/usr/bin/bash"
-    assert captured["argv"][-1] == "echo hi"
+    # The whole argv, not just its ends (#559): rewriting argv[0] must keep
+    # the shell flags (-eo pipefail -c) in place and the body as one arg.
+    assert captured["argv"] == [
+        "/git/usr/bin/bash",
+        *workspace._SHELL_COMMANDS[None][1:],
+        "echo hi",
+    ]
+    assert captured["argv"][1:4] == ["-eo", "pipefail", "-c"]
     assert not passed
     assert "\x00" not in output and "outerr" in output
 

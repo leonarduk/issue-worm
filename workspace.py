@@ -1934,14 +1934,28 @@ def _is_wsl_bash_launcher(bash: str) -> bool:
     return "system32" in parts or "windowsapps" in parts
 
 
+# How many directories above the resolved git.exe _git_bash_dir looks for
+# the install root (the one holding usr/bin/bash.exe). Every Git for Windows
+# layout that can put a git.exe on PATH is covered (#551):
+#
+#   Git/cmd/git.exe, Git/bin/git.exe        -> root is 2 levels up
+#   Git/mingw64/bin/git.exe                 -> 3 levels up
+#   Git/mingw64/libexec/git-core/git.exe    -> 4 levels up
+#
+# It stays bounded rather than walking to the drive root so an unrelated
+# usr/bin/bash.exe high above a vendored git (an MSYS2 or Cygwin root, say)
+# is never picked up by accident.
+_GIT_BASH_ANCESTOR_LIMIT = 4
+
+
 def _git_bash_dir(path: str) -> str | None:
     """Git for Windows' ``usr/bin`` (where its ``bash.exe`` lives), found
-    from the ``git`` on ``path`` - which sits in ``Git/cmd``, ``Git/bin`` or
-    ``Git/mingw64/bin`` depending on the install - or None."""
+    from the ``git`` on ``path`` by looking up to
+    :data:`_GIT_BASH_ANCESTOR_LIMIT` directories above it, or None."""
     git = shutil.which("git", path=path)
     if not git:
         return None
-    for ancestor in list(Path(git).resolve().parents)[:3]:
+    for ancestor in list(Path(git).resolve().parents)[:_GIT_BASH_ANCESTOR_LIMIT]:
         candidate = ancestor / "usr" / "bin"
         if (candidate / "bash.exe").is_file():
             return str(candidate)
@@ -2124,11 +2138,19 @@ def _resolve_on_path(command: list[str], env: dict[str, str]) -> list[str]:
     puts in the child's PATH never reached a workflow step's ``bash``, which
     still hit the WSL launcher. Unchanged when the name is already a path or
     isn't found there (the run then fails the normal way).
+
+    Also unchanged when ``env`` has no ``PATH`` at all (#558):
+    ``shutil.which(path=None)`` would fall back to *this* process's PATH -
+    the very lookup this exists to avoid - so the child's missing PATH is
+    treated as "not found there" instead.
     """
     program = command[0]
     if os.path.basename(program) != program:
         return command
-    resolved = shutil.which(program, path=env.get("PATH"))
+    child_path = env.get("PATH")
+    if child_path is None:
+        return command
+    resolved = shutil.which(program, path=child_path)
     return [resolved, *command[1:]] if resolved else command
 
 
