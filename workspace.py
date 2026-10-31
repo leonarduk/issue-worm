@@ -520,6 +520,20 @@ def _strip_edge_fences(text: str) -> str:
     return "\n".join(lines)
 
 
+def _strip_fence_and_trailing_newlines(text: str) -> str:
+    """``text`` without a wrapping Markdown fence and with no trailing
+    newline - the normalization MODE: DIFF and MODE: FULL bodies share (#605).
+
+    It deliberately returns *no* trailing newline, and each consumer adds
+    exactly the one it needs: :func:`_extract_diff` appends ``"\n"`` because
+    ``git apply`` wants newline-terminated patch text, and
+    :func:`apply_file_change` appends it when writing a MODE: FULL file. So
+    both paths end in exactly one newline however the model ended its reply
+    (blank lines before the closing fence, no newline after it, ...).
+    """
+    return _strip_edge_fences(text).rstrip("\n")
+
+
 def _extract_diff(body: str, path: str | None = None) -> str | None:
     """Pull the unified-diff hunk out of a MODE: DIFF section's body.
 
@@ -562,8 +576,7 @@ def _extract_diff(body: str, path: str | None = None) -> str | None:
     # Drop a Markdown fence line wrapping the block (issue #248): the
     # Coder's ```diff / ``` wrapper is not diff syntax, and handing it to
     # git apply produces a "corrupt patch" error.
-    diff_text = _strip_edge_fences(diff_text)
-    return diff_text.rstrip("\n") + "\n"
+    return _strip_fence_and_trailing_newlines(diff_text) + "\n"
 
 
 def _split_sections(output: str) -> list[tuple[str, str, str, str | None]]:
@@ -1137,7 +1150,7 @@ def parse_coder_output(output: str, declared_files: list[str]) -> list[FileChang
             # Blank lines before the closing fence survive the strip, which
             # left a fenced body with more than one trailing newline in the
             # written file (apply_file_change adds the final one itself).
-            body = _strip_edge_fences(body).rstrip("\n")
+            body = _strip_fence_and_trailing_newlines(body)
             if not body.strip():
                 # A body that was nothing but a fence (e.g. "```python\n```")
                 # strips to nothing. Writing that would silently truncate an
