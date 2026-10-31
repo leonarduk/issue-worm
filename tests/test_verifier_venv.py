@@ -1,6 +1,7 @@
 """Tests for the verifier's isolated per-target venv (workspace.ensure_verifier_venv)
 and how ci_check_env / run_ci_checks use it."""
 
+import logging
 import os
 import subprocess
 import sys
@@ -634,6 +635,108 @@ def test_node_deps_stamps_a_project_with_no_dependencies(tmp_path, node_deps_on)
         workspace.ensure_node_deps(str(repo))
 
     step.assert_called_once()
+
+
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:  # e.g. Windows without the privilege
+        pytest.skip(f"cannot create a directory symlink here: {exc}")
+
+
+def test_node_deps_never_installs_through_a_symlinked_subdirectory(
+    tmp_path, node_deps_on
+):
+    """A symlinked subdirectory may point outside the checkout; npm ci there
+    would run lifecycle scripts from a tree the repo does not own (#544)."""
+    repo = _node_repo(tmp_path / "repo")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "package.json").write_text('{"name": "x"}\n', encoding="utf-8")
+    (outside / "package-lock.json").write_text('{"lockfileVersion": 3}\n', encoding="utf-8")
+    (outside / ".gitignore").write_text("node_modules\n", encoding="utf-8")
+    _symlink_or_skip(repo / "linked", outside)
+
+    assert [d.name for d in workspace._node_project_dirs(repo.resolve())] == ["frontend"]
+    with (
+        patch("workspace.shutil.which", return_value="/usr/bin/npm"),
+        patch("workspace._run_venv_setup_step", side_effect=_fake_npm_ci) as step,
+    ):
+        assert workspace.ensure_node_deps(str(repo)) == []
+
+    assert [Path(c.args[1]).name for c in step.call_args_list] == ["frontend"]
+    assert not (outside / "node_modules").exists()
+
+
+def test_node_deps_in_a_directory_that_is_not_a_git_checkout(
+    tmp_path, node_deps_on, caplog
+):
+    """Real git, no mock: outside a checkout ``git check-ignore`` exits 128,
+    so every candidate is skipped with a logged warning and nothing installs
+    (#546). Notes are for npm problems the checks will trip over; this is
+    reported in the log, and the return value stays empty."""
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "package.json").write_text('{"name": "fe"}\n', encoding="utf-8")
+    (frontend / "package-lock.json").write_text('{"lockfileVersion": 3}\n', encoding="utf-8")
+    (frontend / ".gitignore").write_text("node_modules\n", encoding="utf-8")
+    with (
+        # Stop git from discovering a checkout in some ancestor of tmp_path.
+        patch.dict(os.environ, {"GIT_CEILING_DIRECTORIES": str(tmp_path.parent)}),
+        patch("workspace.shutil.which", return_value="/usr/bin/npm"),
+        patch("workspace._run_venv_setup_step") as step,
+        caplog.at_level(logging.WARNING, logger="workspace"),
+    ):
+        assert workspace._node_project_dirs(tmp_path.resolve())  # git IS consulted
+        assert workspace.ensure_node_deps(str(tmp_path)) == []
+
+    step.assert_not_called()
+    assert "could not tell whether its node_modules is gitignored" in caplog.text
+    assert "frontend" in caplog.text
+
+
+@pytest.mark.parametrize("stamp", ["", "0" * 32, "not a digest\n"])
+def test_node_deps_reinstalls_over_a_corrupt_or_truncated_stamp(
+    tmp_path, node_deps_on, stamp
+):
+    """The stamp is the only thing that skips npm ci; one that does not
+    match the manifests' digest exactly must count as a cache miss (#547)."""
+    repo = _node_repo(tmp_path)
+
+    with (
+        patch("workspace.shutil.which", return_value="/usr/bin/npm"),
+        patch("workspace._run_venv_setup_step", side_effect=_fake_npm_ci) as step,
+    ):
+        assert workspace.ensure_node_deps(str(repo)) == []
+        stamp_path = repo / "frontend" / "node_modules" / workspace._NODE_DEPS_STAMP
+        digest = stamp_path.read_text(encoding="utf-8")
+        stamp_path.write_text(stamp, encoding="utf-8")
+        assert workspace.ensure_node_deps(str(repo)) == []
+
+    assert step.call_count == 2
+    assert stamp_path.read_text(encoding="utf-8") == digest  # re-stamped
+
+
+def test_node_deps_reinstalls_when_the_stamp_cannot_be_read(tmp_path, node_deps_on):
+    """An unreadable stamp (the ``except OSError`` branch) is a cache miss,
+    not a hit and not an error (#547)."""
+    repo = _node_repo(tmp_path)
+    real_read_text = Path.read_text
+
+    def read_text(self, *args, **kwargs):
+        if self.name == workspace._NODE_DEPS_STAMP:
+            raise OSError("I/O error")
+        return real_read_text(self, *args, **kwargs)
+
+    with (
+        patch("workspace.shutil.which", return_value="/usr/bin/npm"),
+        patch("workspace._run_venv_setup_step", side_effect=_fake_npm_ci) as step,
+    ):
+        workspace.ensure_node_deps(str(repo))
+        with patch.object(Path, "read_text", read_text):
+            assert workspace.ensure_node_deps(str(repo)) == []
+
+    assert step.call_count == 2
 
 
 # --- Git Bash over a WSL bash.exe launcher (workspace._prefer_git_bash) -------
