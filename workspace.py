@@ -3047,21 +3047,31 @@ def changed_paths_from_diff(diff_output: str) -> list[str]:
     each side unambiguously and override the header's guess.
     """
     paths: list[str] = []
+    # Per diff block: the header's guess, replaced wholesale by the block's
+    # rename lines when it has them - an unquoted rename whose old name
+    # contains " b/" (a/x b/y.txt b/z.txt) is the one header no split can
+    # read, and its guess must not linger next to the real paths.
+    header: list[str] = []
+    renamed: dict[str, str] = {}
 
-    def add(path: str) -> None:
-        if path and path not in paths:
-            paths.append(path)
+    def flush() -> None:
+        sides = (
+            [renamed.get("from", ""), renamed.get("to", "")] if renamed else header
+        )
+        for path in sides:
+            if path and path not in paths:
+                paths.append(path)
 
     for line in diff_output.splitlines():
         if line.startswith("diff --git "):
+            flush()
             parsed = _diff_header_paths(line[len("diff --git ") :])
-            if parsed:
-                for path in parsed:
-                    add(path)
+            header, renamed = (list(parsed) if parsed else []), {}
         elif line.startswith("rename from "):
-            add(_git_unquote(line[len("rename from ") :]))
+            renamed["from"] = _git_unquote(line[len("rename from ") :])
         elif line.startswith("rename to "):
-            add(_git_unquote(line[len("rename to ") :]))
+            renamed["to"] = _git_unquote(line[len("rename to ") :])
+    flush()
     return paths
 
 

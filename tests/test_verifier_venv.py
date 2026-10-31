@@ -1209,6 +1209,14 @@ def test_changed_paths_from_diff_rename_to_a_quoted_name(tmp_path):
     assert workspace.changed_paths_from_diff(diff) == ["old name.txt", "docs/néw name.txt"]
 
 
+def test_changed_paths_from_diff_unquoted_rename_with_an_embedded_b_slash(tmp_path):
+    """``a/x b/y.txt b/z.txt`` can't be split from the header alone; the
+    rename lines must *replace* the header's guess, not sit beside it."""
+    diff = _real_git_diff(tmp_path, [], rename=("x b/y.txt", "z.txt"))
+    assert "diff --git a/x b/y.txt b/z.txt" in diff  # really unquoted
+    assert workspace.changed_paths_from_diff(diff) == ["x b/y.txt", "z.txt"]
+
+
 @pytest.mark.parametrize(
     ("token", "expected"),
     [
