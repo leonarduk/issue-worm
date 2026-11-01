@@ -582,6 +582,65 @@ def test_review_workflow_validates_pins_file_refs(tmp_path, key, line, expected)
     assert result.stdout.strip("\n") == expected
 
 
+def _update_workflow_ref_reader() -> str:
+    """update-dependencies.yml's CICAID_PIN=$(...) reader, read out of it."""
+    text = WORKFLOW.read_text(encoding="utf-8")
+    match = re.search(r"^\s*CICAID_PIN=\$\((.*)\)\s*$", text, re.MULTILINE)
+    assert match, f"no CICAID_PIN=$(...) assignment found in {WORKFLOW}"
+    return match.group(1)
+
+
+def test_update_workflow_reads_the_pin_exactly_as_the_review_workflow_does():
+    """The smoke install pairs the new cicaid-devtools-pro with the
+    cicaid-devtools pin the review workflow installs, so it must read that
+    pin with the same command: same validation, same first-line rule. Its
+    old grep -oP exited silently on no match and returned every line on
+    duplicates (#152, #164)."""
+    assert _update_workflow_ref_reader() == _review_workflow_ref_reader("CICAID_REF")
+
+
+def test_update_workflow_fails_clearly_when_no_valid_pin_is_found():
+    """An empty read stops the step with the reason (#152), not a pip
+    error about `git+https://...cicaid.git@` with no ref."""
+    text = WORKFLOW.read_text(encoding="utf-8")
+    reader_at = text.index("CICAID_PIN=$(")
+    after = text[reader_at:]
+    assert after.index('if [ -z "${CICAID_PIN}" ]; then') < after.index("pip install")
+    assert "::error::no valid CICAID_REF=<tag> line in $PINS" in after
+
+
+@pytest.mark.skipif(
+    shutil.which("bash") is None or shutil.which("awk") is None,
+    reason="needs bash and awk, as the workflow's ubuntu runner has",
+)
+@pytest.mark.parametrize(
+    ("lines", "expected"),
+    [
+        ("CICAID_REF=v1.0.0\nCICAID_REF=v2.0.0\n", "v1.0.0"),
+        ("CICAID_REF=v1.0.0\r\nCICAID_REF=v2.0.0\r\n", "v1.0.0"),
+        # Only the first line counts; a valid later one doesn't rescue an
+        # invalid first one, so the [ -z ] check fails it.
+        ("CICAID_REF=garbage\nCICAID_REF=v2.0.0\n", ""),
+    ],
+    ids=["lf", "crlf", "first-invalid"],
+)
+def test_pin_reader_takes_only_the_first_line_of_duplicates(tmp_path, lines, expected):
+    """Duplicate CICAID_REF lines yield one deterministic value, never a
+    multi-line one interpolated into a pip URL (#164)."""
+    pins = tmp_path / "cicaid-pins.env"
+    pins.write_bytes(f"# header\n{lines}CICAID_PRO_REF=v7.7.7\n".encode("utf-8"))
+
+    result = subprocess.run(
+        ["bash", "-c", _review_workflow_ref_reader("CICAID_REF")],
+        env={**os.environ, "PINS": str(pins)},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert result.stdout == (f"{expected}\n" if expected else "")
+
+
 def test_script_imports_only_stdlib():
     """The helper must stay stdlib-only: it runs when pins are stale/broken,
     so it must never import cicaid-devtools or any project module."""

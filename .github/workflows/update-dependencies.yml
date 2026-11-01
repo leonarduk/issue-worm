@@ -183,12 +183,19 @@ jobs:
           # can't resolve that dependency and 404s looking for it there.
           # _ai-pr-review.yml's real install works because it passes both
           # packages' git+https URLs to one pip invocation, same as here --
-          # reading the cicaid-devtools pin from the same pins file it does.
-          # The trailing (?=\r?$) anchor keeps a malformed value from being
-          # read as its valid prefix: without it "mainline" would yield
-          # "main" and install a ref the pins file never named. This is the
-          # same ref pattern scripts/update_dependency_pins.py matches.
-          CICAID_PIN=$(grep -oP '^CICAID_REF=\K(?:main|v[0-9][A-Za-z0-9.+-]*)(?=\r?$)' .github/cicaid-pins.env)
+          # reading the cicaid-devtools pin from the same pins file, with the
+          # very same reader (tests/test_update_dependency_pins.py holds the
+          # two identical): only "main" or a v-prefixed tag, the first
+          # CICAID_REF line only, CRLF tolerated. Anything else reads as
+          # empty and fails here with the reason, rather than as a pip
+          # error about a malformed git URL several lines later (#152) or
+          # a multi-line value from duplicate lines (#164).
+          PINS=".github/cicaid-pins.env"
+          CICAID_PIN=$(awk '/^CICAID_REF=/{v=substr($0, index($0, "=") + 1); sub(/\r$/, "", v); if (v == "main" || v ~ /^v[0-9][A-Za-z0-9.+-]*$/) print v; exit}' "$PINS" | tr -d '\r' || true)
+          if [ -z "${CICAID_PIN}" ]; then
+            echo "::error::no valid CICAID_REF=<tag> line in $PINS (expected main or vX.Y.Z), so there is no cicaid-devtools ref to smoke-install cicaid-devtools-pro against." >&2
+            exit 1
+          fi
           PRO_REF="v${{ steps.check.outputs.new_version }}"
           bash .github/scripts/pip_install_cicaid_pro.sh python -m pip install \
             "cicaid-devtools @ git+https://github.com/leonarduk/cicaid.git@${CICAID_PIN}" \
