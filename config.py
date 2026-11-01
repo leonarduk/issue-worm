@@ -6,7 +6,7 @@ Loads settings for model providers, coder targets, and workspace paths.
 import logging
 import os
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -44,6 +44,52 @@ DEFAULT_MCP_TIMEOUT_SECONDS = 10
 DEFAULT_MCP_MAX_DOC_CHARS = 8000
 
 
+# DeepSeek's API is OpenAI-compatible, so CODER_MODEL_SOURCE=cloud reuses
+# coder.RemoteOpenAICoder with these as its provider defaults; both are
+# overridable via DEEPSEEK_ENDPOINT / DEEPSEEK_MODEL (see
+# remote_coder_settings_from_env). coder.py re-exports them under the same
+# names.
+DEFAULT_DEEPSEEK_ENDPOINT = "https://api.deepseek.com"
+DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
+
+
+@dataclass(frozen=True)
+class RemoteCoderSettings:
+    """The coder settings for CODER_MODEL_SOURCE=remote and =cloud.
+
+    Read from the environment here, in config.py, like every other setting
+    (#223) - coder.build_coder takes them from the RoleConfig it is given
+    rather than calling os.getenv itself. Global, not role-prefixed: a
+    generic OpenAI-compatible endpoint or a DeepSeek account isn't a
+    per-role concept the way an Ollama host pool is.
+
+    The remote_* values have no default (build_coder rejects a `remote`
+    role missing any of them); the DeepSeek endpoint and model fall back to
+    the provider defaults above. API keys are kept out of repr so a logged
+    RoleConfig can't leak them.
+    """
+
+    remote_endpoint: Optional[str] = None
+    remote_api_key: Optional[str] = field(default=None, repr=False)
+    remote_model: Optional[str] = None
+    deepseek_api_key: Optional[str] = field(default=None, repr=False)
+    deepseek_endpoint: str = DEFAULT_DEEPSEEK_ENDPOINT
+    deepseek_model: str = DEFAULT_DEEPSEEK_MODEL
+
+
+def remote_coder_settings_from_env() -> RemoteCoderSettings:
+    """RemoteCoderSettings from REMOTE_LLM_* / DEEPSEEK_*. As before #223, an
+    empty value counts as unset (falling back to the default, or to None)."""
+    return RemoteCoderSettings(
+        remote_endpoint=os.getenv("REMOTE_LLM_ENDPOINT") or None,
+        remote_api_key=os.getenv("REMOTE_LLM_API_KEY") or None,
+        remote_model=os.getenv("REMOTE_LLM_MODEL") or None,
+        deepseek_api_key=os.getenv("DEEPSEEK_API_KEY") or None,
+        deepseek_endpoint=os.getenv("DEEPSEEK_ENDPOINT") or DEFAULT_DEEPSEEK_ENDPOINT,
+        deepseek_model=os.getenv("DEEPSEEK_MODEL") or DEFAULT_DEEPSEEK_MODEL,
+    )
+
+
 @dataclass
 class RoleConfig:
     """Configuration for a specific role (coder, analyser, triage)."""
@@ -68,6 +114,12 @@ class RoleConfig:
     mcp_tool_name: str = DEFAULT_MCP_TOOL_NAME
     mcp_timeout_seconds: int = DEFAULT_MCP_TIMEOUT_SECONDS
     mcp_max_doc_chars: int = DEFAULT_MCP_MAX_DOC_CHARS
+    # Read from the environment when not given, so a RoleConfig built by
+    # hand (tests, callers outside load_config) behaves as one from
+    # load_config does. repr=False: it carries API keys.
+    remote: RemoteCoderSettings = field(
+        default_factory=remote_coder_settings_from_env, repr=False
+    )
 
 
 def load_config() -> dict:
@@ -310,6 +362,7 @@ def _load_role_config(role_prefix: str) -> RoleConfig:
         mcp_tool_name=os.getenv("MCP_TOOL_NAME") or DEFAULT_MCP_TOOL_NAME,
         mcp_timeout_seconds=_env_int("MCP_TIMEOUT_SECONDS", DEFAULT_MCP_TIMEOUT_SECONDS),
         mcp_max_doc_chars=_env_int("MCP_MAX_DOC_CHARS", DEFAULT_MCP_MAX_DOC_CHARS),
+        remote=remote_coder_settings_from_env(),
     )
 
 

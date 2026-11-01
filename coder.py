@@ -21,12 +21,13 @@ raise, any failure is logged and reported back as `""`):
   server — see `build_coder`).
 
 `build_coder` is the factory that picks between them (and the
-not-yet-implemented `claude` source) based on a role's `model_source`,
-reading `REMOTE_LLM_ENDPOINT` / `REMOTE_LLM_MODEL` / `REMOTE_LLM_API_KEY`,
-`DEEPSEEK_API_KEY` / `DEEPSEEK_MODEL`, or `LMSTUDIO_ENDPOINT` /
-`LMSTUDIO_MODEL` from the environment — see `.env-example-openai` /
-`.env-example-deepseek` / `.env-example-lmstudio` in issue-worm-pro for the
-env vars these are meant to match.
+not-yet-implemented `claude` source) based on a role's `model_source`.
+`REMOTE_LLM_ENDPOINT` / `REMOTE_LLM_MODEL` / `REMOTE_LLM_API_KEY` and
+`DEEPSEEK_API_KEY` / `DEEPSEEK_ENDPOINT` / `DEEPSEEK_MODEL` are read by
+`config.py` and arrive on the role's `RoleConfig.remote`;
+`LMSTUDIO_ENDPOINT` / `LMSTUDIO_MODEL` are still read here. See
+`.env-example-openai` / `.env-example-deepseek` / `.env-example-lmstudio`
+in issue-worm-pro for the env vars these are meant to match.
 """
 
 from __future__ import annotations
@@ -38,7 +39,12 @@ from typing import Protocol
 
 import requests
 
-from config import _env_int
+from config import (  # noqa: F401 - DEFAULT_DEEPSEEK_* re-exported for callers
+    DEFAULT_DEEPSEEK_ENDPOINT,
+    DEFAULT_DEEPSEEK_MODEL,
+    _env_int,
+    remote_coder_settings_from_env,
+)
 from workspace import MODE_EDIT, MODE_FULL, sanitize_file_path
 
 logger = logging.getLogger(__name__)
@@ -50,13 +56,6 @@ DEFAULT_OLLAMA_MODEL = "qwen2.5-coder"
 # the fallback for direct construction (tests, or a Coder built by hand).
 REQUEST_TIMEOUT_SECONDS = 300
 
-# DeepSeek's API is itself OpenAI-compatible (see .env-example-deepseek in
-# issue-worm-pro), so CODER_MODEL_SOURCE=cloud reuses RemoteOpenAICoder with
-# these as its provider default rather than needing a separate coder class.
-# Both are overridable via DEEPSEEK_ENDPOINT / DEEPSEEK_MODEL (build_coder's
-# `cloud` branch) - these are only the fallback when unset.
-DEFAULT_DEEPSEEK_ENDPOINT = "https://api.deepseek.com"
-DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
 # Output-token cap sent as `max_tokens` for CODER_MODEL_SOURCE=cloud. Left
 # unset, the provider applies its own (much smaller) default, and a
 # multi-file FULL rewrite is silently cut off mid-file - the Coder output
@@ -455,8 +454,12 @@ def build_coder(role_config) -> Coder:
             not implemented here yet.
     """
     model_source = getattr(role_config, "model_source", "local")
+    # REMOTE_LLM_* / DEEPSEEK_* arrive through config.py (#223), on the
+    # role's RoleConfig; something RoleConfig-shaped without them gets the
+    # same values config.py would have read.
+    remote = getattr(role_config, "remote", None) or remote_coder_settings_from_env()
     # Global, not role-prefixed - one HTTP timeout for whichever coder this
-    # factory returns, same as REMOTE_LLM_*/DEEPSEEK_* below.
+    # factory returns.
     timeout = _env_int("CODER_REQUEST_TIMEOUT_SECONDS", REQUEST_TIMEOUT_SECONDS)
     # Only the OpenAI-compatible coders send max_tokens; don't parse (or
     # warn about) CODER_MAX_TOKENS for a source that never uses it.
@@ -505,23 +508,20 @@ def build_coder(role_config) -> Coder:
         )
 
     if model_source == "remote":
-        # REMOTE_LLM_* are global, not role-prefixed (like config.py's
-        # MCP_* vars) — a generic OpenAI-compatible endpoint isn't a
-        # per-role concept the way an Ollama host pool is.
-        endpoint = os.getenv("REMOTE_LLM_ENDPOINT")
+        endpoint = remote.remote_endpoint
         if not endpoint:
             raise CoderConfigError(
                 "CODER_MODEL_SOURCE=remote requires REMOTE_LLM_ENDPOINT to "
                 "be set (e.g. https://api.openai.com) — see "
                 "issue-worm-pro's .env-example-openai."
             )
-        api_key = os.getenv("REMOTE_LLM_API_KEY")
+        api_key = remote.remote_api_key
         if not api_key:
             raise CoderConfigError(
                 "CODER_MODEL_SOURCE=remote requires REMOTE_LLM_API_KEY to "
                 "be set — see issue-worm-pro's .env-example-openai."
             )
-        model = os.getenv("REMOTE_LLM_MODEL")
+        model = remote.remote_model
         if not model:
             raise CoderConfigError(
                 "CODER_MODEL_SOURCE=remote requires REMOTE_LLM_MODEL to be "
@@ -542,15 +542,15 @@ def build_coder(role_config) -> Coder:
         # is itself OpenAI-compatible, so it reuses RemoteOpenAICoder with
         # a provider default endpoint/model instead of a bespoke class —
         # see the module docstring and issue-worm-pro#590's report).
-        api_key = os.getenv("DEEPSEEK_API_KEY")
+        api_key = remote.deepseek_api_key
         if not api_key:
             raise CoderConfigError(
                 "CODER_MODEL_SOURCE=cloud requires DEEPSEEK_API_KEY to be "
                 "set — see issue-worm-pro's .env-example-deepseek. (cloud "
                 "currently only supports DeepSeek.)"
             )
-        endpoint = os.getenv("DEEPSEEK_ENDPOINT") or DEFAULT_DEEPSEEK_ENDPOINT
-        model = os.getenv("DEEPSEEK_MODEL") or DEFAULT_DEEPSEEK_MODEL
+        endpoint = remote.deepseek_endpoint
+        model = remote.deepseek_model
         return RemoteOpenAICoder(
             endpoint=endpoint,
             model=model,

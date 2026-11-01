@@ -24,7 +24,7 @@ from coder import (
     _default_ollama_model,
     build_coder,
 )
-from config import RoleConfig
+from config import RemoteCoderSettings, RoleConfig
 from workspace import MODE_EDIT, MODE_FULL
 
 
@@ -669,6 +669,52 @@ def test_build_coder_cloud_uses_deepseek_default_endpoint_and_model(monkeypatch)
     assert coder.endpoint == DEFAULT_DEEPSEEK_ENDPOINT
     assert coder.model == DEFAULT_DEEPSEEK_MODEL
     assert coder.api_key == "sk-test"
+
+
+def test_build_coder_takes_remote_settings_from_config_not_the_environment(monkeypatch):
+    """build_coder reads REMOTE_LLM_* from the RoleConfig config.py built,
+    never from os.environ itself (#223): with both set, config wins."""
+    monkeypatch.setenv("REMOTE_LLM_ENDPOINT", "https://env.example")
+    monkeypatch.setenv("REMOTE_LLM_API_KEY", "sk-env")
+    monkeypatch.setenv("REMOTE_LLM_MODEL", "env-model")
+    role = RoleConfig(
+        model_source="remote",
+        remote=RemoteCoderSettings(
+            remote_endpoint="https://config.example",
+            remote_api_key="sk-config",
+            remote_model="config-model",
+        ),
+    )
+
+    coder = build_coder(role)
+
+    assert (coder.endpoint, coder.model, coder.api_key) == (
+        "https://config.example",
+        "config-model",
+        "sk-config",
+    )
+
+
+def test_build_coder_takes_deepseek_settings_from_config_not_the_environment(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-env")
+    monkeypatch.setenv("DEEPSEEK_ENDPOINT", "https://env.example")
+    monkeypatch.setenv("DEEPSEEK_MODEL", "env-model")
+    role = RoleConfig(
+        model_source="cloud",
+        remote=RemoteCoderSettings(
+            deepseek_api_key="sk-config",
+            deepseek_endpoint="https://config.example",
+            deepseek_model="config-model",
+        ),
+    )
+
+    coder = build_coder(role)
+
+    assert (coder.endpoint, coder.model, coder.api_key) == (
+        "https://config.example",
+        "config-model",
+        "sk-config",
+    )
 
 
 def test_build_coder_cloud_model_override(monkeypatch):

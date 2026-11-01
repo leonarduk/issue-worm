@@ -6,7 +6,10 @@ import pytest
 
 from config import (
     CoderTarget,
+    DEFAULT_DEEPSEEK_ENDPOINT,
+    DEFAULT_DEEPSEEK_MODEL,
     ConfigError,
+    RemoteCoderSettings,
     RoleConfig,
     TargetPool,
     _parse_coder_backend,
@@ -66,6 +69,63 @@ def test_load_config_reads_ollama_think_per_role(monkeypatch):
     assert config["analyser_config"].ollama_think is None
     assert get_role_env_vars(config["coder_config"])["OLLAMA_THINK"] == "true"
     assert "OLLAMA_THINK" not in get_role_env_vars(config["analyser_config"])
+
+
+_REMOTE_ENV = {
+    "REMOTE_LLM_ENDPOINT": "https://api.openai.com",
+    "REMOTE_LLM_API_KEY": "sk-remote",
+    "REMOTE_LLM_MODEL": "gpt-5",
+    "DEEPSEEK_API_KEY": "sk-deepseek",
+    "DEEPSEEK_ENDPOINT": "https://deepseek.internal.example",
+    "DEEPSEEK_MODEL": "deepseek-v4",
+}
+
+
+def test_load_config_reads_remote_coder_settings_from_env(monkeypatch):
+    """REMOTE_LLM_* / DEEPSEEK_* are read by config.py, the one place config
+    comes from (#223), and reach every role's RoleConfig."""
+    for key, value in _REMOTE_ENV.items():
+        monkeypatch.setenv(key, value)
+
+    config = load_config()
+
+    assert config["coder_config"].remote == RemoteCoderSettings(
+        remote_endpoint="https://api.openai.com",
+        remote_api_key="sk-remote",
+        remote_model="gpt-5",
+        deepseek_api_key="sk-deepseek",
+        deepseek_endpoint="https://deepseek.internal.example",
+        deepseek_model="deepseek-v4",
+    )
+    assert config["analyser_config"].remote == config["coder_config"].remote
+
+
+def test_load_config_remote_coder_settings_defaults_when_blank(monkeypatch):
+    """Blank counts as unset, as it did when build_coder read these itself:
+    no remote_* value, and DeepSeek's provider endpoint and model. Set blank
+    rather than deleted so the repo's own .env can't fill them in."""
+    for key in _REMOTE_ENV:
+        monkeypatch.setenv(key, "")
+
+    remote = load_config()["coder_config"].remote
+
+    assert remote.remote_endpoint is None
+    assert remote.remote_api_key is None
+    assert remote.remote_model is None
+    assert remote.deepseek_api_key is None
+    assert remote.deepseek_endpoint == DEFAULT_DEEPSEEK_ENDPOINT
+    assert remote.deepseek_model == DEFAULT_DEEPSEEK_MODEL
+
+
+def test_role_config_repr_never_shows_api_keys(monkeypatch):
+    for key, value in _REMOTE_ENV.items():
+        monkeypatch.setenv(key, value)
+
+    config = load_config()["coder_config"]
+
+    for text in (repr(config), repr(config.remote)):
+        assert "sk-remote" not in text
+        assert "sk-deepseek" not in text
 
 
 def test_load_config_defaults(monkeypatch):
