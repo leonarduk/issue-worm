@@ -3375,6 +3375,25 @@ def test_search_replace_indentation_tolerant_fallback_keeps_a_dedent_relative():
     assert text == "def f(x):\n    if x:\n        y = 2\n    log(y)\n    return y\n"
 
 
+def test_search_replace_indentation_tolerant_fallback_dedent_to_exactly_column_zero():
+    """The boundary of the dedent rule: a dedent equal to the matched
+    lines' own indentation lands at column 0 and is accepted."""
+    content = "if x:\n    y = 1\nz = 0\n"
+    body = (
+        "<<<<<<< SEARCH\n"
+        "        y = 1\n"
+        "=======\n"
+        "        y = 2\n"
+        "    w = 3\n"
+        ">>>>>>> REPLACE\n"
+    )
+
+    text, rung = _apply_search_replace(content, body, "a.py")
+
+    assert rung == "edit-indentation-tolerant"
+    assert text == "if x:\n    y = 2\nw = 3\nz = 0\n"
+
+
 def test_search_replace_indentation_tolerant_fallback_refuses_an_impossible_dedent():
     """A dedent deeper than the matched lines' own indentation has no right
     answer; fail the block instead of writing it at the wrong level."""
@@ -3439,6 +3458,11 @@ def test_search_replace_empty_search_creates_new_file_only():
     assert _apply_search_replace(None, body, "n.py") == ("new = 1\n", None)
     with pytest.raises(MalformedOutputError, match="empty SEARCH"):
         _apply_search_replace(SAMPLE, body, "a.py")
+    # Whitespace-only SEARCH text is "empty" too, so the fallback rungs
+    # (which index the matched lines) only ever see a non-empty block.
+    blank = "<<<<<<< SEARCH\n   \n\n=======\nnew = 1\n>>>>>>> REPLACE\n"
+    with pytest.raises(MalformedOutputError, match="empty SEARCH"):
+        _apply_search_replace(SAMPLE, blank, "a.py")
     with pytest.raises(MalformedOutputError, match="does not exist"):
         _apply_search_replace(
             None, "<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE\n", "n.py"
