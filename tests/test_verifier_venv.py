@@ -1412,4 +1412,4 @@ def test_venv_dir_folds_case_only_on_case_insensitive_platforms(
     upper = verifier_venv_dir(str(tmp_path / "Repo"))
     lower = verifier_venv_dir(str(tmp_path / "repo"))
 
-    assert (upper.name.split("-")[-1] == lower.name.split("-")[-1]) is shared
+    assert (upper == lower) is shared

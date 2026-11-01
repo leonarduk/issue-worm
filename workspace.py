@@ -2946,12 +2946,18 @@ def verifier_venv_dir(repo_path: str) -> Path:
     root = os.environ.get(VERIFIER_VENV_DIR_ENV) or str(
         Path.home() / ".issue-worm" / "verifier-venvs"
     )
-    key = hashlib.sha1(_venv_key_path(repo).encode("utf-8")).hexdigest()[:10]
-    return Path(root) / f"{repo.name}-{key}"
+    key_path = _venv_key_path(repo)
+    key = hashlib.sha1(key_path.encode("utf-8")).hexdigest()[:10]
+    # The name comes from the same folded path as the hash, so one checkout
+    # spelled two ways maps to one directory name too, not just one hash.
+    return Path(root) / f"{Path(key_path).name}-{key}"
 
 
 # Platforms whose default filesystem ignores case (NTFS, APFS/HFS+), where
-# "C:\Repo" and "c:\repo" are one checkout and must share one venv.
+# "C:\Repo" and "c:\repo" are one checkout and must share one venv. A Mac
+# on a case-sensitive APFS volume is the exception this accepts: there, two
+# checkouts differing only in case would still share one, as every
+# checkout on every platform did before #473.
 _CASE_INSENSITIVE_PLATFORMS = ("win32", "darwin")
 
 
