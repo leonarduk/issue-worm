@@ -14,7 +14,7 @@ import subprocess
 import sys
 import urllib.error
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import yaml
@@ -378,6 +378,33 @@ def test_http_json_names_a_rate_limit(code, headers):
 
     assert exc.value.status == code
     assert exc.value.__cause__ is original  # the HTTP response stays reachable (#773)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [urllib.error.URLError("Name or service not known"), TimeoutError("timed out")],
+    ids=["url-error", "timeout"],
+)
+def test_http_json_reports_no_status_for_a_transport_failure(failure):
+    """Only an HTTP response has a status: DNS failures, refused
+    connections and timeouts reach the OSError branch with status None
+    (#781), so latest_version never mistakes one for a 404."""
+    with patch("urllib.request.urlopen", side_effect=failure):
+        with pytest.raises(PinError) as exc:
+            _http_json("https://api.example.invalid")
+
+    assert exc.value.status is None
+
+
+def test_http_json_reports_no_status_for_an_unparseable_body():
+    """A 200 whose body isn't JSON reaches the ValueError branch: no status."""
+    response = MagicMock()
+    response.__enter__.return_value.read.return_value = b"<html>not json</html>"
+    with patch("urllib.request.urlopen", return_value=response):
+        with pytest.raises(PinError) as exc:
+            _http_json("https://api.example.invalid")
+
+    assert exc.value.status is None
 
 
 def test_http_json_reports_other_http_errors_with_their_status():
