@@ -1249,10 +1249,21 @@ def _every_hunk_has_a_preimage(diff_text: str) -> bool:
     hunks = re.split(r"(?m)^@@ .*$", diff_text)[1:]
     if not hunks:
         return False
-    return all(
-        any(line.startswith("-") and not line.startswith("---") for line in hunk.splitlines())
-        for hunk in hunks
-    )
+    return all(_hunk_removes_a_line(hunk.splitlines()) for hunk in hunks)
+
+
+def _hunk_removes_a_line(lines: list[str]) -> bool:
+    """True when a hunk body has a removed (`-`) line.
+
+    Every `-` line in a hunk body is a removal, including `---flag`, the
+    removal of a line whose content is `--flag` (#254). The old "not `---`"
+    guard misread that as a file header and denied a real preimage. No
+    exclusion is needed for a following file's `--- a/x` / `+++ b/x` header
+    either (#247): every apply rung passes `--recount`, under which git
+    itself reads those lines as part of the previous hunk, so a section
+    carrying a second file's diff never applies on any rung anyway.
+    """
+    return any(line.startswith("-") for line in lines)
 
 
 _APPLY_LADDER: tuple[tuple[str, tuple[str, ...]], ...] = (

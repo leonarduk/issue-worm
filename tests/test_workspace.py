@@ -33,6 +33,7 @@ from workspace import (
     _APPLY_LADDER,
     APPLY_CONTEXT0_ENV,
     _apply_ladder,
+    _every_hunk_has_a_preimage,
     CI_GIT_IDENTITY_NAME,
     apply_file_change,
     ci_check_env,
@@ -1306,6 +1307,137 @@ def test_apply_ladder_is_ordered_strictest_first_and_context_0_is_opt_in(monkeyp
     assert [rung for rung, _ in _apply_ladder()][-1] == "context-0"
     monkeypatch.setenv(APPLY_CONTEXT0_ENV, "0")
     assert _apply_ladder() == _APPLY_LADDER
+
+
+@pytest.mark.parametrize(
+    ("diff", "expected"),
+    [
+        ("@@ -1 +1 @@\n-a\n+b\n", True),
+        ("@@ -1,0 +1 @@\n+b\n", False),
+        # Mixed: one pure-addition hunk denies -C0 for the whole diff (#244).
+        ("@@ -1 +1 @@\n-a\n+b\n@@ -5,0 +6 @@\n+c\n", False),
+        ("@@ -1 +1 @@\n-a\n+b\n@@ -5 +5 @@\n-c\n+d\n", True),
+        # Removing a line whose content is `--flag` renders as `---flag` (#254).
+        ("@@ -1 +1 @@\n---flag\n+--other\n", True),
+        ("@@ -1 +1 @@\n-\n+b\n", True),
+        # `\ No newline at end of file` is not a removed line (#254).
+        ("@@ -1,0 +1 @@\n+b\n\\ No newline at end of file\n", False),
+        # A removed `-- x` next to an added `++ y` is still a removal (#247).
+        ("@@ -1 +1 @@\n--- x\n+++ y\n", True),
+        ("no hunks at all\n", False),
+    ],
+    ids=[
+        "replacement", "pure-addition", "mixed", "all-replacements",
+        "removed-double-dash", "removed-empty-line", "no-newline-marker",
+        "dash-dash-then-plus-plus", "no-hunks",
+    ],
+)
+def test_every_hunk_has_a_preimage(diff, expected):
+    assert _every_hunk_has_a_preimage("--- a/a.py\n+++ b/a.py\n" + diff) is expected
+
+
+def test_apply_refuses_a_section_carrying_a_second_files_diff(repo_with_context):
+    """Why _hunk_removes_a_line needs no file-header exclusion (#247):
+    every rung passes --recount, under which git reads a following file's
+    `---`/`+++` header as lines of the previous hunk. Even with correct
+    context everywhere, a two-file section applies on no rung."""
+    (Path(repo_with_context) / "b.py").write_text("import sys\n")
+    _run_git(repo_with_context, "add", "b.py")
+    _run_git(repo_with_context, "commit", "-q", "-m", "b")
+    body = (
+        "--- a/a.py\n+++ b/a.py\n"
+        "@@ -1,3 +1,3 @@\n # header\n-value = 1\n+value = 2\n # footer\n"
+        "--- a/b.py\n+++ b/b.py\n"
+        "@@ -1 +1,2 @@\n import sys\n+import os\n"
+    )
+
+    with pytest.raises(MalformedOutputError, match="does not apply"):
+        apply_file_change(repo_with_context, FileChange("a.py", "DIFF", body))
+    assert (Path(repo_with_context) / "b.py").read_text() == "import sys\n"
+
+
+@pytest.fixture
+def repo_with_wide_context(repo):
+    (Path(repo) / "a.py").write_text("# top\n# header\nvalue = 1\n# footer\n# bottom\n")
+    _run_git(repo, "add", "a.py")
+    _run_git(repo, "commit", "-q", "-m", "wide context")
+    return repo
+
+
+def test_apply_reaches_the_context_1_ignore_whitespace_rung(repo_with_wide_context):
+    """Wrong outer context defeats every full-context rung; whitespace
+    drift on the inner context defeats plain -C1. Only -C1 with
+    --ignore-whitespace applies it - so that rung is reachable (#240)."""
+    body = (
+        "--- a/a.py\n+++ b/a.py\n"
+        "@@ -1,5 +1,5 @@\n"
+        " # WRONG\n #  header\n-value = 1\n+value = 2\n #  footer\n # WRONG2\n"
+    )
+
+    rung = apply_file_change(repo_with_wide_context, FileChange("a.py", "DIFF", body))
+
+    assert rung == "context-1-ignore-whitespace"
+    assert (Path(repo_with_wide_context) / "a.py").read_text() == (
+        "# top\n# header\nvalue = 2\n# footer\n# bottom\n"
+    )
+
+
+def test_apply_skips_context_0_when_any_hunk_is_a_pure_addition(repo_with_context, monkeypatch):
+    """Opted in, a diff whose replacement hunk could anchor -C0 still
+    doesn't get it when another hunk only adds lines: that hunk would be
+    placed by line number alone (#240)."""
+    monkeypatch.setenv(APPLY_CONTEXT0_ENV, "1")
+    body = (
+        "--- a/a.py\n+++ b/a.py\n"
+        "@@ -1,3 +1,3 @@\n # not the header\n-value = 1\n+value = 2\n # not the footer\n"
+        "@@ -3,1 +3,2 @@\n # not the footer\n+# appended\n"
+    )
+
+    with pytest.raises(MalformedOutputError, match="does not apply"):
+        apply_file_change(repo_with_context, FileChange("a.py", "DIFF", body))
+    assert (Path(repo_with_context) / "a.py").read_text() == "# header\nvalue = 1\n# footer\n"
+
+
+def test_run_revision_attempt_keeps_recovery_when_a_later_file_fails_to_apply(repo_with_context):
+    """The apply-failure result still says how far recovery got: the first
+    file applied via a fallback rung, the second could not apply (#241)."""
+    (Path(repo_with_context) / "b.py").write_text("b = 1\n")
+    _run_git(repo_with_context, "add", "b.py")
+    _run_git(repo_with_context, "commit", "-q", "-m", "b")
+    start = get_current_commit(repo_with_context)
+    output = (
+        "=== FILE: a.py ===\n=== MODE: DIFF ===\n"
+        + _diff_for_a("#  header", "#  footer")
+        + "=== END FILE ===\n"
+        "=== FILE: b.py ===\n=== MODE: DIFF ===\n"
+        "--- a/b.py\n+++ b/b.py\n@@ -1 +1 @@\n-b = 999\n+b = 2\n"
+        "=== END FILE ===\n"
+    )
+
+    result = run_revision_attempt(repo_with_context, output, ["a.py", "b.py"], start_commit=start)
+
+    assert result.success is False
+    assert result.category == CATEGORY_OUTPUT_SHAPE
+    assert result.recovery == ["a.py: applied with ignore-whitespace"]
+    # Rolled back: the first file's applied change didn't survive.
+    assert (Path(repo_with_context) / "a.py").read_text() == "# header\nvalue = 1\n# footer\n"
+
+
+def test_run_revision_attempt_keeps_recovery_on_ci_failure(repo_with_context):
+    """The CI-failure result carries the recovery notes too, so a caller
+    can tell a rescued-but-wrong attempt from a clean-but-wrong one (#255)."""
+    start = get_current_commit(repo_with_context)
+    output = "=== FILE: a.py ===\n=== MODE: DIFF ===\n" + _diff_for_a("#  header", "# footer")
+
+    with patch("workspace.run_ci_checks", return_value=(False, "boom")):
+        result = run_revision_attempt(repo_with_context, output, ["a.py"], start_commit=start)
+
+    assert result.success is False
+    assert result.error == "CI checks failed"
+    assert result.recovery == [
+        "a.py: implicit-terminator: ended at end of output",
+        "a.py: applied with ignore-whitespace",
+    ]
 
 
 def test_run_revision_attempt_reports_recovery_steps(repo_with_context):
