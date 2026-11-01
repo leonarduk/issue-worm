@@ -804,10 +804,16 @@ def _resolve_repeated_sections(
             note = f"kept 1 of {len(entries)} identical repeated FILE sections"
         elif terminated and len({key(entry) for entry in terminated}) == 1:
             kept = terminated[0]
-            dropped = len(entries) - len(terminated)
+            unterminated = len(entries) - len(terminated)
+            duplicates = len(terminated) - 1
+            dropped = f"{unterminated} unterminated draft/looped section(s)"
+            if duplicates:
+                # Every copy but the kept one is dropped; the identical
+                # terminated extras count too (#310).
+                dropped = f"{duplicates} identical terminated duplicate(s) and {dropped}"
             note = (
                 f"kept the END FILE-terminated section, dropped {dropped} "
-                f"unterminated draft/looped section(s) ({len(entries)} emitted)"
+                f"({len(entries)} emitted)"
             )
         else:
             raise MalformedOutputError(
@@ -976,10 +982,18 @@ def _leading_ws(line: str) -> str:
 
 
 def _reindent(
-    lines: list[str], search_lines: list[str], matched: list[str]
+    lines: list[str], search_lines: list[str], matched: list[str], path: str, number: int
 ) -> list[str]:
     """Shift ``lines`` by the indentation difference between the first
-    non-blank SEARCH line and the file line it matched."""
+    non-blank SEARCH line and the file line it matched.
+
+    A line indented less than that SEARCH line (a dedent, e.g. a REPLACE
+    that closes the block it edits) keeps its offset relative to it (#314)
+    rather than being left where it was. A dedent deeper than the file
+    line's own indentation has nowhere to go, so it fails the block rather
+    than silently landing at the wrong level. Indentation with no prefix
+    relation to the SEARCH line's (tabs against spaces) is left as is.
+    """
     for want, got in zip(search_lines, matched):
         if want.strip():
             old, new = _leading_ws(want), _leading_ws(got)
@@ -990,13 +1004,37 @@ def _reindent(
         return lines
     out = []
     for line in lines:
+        indent = _leading_ws(line)
         if not line.strip():
             out.append(line)
-        elif line.startswith(old):
+        elif indent.startswith(old):
             out.append(new + line[len(old) :])
+        elif old.startswith(indent):
+            dedent = len(old) - len(indent)
+            if dedent > len(new):
+                raise MalformedOutputError(
+                    f"MODE: EDIT block {number} for {path!r}: a REPLACE line "
+                    f"dedents {dedent} columns below its SEARCH text, past the "
+                    "matched lines' own indentation - copy the SEARCH text "
+                    "with its real indentation"
+                )
+            out.append(new[: len(new) - dedent] + line[len(indent) :])
         else:
             out.append(line)
     return out
+
+
+def _line_terminators(lines: list[str]) -> list[str]:
+    """The terminator of each of ``lines`` (kept-ends), "\r\n" or "\n". A
+    final line with none borrows the one before it, or "\n"."""
+    terminators, last = [], "\n"
+    for line in lines:
+        if line.endswith("\r\n"):
+            last = "\r\n"
+        elif line.endswith("\n"):
+            last = "\n"
+        terminators.append(last)
+    return terminators
 
 
 def _apply_one_block(
@@ -1056,9 +1094,15 @@ def _apply_one_block(
             matched = [line.rstrip("\r\n") for line in file_lines[start : start + size]]
             new_lines = replace.splitlines()
             if rung == EDIT_RUNG_INDENT:
-                new_lines = _reindent(new_lines, search_lines, matched)
-            eol = "\r\n" if file_lines[start].endswith("\r\n") else "\n"
-            chunk = "".join(line + eol for line in new_lines)
+                new_lines = _reindent(new_lines, search_lines, matched, path, number)
+            # Each replacement line takes the terminator of the matched line
+            # at the same position (the last one's past the end), so a
+            # mixed-EOL region keeps its shape instead of being normalised
+            # to its first line's ending (#312).
+            eols = _line_terminators(file_lines[start : start + size])
+            chunk = "".join(
+                line + eols[min(i, size - 1)] for i, line in enumerate(new_lines)
+            )
             out = (
                 "".join(file_lines[:start])
                 + chunk
@@ -1066,12 +1110,11 @@ def _apply_one_block(
             )
             # Same end-of-file rule as the exact path: an edit that reaches
             # the last line must not add a final newline the file lacked.
-            if (
-                not had_final_newline
-                and start + size == len(file_lines)
-                and out.endswith(eol)
-            ):
-                out = out[: -len(eol)]
+            if not had_final_newline and start + size == len(file_lines):
+                for eol in ("\r\n", "\n"):
+                    if out.endswith(eol):
+                        out = out[: -len(eol)]
+                        break
             return out, rung
 
     first = next((line.strip() for line in search_lines if line.strip()), "")
