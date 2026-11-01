@@ -458,7 +458,13 @@ def build_coder(role_config) -> Coder:
     # Global, not role-prefixed - one HTTP timeout for whichever coder this
     # factory returns, same as REMOTE_LLM_*/DEEPSEEK_* below.
     timeout = _env_int("CODER_REQUEST_TIMEOUT_SECONDS", REQUEST_TIMEOUT_SECONDS)
-    max_tokens_override = _max_tokens_override(model_source)
+    # Only the OpenAI-compatible coders send max_tokens; don't parse (or
+    # warn about) CODER_MAX_TOKENS for a source that never uses it.
+    max_tokens_override = (
+        _max_tokens_override(model_source)
+        if model_source in ("lmstudio", "remote", "cloud")
+        else None
+    )
 
     if model_source == "local":
         # Endpoint/model here are unchanged from before this factory

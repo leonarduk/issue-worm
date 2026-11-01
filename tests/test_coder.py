@@ -1068,6 +1068,17 @@ def test_build_coder_cloud_ignores_invalid_max_tokens(raw, warns, monkeypatch, c
         assert caplog.records == []
 
 
+def test_build_coder_local_ignores_max_tokens_silently(monkeypatch, caplog):
+    """LocalOllamaCoder never sends max_tokens, so an unparseable
+    CODER_MAX_TOKENS is irrelevant to it and not worth a warning."""
+    monkeypatch.setenv("CODER_MAX_TOKENS", "lots")
+
+    with caplog.at_level("WARNING"):
+        build_coder(RoleConfig(model_source="local"))
+
+    assert "CODER_MAX_TOKENS" not in caplog.text
+
+
 @pytest.mark.parametrize("model_source", ["remote", "lmstudio"])
 def test_build_coder_warns_when_max_tokens_unparseable(model_source, monkeypatch, caplog):
     """Without a provider default cap, an ignored override means no
