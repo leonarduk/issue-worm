@@ -180,15 +180,26 @@ def _write_run_atomic(path: Path, record: dict) -> None:
 
     ``os.replace`` is atomic on both POSIX and Windows, so a concurrent
     reader either sees the old file or the fully-written new one - never a
-    half-written one.
+    half-written one. If the write fails, the temp file is removed and the
+    error re-raised.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as f:
-        json.dump(record, f)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp_path, path)
+    try:
+        with tmp_path.open("w", encoding="utf-8") as f:
+            json.dump(record, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        # A failed write (disk full, unserialisable value, interrupt) must
+        # not leave its `.tmp` behind to pile up (#186). The error itself
+        # still propagates - the public callers turn it into a logged no-op.
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            logger.debug("could not remove %s", tmp_path, exc_info=True)
+        raise
 
 
 def register(
