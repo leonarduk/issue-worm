@@ -1732,8 +1732,8 @@ def test_ensure_gitignored_survives_a_hard_reset(repo):
 def test_ensure_gitignored_with_a_relative_repo_path(tmp_path, monkeypatch, how):
     """The Scheduler's default WORKSPACE_ROOT is ".": a relative repo_path
     must still write the repo's own .git/info/exclude (#396). _run_git runs
-    git with cwd=repo_path, so --git-path's relative output is relative to
-    repo_path and the join is correct. The repo sits under tmp_path so the
+    git with cwd=repo_path, so --git-common-dir's relative output (".git")
+    is relative to repo_path and the join is correct. The repo sits under tmp_path so the
     parent directory checked below is owned by this test."""
     repo_dir = tmp_path / "repo"
     repo_dir.mkdir()
@@ -1762,10 +1762,11 @@ def test_ensure_gitignored_with_a_relative_repo_path(tmp_path, monkeypatch, how)
 
 
 def test_ensure_gitignored_in_a_linked_worktree_writes_the_shared_exclude(repo, tmp_path):
-    """In a linked worktree git reads the *main* repo's .git/info/exclude,
-    never a per-worktree one; --git-path info/exclude already resolves
-    there, so the bookkeeping files stay invisible even after the reset and
-    clean every attempt does (#395)."""
+    """In a linked worktree git reads the *main* repo's .git/info/exclude
+    (under --git-common-dir), never one under the per-worktree --git-dir,
+    so the patterns must land there and the bookkeeping files stay
+    invisible through the reset and clean every attempt does (#395). Fails
+    if the path is built from the per-worktree --git-dir."""
     worktree = tmp_path / "linked"
     _git(repo, "worktree", "add", "-q", str(worktree))
 
