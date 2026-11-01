@@ -4304,6 +4304,156 @@ def test_extract_new_workflow_run_scripts_ignores_non_workflow_files():
     assert _extract_new_workflow_run_scripts(diff) == []
 
 
+# --- workflow steps come from parsing the applied YAML (#424) -------------
+#
+# With repo_path, the touched workflow is read from disk as applied and
+# parsed; the diff only says which lines were added. These pin the cases a
+# line-regex reader got wrong.
+
+_LONG_WORKFLOW = (
+    "name: ci\n"
+    "on: pull_request\n"
+    "jobs:\n"
+    "  lint:\n"
+    "    runs-on: ubuntu-latest\n"
+    "    steps:\n"
+    "      - name: first\n"
+    "        shell: pwsh\n"
+    "        run: Write-Host first\n"
+    "      - name: second\n"
+    "        run: |\n"
+    "          echo second\n"
+    "          echo more\n"
+    "      - name: third\n"
+    "        run: echo third\n"
+)
+
+
+def _commit_workflow(repo, text, path=".github/workflows/ci.yml"):
+    target = Path(repo) / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(text.encode())
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "workflow")
+    return path
+
+
+def _apply_and_diff(repo, path, new_text):
+    """Write ``new_text`` (as applied) and return the diff against HEAD."""
+    target = Path(repo) / path
+    target.write_bytes(new_text.encode())
+    return subprocess.run(
+        ["git", "diff", "--", path], cwd=repo, capture_output=True, text=True
+    ).stdout
+
+
+def test_added_line_numbers_follow_hunk_headers():
+    from workspace import _added_line_numbers
+
+    hunk = ["@@ -3,3 +3,4 @@", " keep", "-old", "+new", "+extra", " tail", "@@ -20 +21 @@", "+late"]
+
+    assert _added_line_numbers(hunk) == {3, 4, 20}
+
+
+def test_editing_one_step_mid_file_runs_only_that_step(repo):
+    """A partial hunk (the edit plus 3 context lines) is enough: the step
+    boundaries come from the parsed file, so neither neighbour - nor the
+    first step's `shell: pwsh` - leaks in (#435, #416)."""
+    from workspace import _extract_new_workflow_run_scripts
+
+    path = _commit_workflow(repo, _LONG_WORKFLOW)
+    diff = _apply_and_diff(repo, path, _LONG_WORKFLOW.replace("echo more", "echo changed"))
+
+    scripts = _extract_new_workflow_run_scripts(diff, repo)
+
+    assert scripts == [(path, "echo second\necho changed", None)]
+
+
+def test_crlf_workflow_is_parsed(repo):
+    """CRLF line endings are YAML's to handle (#417)."""
+    from workspace import _extract_new_workflow_run_scripts
+
+    crlf = _LONG_WORKFLOW.replace("\n", "\r\n")
+    path = _commit_workflow(repo, crlf)
+    diff = _apply_and_diff(repo, path, crlf.replace("echo third", "echo THIRD"))
+
+    scripts = _extract_new_workflow_run_scripts(diff, repo)
+
+    assert scripts == [(path, "echo THIRD", None)]
+
+
+def test_block_body_with_yaml_lookalike_lines_is_kept_whole(repo):
+    """A literal `---`, a `run:` and a `shell:` line inside a block scalar
+    are script text, not YAML structure (#427)."""
+    from workspace import _extract_new_workflow_run_scripts
+
+    path = _commit_workflow(repo, _LONG_WORKFLOW)
+    body = "          echo second\n          echo ---\n          ---\n          run: x\n          shell: pwsh\n"
+    new = _LONG_WORKFLOW.replace("          echo second\n          echo more\n", body)
+    diff = _apply_and_diff(repo, path, new)
+
+    scripts = _extract_new_workflow_run_scripts(diff, repo)
+
+    assert scripts == [(path, "echo second\necho ---\n---\nrun: x\nshell: pwsh", None)]
+
+
+def test_guarded_and_matrix_steps_are_still_extracted(repo):
+    """`if:` and `matrix` live in the step/job mapping, not in the script,
+    so they don't stop the step being found (#422)."""
+    from workspace import _extract_new_workflow_run_scripts
+
+    workflow = (
+        "on: pull_request\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    strategy:\n"
+        "      matrix:\n"
+        "        py: ['3.11', '3.12']\n"
+        "    steps:\n"
+        "      - if: ${{ matrix.py == '3.12' }}\n"
+        "        run: echo guarded\n"
+    )
+    path = _commit_workflow(repo, "on: pull_request\n")
+    diff = _apply_and_diff(repo, path, workflow)
+
+    assert _extract_new_workflow_run_scripts(diff, repo) == [(path, "echo guarded", None)]
+
+
+@pytest.mark.parametrize(
+    ("defaults_at", "expected"),
+    [("job", "pwsh"), ("workflow", "pwsh"), ("both", "sh")],
+)
+def test_defaults_run_shell_applies_to_steps_without_their_own(repo, defaults_at, expected):
+    from workspace import _extract_new_workflow_run_scripts
+
+    workflow_defaults = "defaults:\n  run:\n    shell: pwsh\n" if defaults_at in ("workflow", "both") else ""
+    job_shell = "pwsh" if defaults_at == "job" else "sh"
+    job_defaults = (
+        f"    defaults:\n      run:\n        shell: {job_shell}\n"
+        if defaults_at in ("job", "both") else ""
+    )
+    workflow = (
+        "on: pull_request\n" + workflow_defaults + "jobs:\n  lint:\n" + job_defaults
+        + "    steps:\n      - run: echo hi\n"
+    )
+    path = _commit_workflow(repo, "on: pull_request\n")
+    diff = _apply_and_diff(repo, path, workflow)
+
+    assert _extract_new_workflow_run_scripts(diff, repo) == [(path, "echo hi", expected)]
+
+
+def test_invalid_workflow_yaml_fails_the_attempt(repo):
+    """GitHub would refuse to run a workflow that isn't valid YAML, so
+    the attempt fails instead of being waved through."""
+    path = _commit_workflow(repo, "on: pull_request\n")
+    diff = _apply_and_diff(repo, path, "on: pull_request\njobs:\n  lint: [unclosed\n")
+
+    passed, output = workspace._run_new_workflow_step_scripts(repo, diff, None, timeout=30)
+
+    assert passed is False
+    assert "not valid YAML" in output and path in output
+
+
 # --- get_working_diff(stage_all=True) / run_advisory_attempt (issue-worm-pro#1917)
 
 

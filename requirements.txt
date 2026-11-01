@@ -6,3 +6,7 @@ python-dotenv>=1.0  # config.load_config() loads .env; declared directly, not ju
 # so they are declared directly (same rule as python-dotenv above).
 requests>=2.34.2,<3
 packaging>=24,<27
+
+# Direct import in workspace.py: workflow steps are found by parsing the
+# workflow YAML, not line regexes (#424).
+PyYAML>=6,<7
