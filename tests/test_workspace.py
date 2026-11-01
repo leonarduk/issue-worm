@@ -1322,18 +1322,38 @@ def test_apply_ladder_is_ordered_strictest_first_and_context_0_is_opt_in(monkeyp
         ("@@ -1 +1 @@\n-\n+b\n", True),
         # `\ No newline at end of file` is not a removed line (#254).
         ("@@ -1,0 +1 @@\n+b\n\\ No newline at end of file\n", False),
-        # A following file's header at a hunk's tail is not a removal (#247).
-        ("@@ -1 +1,2 @@\n x\n+y\n--- a/b.py\n+++ b/b.py\n@@ -1 +1 @@\n-z\n+w\n", False),
+        # A removed `-- x` next to an added `++ y` is still a removal (#247).
+        ("@@ -1 +1 @@\n--- x\n+++ y\n", True),
         ("no hunks at all\n", False),
     ],
     ids=[
         "replacement", "pure-addition", "mixed", "all-replacements",
         "removed-double-dash", "removed-empty-line", "no-newline-marker",
-        "next-file-header", "no-hunks",
+        "dash-dash-then-plus-plus", "no-hunks",
     ],
 )
 def test_every_hunk_has_a_preimage(diff, expected):
     assert _every_hunk_has_a_preimage("--- a/a.py\n+++ b/a.py\n" + diff) is expected
+
+
+def test_apply_refuses_a_section_carrying_a_second_files_diff(repo_with_context):
+    """Why _hunk_removes_a_line needs no file-header exclusion (#247):
+    every rung passes --recount, under which git reads a following file's
+    `---`/`+++` header as lines of the previous hunk. Even with correct
+    context everywhere, a two-file section applies on no rung."""
+    (Path(repo_with_context) / "b.py").write_text("import sys\n")
+    _run_git(repo_with_context, "add", "b.py")
+    _run_git(repo_with_context, "commit", "-q", "-m", "b")
+    body = (
+        "--- a/a.py\n+++ b/a.py\n"
+        "@@ -1,3 +1,3 @@\n # header\n-value = 1\n+value = 2\n # footer\n"
+        "--- a/b.py\n+++ b/b.py\n"
+        "@@ -1 +1,2 @@\n import sys\n+import os\n"
+    )
+
+    with pytest.raises(MalformedOutputError, match="does not apply"):
+        apply_file_change(repo_with_context, FileChange("a.py", "DIFF", body))
+    assert (Path(repo_with_context) / "b.py").read_text() == "import sys\n"
 
 
 @pytest.fixture
