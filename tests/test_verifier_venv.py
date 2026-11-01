@@ -1408,3 +1408,29 @@ def test_venv_dir_folds_case_only_on_case_insensitive_platforms(
     lower = verifier_venv_dir(str(tmp_path / "repo"))
 
     assert (upper == lower) is shared
+
+
+@pytest.mark.parametrize("name", ["PIP_TARGET", "PIP_PREFIX", "PIP_ROOT"])
+def test_setup_env_drops_pip_settings_that_install_outside_the_venv(monkeypatch, name):
+    """These would put the target's dependencies somewhere other than the
+    venv its checks then run in (#474); other PIP_* settings still pass."""
+    monkeypatch.setenv(name, "/elsewhere")
+    monkeypatch.setenv("PIP_FIND_LINKS", "/wheels")
+
+    env = workspace._venv_setup_env()
+
+    assert name not in env
+    assert env["PIP_FIND_LINKS"] == "/wheels"
+
+
+@pytest.mark.parametrize("ambient", [None, "1", "true"])
+def test_setup_env_always_turns_user_installs_off(monkeypatch, ambient):
+    """PIP_USER is forced to "0" whatever the caller's environment says, so
+    it also beats `user = true` in a pip config file (env outranks config);
+    inside a venv a user install is refused outright (#474)."""
+    if ambient is None:
+        monkeypatch.delenv("PIP_USER", raising=False)
+    else:
+        monkeypatch.setenv("PIP_USER", ambient)
+
+    assert workspace._venv_setup_env()["PIP_USER"] == "0"
