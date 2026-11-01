@@ -1339,18 +1339,25 @@ def test_every_hunk_has_a_preimage(diff, expected):
     assert _every_hunk_has_a_preimage("--- a/a.py\n+++ b/a.py\n" + diff) is expected
 
 
-def test_every_apply_rung_recounts(monkeypatch):
+@pytest.mark.parametrize(
+    ("rung", "flags"),
+    [*_APPLY_LADDER, workspace._CONTEXT0_RUNG],
+    ids=[name for name, _ in (*_APPLY_LADDER, workspace._CONTEXT0_RUNG)],
+)
+def test_every_apply_rung_recounts(rung, flags):
     """_hunk_removes_a_line counts any `-` line as a removal, a following
     file's `--- a/x` header included. That is only sound because every
     rung passes --recount, so git reads such a header the same way and a
-    multi-file section never applies (#719). Pin it on the rungs directly,
-    the opt-in context-0 rung included."""
+    multi-file section never applies (#719). One case per rung, the
+    opt-in context-0 rung included, so a failure names the rung."""
+    assert "--recount" in flags, f"apply rung {rung!r} does not pass --recount"
+
+
+def test_apply_ladder_with_context_0_is_the_rungs_pinned_above(monkeypatch):
+    """Keeps the parametrization above honest: the opted-in ladder is
+    exactly _APPLY_LADDER plus _CONTEXT0_RUNG, so no rung escapes it."""
     monkeypatch.setenv(APPLY_CONTEXT0_ENV, "1")
-
-    rungs = _apply_ladder()
-
-    assert [name for name, _ in rungs][-1] == "context-0"
-    assert all("--recount" in flags for _, flags in rungs)
+    assert _apply_ladder() == (*_APPLY_LADDER, workspace._CONTEXT0_RUNG)
 
 
 def test_apply_refuses_a_section_carrying_a_second_files_diff(repo_with_context):
