@@ -181,20 +181,26 @@ def _strings(value):
             yield from _strings(item)
 
 
+def _receives_issue(step: dict) -> bool:
+    return any(
+        _USES_ISSUE.search(text)
+        for key, value in step.items()
+        if key != "name"
+        for text in _strings(value)
+    )
+
+
 def _issue_input_users(steps: list[dict]) -> list[str]:
-    """Names of the steps that receive `inputs.issue`, in run order."""
-    return [
-        step["name"]
-        for step in steps
-        if any(_USES_ISSUE.search(text) for key, value in step.items() if key != "name" for text in _strings(value))
-    ]
+    """Names of the steps that receive `inputs.issue`, in run order. A step
+    may have no name in a composite action; it is reported as "?" (#764)."""
+    return [step.get("name", "?") for step in steps if _receives_issue(step)]
 
 
 def _guard_runs_first(steps: list[dict]) -> bool:
     """The property #365 depends on: the validation step is the first step,
     and so the first of those that receive `inputs.issue`."""
     users = _issue_input_users(steps)
-    return steps[0]["name"] == "Validate issue input" and users[:1] == ["Validate issue input"]
+    return steps[0].get("name") == "Validate issue input" and users[:1] == ["Validate issue input"]
 
 
 def test_issue_input_is_validated_before_any_other_step_uses_it():
@@ -208,9 +214,19 @@ def test_issue_input_check_catches_a_consumer_moved_before_the_guard():
     after the guard that receives `inputs.issue` ahead of it."""
     steps = _steps()
     guard = steps.pop(0)
-    consumer = next(i for i, step in enumerate(steps) if step["name"] in _issue_input_users(steps))
+    consumer = next(i for i, step in enumerate(steps) if _receives_issue(step))
     steps.insert(consumer + 1, guard)
 
+    assert not _guard_runs_first(steps)
+
+
+def test_issue_input_check_handles_an_unnamed_step():
+    """Composite-action steps may omit `name`; an unnamed step that receives
+    the input ahead of the guard fails the check rather than raising (#764)."""
+    unnamed = {"shell": "bash", "env": {"N": "${{ inputs.issue }}"}, "run": "echo $N"}
+    steps = [unnamed, *_steps()]
+
+    assert _issue_input_users(steps)[0] == "?"
     assert not _guard_runs_first(steps)
 
 
