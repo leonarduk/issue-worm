@@ -4554,6 +4554,89 @@ def test_invalid_workflow_yaml_fails_the_attempt(repo):
     assert "not valid YAML" in output and path in output
 
 
+# --- workflow-step time limits (#415, #421) -------------------------------
+
+
+def _workflow_with_steps(*bodies):
+    steps = "".join(f"      - run: {body}\n" for body in bodies)
+    return f"on: pull_request\njobs:\n  lint:\n    steps:\n{steps}"
+
+
+def test_run_revision_attempt_uses_the_configured_step_timeout(repo, monkeypatch):
+    """ISSUE_WORM_WORKFLOW_STEP_TIMEOUT reaches the step that runs (#415)."""
+    monkeypatch.setenv(workspace.WORKFLOW_STEP_TIMEOUT_ENV, "0.3")
+    output = _full_file_output(".github/workflows/ci.yml", _workflow_with_steps("sleep 2"))
+
+    result = run_revision_attempt(
+        repo, output, [".github/workflows/ci.yml"], ci_command=[sys.executable, "-c", "pass"]
+    )
+
+    assert result.success is False
+    assert "timed out after 0.3s" in result.test_output
+    # A lone step under its own limit - the per-step message, not the budget one.
+    assert "budget" not in result.test_output
+
+
+def test_steps_share_one_budget_and_stop_when_it_runs_out(repo):
+    """Each step is within its own timeout, but together they are not: the
+    second step gets only what the first left of the total, is stopped with
+    a budget message rather than a per-step one, and the third never runs
+    (#421)."""
+    path = _commit_workflow(repo, "on: pull_request\n")
+    diff = _apply_and_diff(
+        repo, path, _workflow_with_steps("sleep 1.5", "sleep 10", "echo third-ran")
+    )
+
+    # Total above the per-step timeout - the real "many steps add up" case.
+    # Wide margins: the first step finishes 1s inside its 2.5s timeout, and
+    # the second has ~1.5s of the 3s total left, well short of its own 2.5s.
+    passed, output = workspace._run_new_workflow_step_scripts(
+        repo, diff, None, timeout=2.5, total_timeout=3.0
+    )
+
+    assert passed is False
+    assert "the 3s budget for all new workflow steps ran out" in output
+    assert "third-ran" not in output
+
+
+def test_a_lone_step_keeps_its_full_timeout_when_the_total_is_smaller(repo, caplog):
+    """The total never cuts a step below its own per-step allowance - and
+    a total set that low is raised with a warning, not silently."""
+    path = _commit_workflow(repo, "on: pull_request\n")
+    diff = _apply_and_diff(repo, path, _workflow_with_steps("sleep 0.4 && echo done"))
+
+    with caplog.at_level(logging.WARNING, logger="workspace"):
+        passed, output = workspace._run_new_workflow_step_scripts(
+            repo, diff, None, timeout=5, total_timeout=0.1
+        )
+
+    assert passed is True
+    assert "done" in output
+    assert "total budget 0.1s is below the per-step timeout 5s" in caplog.text
+
+
+def test_a_step_is_not_started_once_the_budget_is_spent():
+    with (
+        patch(
+            "workspace._extract_new_workflow_run_scripts",
+            return_value=[("w.yml", "echo one", None), ("w.yml", "echo two", None)],
+        ),
+        patch("workspace._unsupported_step_context", return_value=None),
+        patch("workspace.time.monotonic", side_effect=[0.0, 0.0, 99.0]),
+        patch(
+            "workspace.subprocess.run",
+            return_value=subprocess.CompletedProcess([], 0, "one\n", ""),
+        ) as run,
+    ):
+        passed, output = workspace._run_new_workflow_step_scripts(
+            ".", "diff", None, timeout=5, total_timeout=10
+        )
+
+    assert passed is False
+    assert run.call_count == 1
+    assert "not run: the 10s budget for all new workflow steps was used up" in output
+
+
 # --- get_working_diff(stage_all=True) / run_advisory_attempt (issue-worm-pro#1917)
 
 

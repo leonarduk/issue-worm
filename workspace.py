@@ -29,7 +29,18 @@ Constant                     Default  Applies to
                                       of a large repo takes minutes.
 :data:`DEFAULT_CI_TIMEOUT`     600s   :func:`run_ci_checks` - a real test suite
                                       takes minutes.
+:data:`WORKFLOW_STEP_TIMEOUT`  120s   each newly added/edited workflow ``run:``
+                                      step (:func:`_run_new_workflow_step_scripts`)
 ===========================  =======  =========================================
+
+Those workflow steps also share :data:`WORKFLOW_STEPS_TOTAL_TIMEOUT` (600s)
+between them, so many steps can't add up to an unbounded wait.
+
+The CI and workflow-step timeouts can each be raised per machine (an
+``ISSUE_WORM_*`` env var) or per target repo (``[tool.issue-worm]`` in its
+pyproject.toml) - see :func:`resolve_ci_timeout`,
+:func:`resolve_workflow_step_timeout` and
+:func:`resolve_workflow_steps_total_timeout`.
 
 Note the two different failure shapes. A CI command that *fails* is
 reported as ``(False, output)`` so the Analyser can read it like any test
@@ -56,6 +67,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import sys
 import tomllib
 from dataclasses import dataclass, field
@@ -2154,6 +2166,13 @@ def _reject_base_environment_kwarg(func_name: str, kwargs: dict) -> None:
 # applied workflow file and actually executing it against the repo
 # before the attempt is accepted.
 WORKFLOW_STEP_TIMEOUT = 120.0
+# One slow step must not be falsely rejected (#415), and many steps must
+# not add up to an unbounded wait (#421) - both are configurable, the same
+# way as the CI timeout (resolve_workflow_step_timeout and
+# resolve_workflow_steps_total_timeout).
+WORKFLOW_STEP_TIMEOUT_ENV = "ISSUE_WORM_WORKFLOW_STEP_TIMEOUT"
+WORKFLOW_STEPS_TOTAL_TIMEOUT = 600.0
+WORKFLOW_STEPS_TOTAL_TIMEOUT_ENV = "ISSUE_WORM_WORKFLOW_STEPS_TOTAL_TIMEOUT"
 
 _WORKFLOW_DIFF_PATH_RE = re.compile(r"^\.github/workflows/.+\.ya?ml$")
 # Steps are read with a YAML parser, not line regexes (#424): a block
@@ -2506,7 +2525,8 @@ def _run_new_workflow_step_scripts(
     repo_path: str,
     diff_output: str,
     extra_env: dict[str, str] | None,
-    timeout: float,
+    timeout: float | None = None,
+    total_timeout: float | None = None,
 ) -> tuple[bool, str]:
     """Execute every workflow ``run:`` step this diff touched, found in
     ``diff_output``, against ``repo_path``, in the same sandboxed
@@ -2528,6 +2548,13 @@ def _run_new_workflow_step_scripts(
 
     A touched workflow that is not valid YAML fails the attempt outright:
     GitHub would refuse to run any of it.
+
+    Each step gets ``timeout`` seconds (default
+    :func:`resolve_workflow_step_timeout`), and all of them together get
+    ``total_timeout`` (default :func:`resolve_workflow_steps_total_timeout`)
+    - but never less than one step's ``timeout``, so a lone step keeps its
+    full allowance (#421). A step only gets what is left of the total; once
+    it is spent, the remaining steps are not run and the attempt fails.
     """
     try:
         scripts = _extract_new_workflow_run_scripts(diff_output, repo_path)
@@ -2535,6 +2562,21 @@ def _run_new_workflow_step_scripts(
         return False, str(exc)
     if not scripts:
         return True, ""
+    if timeout is None:
+        timeout = resolve_workflow_step_timeout(repo_path)
+    if total_timeout is None:
+        total_timeout = resolve_workflow_steps_total_timeout(repo_path)
+    if total_timeout < timeout:
+        # A lone step always keeps its full allowance, so a total below it
+        # can't be honoured; say so rather than silently raising it.
+        logger.warning(
+            "Workflow-step total budget %gs is below the per-step timeout %gs; using %gs",
+            total_timeout,
+            timeout,
+            timeout,
+        )
+    budget = max(total_timeout, timeout)
+    deadline = time.monotonic() + budget
     all_passed = True
     output_parts: list[str] = []
     with tempfile.TemporaryDirectory(
@@ -2555,6 +2597,15 @@ def _run_new_workflow_step_scripts(
                     f"[{path}] skipped new/changed workflow step: {unsupported}"
                 )
                 continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                all_passed = False
+                output_parts.append(
+                    f"[{path}] not run: the {budget:g}s budget for all new "
+                    "workflow steps was used up by earlier steps"
+                )
+                break
+            step_timeout = min(timeout, remaining)
             try:
                 result = subprocess.run(
                     [*_resolve_on_path(command, env), script],
@@ -2568,7 +2619,7 @@ def _run_new_workflow_step_scripts(
                     # reporting the step as a normal failed attempt.
                     errors="replace",
                     env=env,
-                    timeout=timeout,
+                    timeout=step_timeout,
                 )
             except OSError as exc:
                 all_passed = False
@@ -2576,6 +2627,12 @@ def _run_new_workflow_step_scripts(
                 continue
             except subprocess.TimeoutExpired:
                 all_passed = False
+                if step_timeout < timeout:
+                    output_parts.append(
+                        f"[{path}] new workflow step stopped after {step_timeout:.1f}s: the "
+                        f"{budget:g}s budget for all new workflow steps ran out"
+                    )
+                    break
                 output_parts.append(f"[{path}] new workflow step timed out after {timeout}s")
                 continue
             status = "passed" if result.returncode == 0 else "FAILED"
@@ -2727,23 +2784,56 @@ def resolve_ci_timeout(repo_path: str) -> float:
     ``repo_path`` is resolved here, as every helper :func:`run_ci_checks`
     hands a ``repo_path`` string to does for itself (#569).
     """
-    raw_env = os.environ.get(CI_TIMEOUT_ENV)
+    return _resolve_timeout(repo_path, CI_TIMEOUT_ENV, "verifier-timeout", DEFAULT_CI_TIMEOUT)
+
+
+def resolve_workflow_step_timeout(repo_path: str) -> float:
+    """How long each newly added/edited workflow ``run:`` step may take
+    (#415): ``ISSUE_WORM_WORKFLOW_STEP_TIMEOUT``, else the target's
+    ``[tool.issue-worm] workflow-step-timeout``, else
+    :data:`WORKFLOW_STEP_TIMEOUT`. Same parsing rules as
+    :func:`resolve_ci_timeout`."""
+    return _resolve_timeout(
+        repo_path, WORKFLOW_STEP_TIMEOUT_ENV, "workflow-step-timeout", WORKFLOW_STEP_TIMEOUT
+    )
+
+
+def resolve_workflow_steps_total_timeout(repo_path: str) -> float:
+    """How long all of an attempt's workflow steps may take together
+    (#421): ``ISSUE_WORM_WORKFLOW_STEPS_TOTAL_TIMEOUT``, else the target's
+    ``[tool.issue-worm] workflow-steps-total-timeout``, else
+    :data:`WORKFLOW_STEPS_TOTAL_TIMEOUT`. Same parsing rules as
+    :func:`resolve_ci_timeout`."""
+    return _resolve_timeout(
+        repo_path,
+        WORKFLOW_STEPS_TOTAL_TIMEOUT_ENV,
+        "workflow-steps-total-timeout",
+        WORKFLOW_STEPS_TOTAL_TIMEOUT,
+    )
+
+
+def _resolve_timeout(repo_path: str, env_name: str, setting: str, default: float) -> float:
+    """``env_name`` when set to a positive number of seconds, else the
+    target's ``[tool.issue-worm] <setting>``, else ``default``. Unusable
+    values are ignored with a warning; a blank env var counts as unset."""
+    raw_env = os.environ.get(env_name)
     if raw_env is not None and raw_env.strip():
         seconds = _positive_seconds(raw_env)
         if seconds is not None:
             return seconds
-        logger.warning("%s=%r is not a positive number of seconds; ignoring it", CI_TIMEOUT_ENV, raw_env)
-    declared = _issue_worm_settings(Path(repo_path).resolve()).get("verifier-timeout")
+        logger.warning("%s=%r is not a positive number of seconds; ignoring it", env_name, raw_env)
+    declared = _issue_worm_settings(Path(repo_path).resolve()).get(setting)
     if declared is not None:
         seconds = _positive_seconds(declared)
         if seconds is not None:
             return seconds
         logger.warning(
-            "%s declares verifier-timeout=%r, not a positive number of seconds; ignoring it",
+            "%s declares %s=%r, not a positive number of seconds; ignoring it",
             repo_path,
+            setting,
             declared,
         )
-    return DEFAULT_CI_TIMEOUT
+    return default
 
 
 def _declared_verifier_requirements(repo: Path) -> list[str]:
@@ -3429,7 +3519,7 @@ def run_revision_attempt(
             )
 
         workflow_passed, workflow_output = _run_new_workflow_step_scripts(
-            repo_path, diff_output, extra_env, WORKFLOW_STEP_TIMEOUT
+            repo_path, diff_output, extra_env
         )
         if not workflow_passed:
             combined_output = "\n\n".join(part for part in (test_output, workflow_output) if part)
@@ -3524,7 +3614,7 @@ def run_advisory_attempt(
             )
 
         workflow_passed, workflow_output = _run_new_workflow_step_scripts(
-            repo_path, diff_output, extra_env, WORKFLOW_STEP_TIMEOUT
+            repo_path, diff_output, extra_env
         )
         if not workflow_passed:
             combined_output = "\n\n".join(part for part in (test_output, workflow_output) if part)

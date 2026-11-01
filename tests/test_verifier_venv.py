@@ -1097,6 +1097,47 @@ def test_ci_timeout_finds_the_declaration_from_a_relative_repo_path(
     assert workspace.resolve_ci_timeout(".") == 1500.0
 
 
+_WORKFLOW_TIMEOUTS = [
+    pytest.param(
+        "resolve_workflow_step_timeout", "WORKFLOW_STEP_TIMEOUT_ENV",
+        "workflow-step-timeout", "WORKFLOW_STEP_TIMEOUT", id="per-step",
+    ),
+    pytest.param(
+        "resolve_workflow_steps_total_timeout", "WORKFLOW_STEPS_TOTAL_TIMEOUT_ENV",
+        "workflow-steps-total-timeout", "WORKFLOW_STEPS_TOTAL_TIMEOUT", id="total",
+    ),
+]
+
+
+@pytest.mark.parametrize(("resolver", "env_attr", "setting", "default_attr"), _WORKFLOW_TIMEOUTS)
+def test_workflow_step_timeouts_resolve_like_the_ci_timeout(
+    tmp_path, monkeypatch, caplog, resolver, env_attr, setting, default_attr
+):
+    """Env var, else the repo's [tool.issue-worm] setting, else the
+    default; an unusable env value is ignored with a warning (#415, #421)."""
+    resolve = getattr(workspace, resolver)
+    env_name = getattr(workspace, env_attr)
+    monkeypatch.delenv(env_name, raising=False)
+
+    assert resolve(str(tmp_path)) == getattr(workspace, default_attr)
+    monkeypatch.setenv(env_name, "-5")
+    assert resolve(str(tmp_path)) == getattr(workspace, default_attr)
+    monkeypatch.delenv(env_name)
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "pyproject.toml").write_text(f"[tool.issue-worm]\n{setting} = 333\n", encoding="utf-8")
+    assert resolve(str(repo)) == 333.0
+
+    monkeypatch.setenv(env_name, "444")
+    assert resolve(str(repo)) == 444.0
+
+    monkeypatch.setenv(env_name, "soon")
+    with caplog.at_level(logging.WARNING, logger="workspace"):
+        assert resolve(str(repo)) == 333.0
+    assert f"{env_name}='soon' is not a positive number of seconds" in caplog.text
+
+
 def test_run_ci_checks_uses_the_resolved_timeout(tmp_path, no_timeout_env):
     repo = _declares_timeout(tmp_path / "repo", "1500")
     captured = {}
