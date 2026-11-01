@@ -1394,3 +1394,35 @@ def test_run_ci_checks_leaves_an_explicit_command_alone(tmp_path):
         run_ci_checks(str(repo), ["pytest", "-q"], changed_paths=["frontend/src/api.ts"])
 
     assert captured["command"] == ["pytest", "-q"]
+
+
+@pytest.mark.parametrize(
+    "platform, shared",
+    [("linux", False), ("win32", True), ("darwin", True)],
+)
+def test_venv_dir_folds_case_only_on_case_insensitive_platforms(
+    monkeypatch, tmp_path, platform, shared
+):
+    """Two Linux checkouts differing only in case are different trees and
+    must not share a venv (whose editable install points at one of them);
+    on Windows/macOS they are the same directory and must (#473)."""
+    monkeypatch.setattr(workspace.sys, "platform", platform)
+    monkeypatch.setenv(workspace.VERIFIER_VENV_DIR_ENV, str(tmp_path / "venvs"))
+
+    upper = verifier_venv_dir(str(tmp_path / "Repo"))
+    lower = verifier_venv_dir(str(tmp_path / "repo"))
+
+    assert (upper.name.split("-")[-1] == lower.name.split("-")[-1]) is shared
+
+
+@pytest.mark.parametrize("name", ["PIP_TARGET", "PIP_PREFIX", "PIP_USER", "PIP_ROOT"])
+def test_setup_env_drops_pip_settings_that_install_outside_the_venv(monkeypatch, name):
+    """These would put the target's dependencies somewhere other than the
+    venv its checks then run in (#474); other PIP_* settings still pass."""
+    monkeypatch.setenv(name, "/elsewhere")
+    monkeypatch.setenv("PIP_FIND_LINKS", "/wheels")
+
+    env = workspace._venv_setup_env()
+
+    assert name not in env
+    assert env["PIP_FIND_LINKS"] == "/wheels"
