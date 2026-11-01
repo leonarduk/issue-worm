@@ -2,6 +2,7 @@
 
 import logging
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -24,7 +25,7 @@ from coder import (
     _default_ollama_model,
     build_coder,
 )
-from config import RoleConfig
+from config import RemoteCoderSettings, RoleConfig
 from workspace import MODE_EDIT, MODE_FULL
 
 
@@ -669,6 +670,95 @@ def test_build_coder_cloud_uses_deepseek_default_endpoint_and_model(monkeypatch)
     assert coder.endpoint == DEFAULT_DEEPSEEK_ENDPOINT
     assert coder.model == DEFAULT_DEEPSEEK_MODEL
     assert coder.api_key == "sk-test"
+
+
+def test_build_coder_takes_remote_settings_from_config_not_the_environment(monkeypatch):
+    """build_coder reads REMOTE_LLM_* from the RoleConfig config.py built,
+    never from os.environ itself (#223): with both set, config wins."""
+    monkeypatch.setenv("REMOTE_LLM_ENDPOINT", "https://env.example")
+    monkeypatch.setenv("REMOTE_LLM_API_KEY", "sk-env")
+    monkeypatch.setenv("REMOTE_LLM_MODEL", "env-model")
+    role = RoleConfig(
+        model_source="remote",
+        remote=RemoteCoderSettings(
+            remote_endpoint="https://config.example",
+            remote_api_key="sk-config",
+            remote_model="config-model",
+        ),
+    )
+
+    coder = build_coder(role)
+
+    assert (coder.endpoint, coder.model, coder.api_key) == (
+        "https://config.example",
+        "config-model",
+        "sk-config",
+    )
+
+
+def test_build_coder_takes_deepseek_settings_from_config_not_the_environment(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-env")
+    monkeypatch.setenv("DEEPSEEK_ENDPOINT", "https://env.example")
+    monkeypatch.setenv("DEEPSEEK_MODEL", "env-model")
+    role = RoleConfig(
+        model_source="cloud",
+        remote=RemoteCoderSettings(
+            deepseek_api_key="sk-config",
+            deepseek_endpoint="https://config.example",
+            deepseek_model="config-model",
+        ),
+    )
+
+    coder = build_coder(role)
+
+    assert (coder.endpoint, coder.model, coder.api_key) == (
+        "https://config.example",
+        "config-model",
+        "sk-config",
+    )
+
+
+def test_build_coder_rejects_config_supplied_settings_missing_a_value(monkeypatch):
+    """The missing-value checks apply to the config-supplied settings, not
+    to os.environ: a complete environment can't rescue an incomplete
+    RemoteCoderSettings."""
+    monkeypatch.setenv("REMOTE_LLM_ENDPOINT", "https://env.example")
+    monkeypatch.setenv("REMOTE_LLM_API_KEY", "sk-env")
+    monkeypatch.setenv("REMOTE_LLM_MODEL", "env-model")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-env")
+
+    with pytest.raises(CoderConfigError, match="REMOTE_LLM_ENDPOINT"):
+        build_coder(RoleConfig(model_source="remote", remote=RemoteCoderSettings()))
+    with pytest.raises(CoderConfigError, match="DEEPSEEK_API_KEY"):
+        build_coder(RoleConfig(model_source="cloud", remote=RemoteCoderSettings()))
+
+
+def test_build_coder_cloud_falls_back_to_defaults_for_explicit_none():
+    """An explicit None for the DeepSeek endpoint/model still means the
+    provider default, as `os.getenv(...) or DEFAULT` did before #223."""
+    role = RoleConfig(
+        model_source="cloud",
+        remote=RemoteCoderSettings(
+            deepseek_api_key="sk-test", deepseek_endpoint=None, deepseek_model=None
+        ),
+    )
+
+    coder = build_coder(role)
+
+    assert (coder.endpoint, coder.model) == (DEFAULT_DEEPSEEK_ENDPOINT, DEFAULT_DEEPSEEK_MODEL)
+
+
+def test_build_coder_reads_settings_via_config_for_a_role_without_them(monkeypatch):
+    """A role built by hand (or anything RoleConfig-shaped) carries no
+    settings; build_coder gets them from config.py's reader at call time,
+    as it read the environment before #223."""
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-v4")
+
+    assert RoleConfig(model_source="cloud").remote is None
+    for role in (RoleConfig(model_source="cloud"), SimpleNamespace(model_source="cloud")):
+        coder = build_coder(role)
+        assert (coder.model, coder.api_key) == ("deepseek-v4", "sk-test")
 
 
 def test_build_coder_cloud_model_override(monkeypatch):
