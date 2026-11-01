@@ -7,46 +7,19 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 ACTION = Path(__file__).resolve().parent.parent / "action.yml"
 
 
+def _steps() -> list[dict]:
+    """Every step of the composite action, as YAML parses it."""
+    return yaml.safe_load(ACTION.read_text(encoding="utf-8"))["runs"]["steps"]
+
+
 def _run_steps() -> list[dict]:
-    """Each step's `name` and `run: |` script, read by indentation.
-
-    No YAML parser: PyYAML is not a dependency of this package, and every
-    script in action.yml is a literal block (`run: |`), which ends at the
-    first non-blank line indented no deeper than the `run:` key.
-    """
-    lines = ACTION.read_text(encoding="utf-8").splitlines()
-    steps, name = [], "?"
-    i = 0
-    while i < len(lines):
-        stripped = lines[i].lstrip()
-        if stripped.startswith("- name:"):
-            name = stripped.removeprefix("- name:").strip()
-        if stripped == "run: |":
-            key_indent = len(lines[i]) - len(stripped)
-            body = []
-            i += 1
-            while i < len(lines) and (
-                not lines[i].strip() or len(lines[i]) - len(lines[i].lstrip()) > key_indent
-            ):
-                body.append(lines[i])
-                i += 1
-            steps.append({"name": name, "run": "\n".join(body)})
-            continue
-        i += 1
-    return steps
-
-
-def test_every_run_script_is_a_literal_block():
-    """Guards the parser above: a `run:` written any other way would be
-    silently skipped by every check in this file."""
-    text = ACTION.read_text(encoding="utf-8")
-    run_keys = [ln.strip() for ln in text.splitlines() if ln.strip().startswith("run:")]
-    assert run_keys and all(key == "run: |" for key in run_keys)
-    assert len(_run_steps()) == len(run_keys)
+    """Each step that has a `run:` script: its `name` and that script."""
+    return [{"name": s.get("name", "?"), "run": s["run"]} for s in _steps() if "run" in s]
 
 
 def test_no_expression_is_spliced_into_a_run_script():
@@ -189,11 +162,15 @@ def test_validate_issue_input_step_accepts_only_digits(tmp_path, value, ok):
 def test_issue_input_is_validated_before_any_other_step_uses_it():
     """The guard is only worth anything if it runs first: every step that
     receives `inputs.issue` comes after it (#365)."""
-    text = ACTION.read_text(encoding="utf-8")
-    steps_text = text.split("\n    - name: ")[1:]
-    users = [chunk.split("\n", 1)[0] for chunk in steps_text if "${{ inputs.issue }}" in chunk]
+    steps = _steps()
+    users = [
+        step["name"]
+        for step in steps
+        if "inputs.issue" in yaml.safe_dump({k: v for k, v in step.items() if k != "name"})
+    ]
+    assert steps[0]["name"] == "Validate issue input"
     assert users[0] == "Validate issue input"
-    assert _step_names()[0] == "Validate issue input"
+    assert len(users) > 1  # the check is vacuous if nothing else used it
 
 
 # --- Commit, push, verify, and publish (#272, #283, #306, #325) ------------
@@ -222,18 +199,27 @@ case "$*" in
     for arg in "$@"; do
       case "$arg" in body=@*) cp "${arg#body=@}" "$STUB_LOG/patched_body" ;; esac
     done ;;
+  "api -X POST repos/"*"/issues/7/labels"*) ;;
+  *)
+    # A call the step didn't make when this stub was written: fail loudly
+    # so the test is updated, not quietly fed an empty answer (#756).
+    echo "gh stub: unexpected call: $*" >&2
+    exit 97 ;;
 esac
 exit 0
 """
 
 _CICAID_STUB = r"""#!/bin/sh
 printf '%s\n' "$*" >> "$STUB_LOG/cicaid.calls"
-case "$1" in
-  run-ci-checks) exit 0 ;;
-  publish-pr)
-    for arg in "$@"; do last="$arg"; done
+case "$*" in
+  "run-ci-checks --all") exit 0 ;;
+  "publish-pr --body-file "*|"publish-pr --draft --body-file "*)
     # publish-pr appends `Closes #N` to the body it was given.
+    for arg in "$@"; do last="$arg"; done
     { cat "$last"; printf '\nCloses #%s\n' "$ISSUE"; } > "$STUB_LOG/pr_body" ;;
+  *)
+    echo "cicaid stub: unexpected call: $*" >&2
+    exit 97 ;;
 esac
 exit 0
 """
@@ -365,6 +351,14 @@ def test_commit_step_keeps_a_tracked_issue_worm_file_out_of_commit_and_pr_body(a
     body = (action_checkout["log"] / "pr_body").read_text()
     files_section = body.split("**Files changed:**\n", 1)[1].split("\n\n", 1)[0]
     assert [line.removeprefix("- ") for line in files_section.splitlines()] == committed
+
+
+def test_commit_step_runs_in_strict_mode():
+    """The harness below runs the step's own text, so it only exercises
+    `set -e` failure semantics - a non-zero `git reset` aborting the step,
+    say (#272) - while the step itself turns them on (#757)."""
+    first = next(ln.strip() for ln in _step(COMMIT_STEP).splitlines() if ln.strip())
+    assert first == "set -euo pipefail"
 
 
 def test_pr_body_file_list_diffs_against_head_not_the_working_tree():
