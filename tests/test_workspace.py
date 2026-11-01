@@ -1320,13 +1320,16 @@ def test_apply_ladder_is_ordered_strictest_first_and_context_0_is_opt_in(monkeyp
         # Removing a line whose content is `--flag` renders as `---flag` (#254).
         ("@@ -1 +1 @@\n---flag\n+--other\n", True),
         ("@@ -1 +1 @@\n-\n+b\n", True),
+        # `\ No newline at end of file` is not a removed line (#254).
+        ("@@ -1,0 +1 @@\n+b\n\\ No newline at end of file\n", False),
         # A following file's header at a hunk's tail is not a removal (#247).
         ("@@ -1 +1,2 @@\n x\n+y\n--- a/b.py\n+++ b/b.py\n@@ -1 +1 @@\n-z\n+w\n", False),
         ("no hunks at all\n", False),
     ],
     ids=[
         "replacement", "pure-addition", "mixed", "all-replacements",
-        "removed-double-dash", "removed-empty-line", "next-file-header", "no-hunks",
+        "removed-double-dash", "removed-empty-line", "no-newline-marker",
+        "next-file-header", "no-hunks",
     ],
 )
 def test_every_hunk_has_a_preimage(diff, expected):
