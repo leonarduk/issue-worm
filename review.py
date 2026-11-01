@@ -82,20 +82,34 @@ def _split_files(raw: str) -> list[str]:
 
 
 def merge_implementation_notes(issue_body: str, section: str) -> str:
-    """`issue_body` with the drafted `section` in place of its first
-    `## Implementation notes` section, or appended when it has none.
+    """`issue_body` with its `## Implementation notes` sections replaced by
+    the drafted `section`, or with `section` appended when it has none.
 
-    Self-heal only runs on a body `review_issue` rejected, so an existing
-    section here is a malformed one. Appending next to it (#264) left the
-    issue with two `## Implementation notes` headings - harmless to
-    `review_issue`, which takes the first ready one, but a confusing issue
-    for the human reading it. Same section rules as `review_issue`; text
-    outside the replaced section is kept verbatim.
+    For self-heal's use: the caller passes a body `review_issue` rejected,
+    so every such section in it is malformed. They collapse into the one
+    drafted section, placed where the first one was (#264). Appending next
+    to them left the issue with duplicate headings, which `review_issue`
+    tolerates (it takes the first ready section) but a human reading the
+    issue should not have to. Uses `review_issue`'s own section rules; text
+    outside those sections is kept verbatim, and `section`'s own trailing
+    newline is kept either way.
     """
-    match = _SECTION_RE.search(issue_body or "")
-    if match is None:
+    issue_body = issue_body or ""
+    matches = list(_SECTION_RE.finditer(issue_body))
+    if not matches:
         return f"{issue_body}\n\n{section}"
-    return issue_body[: match.start()] + section.strip("\n") + issue_body[match.end():]
+    merged = issue_body
+    # Later sections first, so earlier offsets stay valid. Each is removed
+    # with the blank lines before it; its tail (`\n## next` or nothing)
+    # stays.
+    for match in reversed(matches[1:]):
+        merged = merged[: match.start()].rstrip("\n") + merged[match.end():]
+    first = matches[0]
+    tail = merged[first.end():]
+    replacement = section.lstrip("\n")
+    if tail:
+        replacement = replacement.rstrip("\n")
+    return merged[: first.start()] + replacement + tail
 
 
 # A fenced code block's opening line: up to 3 spaces of indent, then 3+

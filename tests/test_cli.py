@@ -27,7 +27,7 @@ import cli
 import progress_reporter
 import registry
 from coder import CoderConfigError
-from review import ReviewResult
+from review import ReviewResult, review_issue
 from workspace import CATEGORY_OUTPUT_SHAPE, FileChange, MalformedOutputError, WorkspaceError
 
 # The `_pro_cli_absent` fixture below is now redundant with the autouse
@@ -759,8 +759,9 @@ def test_self_heal_scope_replaces_a_malformed_section_instead_of_appending(capsy
     assert result is not None
     review, healed_body = result
     assert review.done == "it works"
-    assert healed_body == "Fix it.\n\n" + section.rstrip("\n")
+    assert healed_body == "Fix it.\n\n" + section
     assert healed_body.count("## Implementation notes") == 1
+    assert review_issue(healed_body).ready is True
 
 
 @pytest.mark.usefixtures("_pro_cli_absent")
@@ -851,7 +852,7 @@ def test_persist_implementation_notes_replaces_a_malformed_section(monkeypatch):
         assert cli._try_persist_implementation_notes("o/r", 5, section) is True
 
     patched = mock_patch.call_args[1]["json"]["body"]
-    assert patched == "Fix it.\n\n" + section.rstrip("\n")
+    assert patched == "Fix it.\n\n" + section
 
 
 def test_persist_implementation_notes_returns_false_on_403(monkeypatch):

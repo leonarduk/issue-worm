@@ -357,5 +357,24 @@ def test_merge_implementation_notes_replaces_a_trailing_section():
 
     merged = merge_implementation_notes(body, _HEALED)
 
-    assert merged == "Intro.\n\n" + _HEALED.rstrip("\n")
+    # Ends with the drafted section's own newline, as the append path does.
+    assert merged == "Intro.\n\n" + _HEALED
     assert review_issue(merged).ready is True
+
+
+def test_merge_implementation_notes_collapses_every_malformed_section():
+    """review_issue looks at every section, so a body can carry several
+    malformed ones; all of them give way to the single drafted section."""
+    body = (
+        "Intro.\n\n## Implementation notes\nFILES: a.py\n\n## Context\nKeep me.\n\n"
+        "## Implementation notes\nDONE:\n\n## Trailer\nKeep me too.\n"
+    )
+
+    merged = merge_implementation_notes(body, _HEALED)
+
+    assert merged == (
+        "Intro.\n\n## Implementation notes\nFILES: a.py\nDONE: it works\n"
+        "## Context\nKeep me.\n## Trailer\nKeep me too.\n"
+    )
+    assert merged.lower().count("## implementation notes") == 1
+    assert review_issue(merged).done == "it works"
