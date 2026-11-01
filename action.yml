@@ -60,7 +60,8 @@ inputs:
       GitHub auto-close the issue when the PR is merged. Set to 'false' to
       keep the issue open after merge - useful when the PR only addresses
       part of the issue, or when the issue tracks broader work that
-      continues after this PR. Defaults to 'true' (issues close on merge).
+      continues after this PR. Defaults to 'true' (issues close on merge);
+      any casing of 'true' counts, anything else keeps the issue open.
     required: false
     default: 'true'
 
@@ -69,13 +70,13 @@ runs:
   steps:
     - name: Validate issue input
       shell: bash
-      # `inputs.issue` is interpolated directly into shell commands below
-      # (the `issue-worm build` invocation and the `gh pr create` body).
-      # GitHub's own `github.event.issue.number` is always an integer, but
-      # this action accepts `issue` as a caller-supplied input, so a
-      # misconfigured or malicious caller could pass arbitrary shell
-      # metacharacters. Reject anything that isn't a plain run of digits
-      # before it ever reaches a shell command. Leading zeros and very
+      # `inputs.issue` ends up in shell commands, URLs and git refs below
+      # (the `issue-worm build` invocation, `gh api` paths, the branch
+      # name). GitHub's own `github.event.issue.number` is always an
+      # integer, but this action accepts `issue` as a caller-supplied
+      # input, so a misconfigured or malicious caller could pass arbitrary
+      # shell metacharacters. Reject anything that isn't a plain run of
+      # digits before it ever reaches a shell command. Leading zeros and very
       # large numbers are still accepted (they're valid issue numbers as
       # far as this check is concerned); only non-numeric input fails.
       # `ISSUE_INPUT` is passed via `env:` rather than interpolated inline
@@ -119,8 +120,12 @@ runs:
 
     - name: Report license-key status
       shell: bash
+      # Every caller-supplied input reaches `run:` through `env:`, never as
+      # inline `${{ }}` - see "Validate issue input" above for why (#366).
+      env:
+        LICENSE_KEY: ${{ inputs.license-key }}
       run: |
-        if [ -n "${{ inputs.license-key }}" ]; then
+        if [ -n "$LICENSE_KEY" ]; then
           echo "::notice::license-key was supplied, but the pro engine install is not implemented yet (issue-worm-pro#584) - running the free engine."
         else
           echo "license-key not supplied - running the free engine."
@@ -167,7 +172,15 @@ runs:
         fi
         echo "$venv_bin" >> "$GITHUB_PATH"
         "$venv_bin/python" -m pip install --upgrade pip
-        "$venv_bin/python" -m pip install "${{ github.action_path }}"
+        "$venv_bin/python" -m pip install "$GITHUB_ACTION_PATH"
+        # The isolation above is the whole point of this venv, so check it
+        # held (#291): if pro_cli is importable anyway - a future dependency
+        # pulling it in, or a runner-wide PYTHONPATH/.pth leaking it -
+        # `issue-worm build` would silently run the pro engine instead.
+        if "$venv_bin/python" -c "import pro_cli" 2>/dev/null; then
+          echo "::error::pro_cli is importable from the action's venv, so 'issue-worm build' would delegate to the pro engine instead of this action's free one. Check the runner's PYTHONPATH and site-packages."
+          exit 1
+        fi
 
     - name: Run issue-worm build
       id: build
@@ -179,15 +192,16 @@ runs:
         # Non-interactive CI already skips the update-check prompt (stdin/
         # stdout aren't both ttys), but this makes the intent explicit.
         ISSUE_WORM_SKIP_UPDATE_CHECK: "1"
+        ISSUE: ${{ inputs.issue }}
       run: |
         set -euo pipefail
         # --workspace reuses this job's own actions/checkout'd working tree
         # (already on the right repo, already credentialed for push by the
         # checkout step above) instead of having `build` re-clone the repo
         # fresh over unauthenticated HTTPS.
-        issue-worm build "${{ inputs.issue }}" \
-          --repo "${{ github.repository }}" \
-          --workspace "${{ github.workspace }}"
+        issue-worm build "$ISSUE" \
+          --repo "$GITHUB_REPOSITORY" \
+          --workspace "$GITHUB_WORKSPACE"
 
     - name: Commit, push, verify, and publish the PR via cicaid
       shell: bash
@@ -203,7 +217,10 @@ runs:
         ISSUE_WORM_SKIP_UPDATE_CHECK: "1"
       run: |
         set -euo pipefail
-        cd "${{ github.workspace }}"
+        cd "$GITHUB_WORKSPACE"
+        # Any casing of 'true' closes the issue on merge (#324). tr, not
+        # ${var,,}: macOS self-hosted runners ship bash 3.2.
+        close_issue="$(printf '%s' "$CLOSE_ISSUE" | tr '[:upper:]' '[:lower:]')"
 
         # #345: `build` already posted the progress comment and reported
         # its own coder stage; this step covers the two stages that run
@@ -276,7 +293,7 @@ runs:
         git ls-files -z -- .issue-worm | xargs -0 -r git update-index --skip-worktree
 
         commit_args=(-m "issue-worm: apply changes for #${ISSUE}")
-        if [ "$CLOSE_ISSUE" = "true" ]; then
+        if [ "$close_issue" = "true" ]; then
           commit_args+=(-m "Closes #${ISSUE}")
         fi
         git commit -q "${commit_args[@]}"
@@ -415,7 +432,7 @@ runs:
 
         # publish-pr always appends `Closes #N`; strip it again when the
         # caller asked for the issue to stay open after merge.
-        if [ "$CLOSE_ISSUE" != "true" ]; then
+        if [ "$close_issue" != "true" ]; then
           gh api "repos/$REPO/pulls/$pr_number" -q .body | { grep -vxF "Closes #${ISSUE}" || true; } > "$body_file"
           gh api -X PATCH "repos/$REPO/pulls/$pr_number" -F body=@"$body_file" > /dev/null
         fi

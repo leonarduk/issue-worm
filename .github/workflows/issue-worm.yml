@@ -24,7 +24,10 @@ on:
       issue:
         description: 'Issue number to run issue-worm against'
         required: true
-        type: string
+        # `number` makes the Run workflow form refuse non-numeric input
+        # (#321). The action's "Validate issue input" step still rejects
+        # anything that isn't a plain run of digits (e.g. 1.5 or -3).
+        type: number
 
 concurrency:
   group: issue-worm-${{ github.event.issue.number || github.event.inputs.issue }}
