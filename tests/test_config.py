@@ -1,5 +1,6 @@
 """Tests for config module."""
 
+import logging
 import os
 import pytest
 
@@ -435,6 +436,24 @@ def test_parse_coder_backend_still_rejects_invalid(caplog):
     assert "CODER_BACKEND='bogus'" in caplog.text
 
 
+@pytest.mark.parametrize("raw", ["", "   ", "\t\n"], ids=["empty", "spaces", "tab-newline"])
+def test_parse_coder_backend_rejects_empty_and_whitespace_only(raw, caplog):
+    """Stripping leaves nothing to validate: fall back to 'native' and warn,
+    rather than accept an empty backend name (#317)."""
+    assert _parse_coder_backend(raw) == "native"
+    (record,) = caplog.records
+    assert record.levelno == logging.WARNING
+    assert f"CODER_BACKEND={raw!r}" in record.getMessage()
+
+
+@pytest.mark.parametrize("raw", ["NATIVE", "Native", " nAtIvE "])
+def test_parse_coder_backend_is_case_insensitive(raw, caplog):
+    """Matches the retired-"aider" branch, which already ignores case:
+    any casing of a valid backend is accepted, normalized, unwarned (#352)."""
+    assert _parse_coder_backend(raw) == "native"
+    assert caplog.records == []
+
+
 def test_load_config_unknown_log_level_falls_back_to_info(monkeypatch, caplog):
     """logging.Logger.setLevel raises on an unrecognized name - a typo'd
     LOG_LEVEL must be caught here, not crash the process later."""
@@ -757,6 +776,16 @@ def test_parse_coder_targets_unset_uses_defaults(monkeypatch):
     """
     monkeypatch.setenv("CODER_MODEL_SOURCE", "local")
     monkeypatch.delenv("CODER_TARGETS", raising=False)
+
+    assert load_config()["coder_targets"] == []
+
+
+def test_parse_coder_targets_explicitly_empty_uses_defaults(monkeypatch):
+    """The sibling of the unset test above (#367): CODER_TARGETS set to ""
+    - e.g. `CODER_TARGETS=` left blank in an env file - is no pool at all,
+    the same as unset, not a malformed entry that raises ConfigError."""
+    monkeypatch.setenv("CODER_MODEL_SOURCE", "local")
+    monkeypatch.setenv("CODER_TARGETS", "")
 
     assert load_config()["coder_targets"] == []
 
