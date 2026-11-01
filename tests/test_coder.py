@@ -2,6 +2,7 @@
 
 import logging
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -715,6 +716,34 @@ def test_build_coder_takes_deepseek_settings_from_config_not_the_environment(mon
         "config-model",
         "sk-config",
     )
+
+
+def test_build_coder_rejects_config_supplied_settings_missing_a_value(monkeypatch):
+    """The missing-value checks apply to the config-supplied settings, not
+    to os.environ: a complete environment can't rescue an incomplete
+    RemoteCoderSettings."""
+    monkeypatch.setenv("REMOTE_LLM_ENDPOINT", "https://env.example")
+    monkeypatch.setenv("REMOTE_LLM_API_KEY", "sk-env")
+    monkeypatch.setenv("REMOTE_LLM_MODEL", "env-model")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-env")
+
+    with pytest.raises(CoderConfigError, match="REMOTE_LLM_ENDPOINT"):
+        build_coder(RoleConfig(model_source="remote", remote=RemoteCoderSettings()))
+    with pytest.raises(CoderConfigError, match="DEEPSEEK_API_KEY"):
+        build_coder(RoleConfig(model_source="cloud", remote=RemoteCoderSettings()))
+
+
+def test_build_coder_reads_settings_via_config_for_a_role_without_them(monkeypatch):
+    """A role built by hand (or anything RoleConfig-shaped) carries no
+    settings; build_coder gets them from config.py's reader at call time,
+    as it read the environment before #223."""
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-v4")
+
+    assert RoleConfig(model_source="cloud").remote is None
+    for role in (RoleConfig(model_source="cloud"), SimpleNamespace(model_source="cloud")):
+        coder = build_coder(role)
+        assert (coder.model, coder.api_key) == ("deepseek-v4", "sk-test")
 
 
 def test_build_coder_cloud_model_override(monkeypatch):

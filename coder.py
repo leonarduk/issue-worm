@@ -455,9 +455,12 @@ def build_coder(role_config) -> Coder:
     """
     model_source = getattr(role_config, "model_source", "local")
     # REMOTE_LLM_* / DEEPSEEK_* arrive through config.py (#223), on the
-    # role's RoleConfig; something RoleConfig-shaped without them gets the
-    # same values config.py would have read.
-    remote = getattr(role_config, "remote", None) or remote_coder_settings_from_env()
+    # RoleConfig load_config built. A role built by hand (or anything
+    # RoleConfig-shaped) carries none, and gets them from the same
+    # config.py reader - read here, only for the sources that use them.
+    remote = getattr(role_config, "remote", None)
+    if remote is None and model_source in ("remote", "cloud"):
+        remote = remote_coder_settings_from_env()
     # Global, not role-prefixed - one HTTP timeout for whichever coder this
     # factory returns.
     timeout = _env_int("CODER_REQUEST_TIMEOUT_SECONDS", REQUEST_TIMEOUT_SECONDS)

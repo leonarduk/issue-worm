@@ -114,12 +114,11 @@ class RoleConfig:
     mcp_tool_name: str = DEFAULT_MCP_TOOL_NAME
     mcp_timeout_seconds: int = DEFAULT_MCP_TIMEOUT_SECONDS
     mcp_max_doc_chars: int = DEFAULT_MCP_MAX_DOC_CHARS
-    # Read from the environment when not given, so a RoleConfig built by
-    # hand (tests, callers outside load_config) behaves as one from
-    # load_config does. repr=False: it carries API keys.
-    remote: RemoteCoderSettings = field(
-        default_factory=remote_coder_settings_from_env, repr=False
-    )
+    # Set by load_config. None for a RoleConfig built by hand: building one
+    # never reads the environment; coder.build_coder falls back to
+    # remote_coder_settings_from_env() itself for such a role. repr=False:
+    # it carries API keys.
+    remote: Optional[RemoteCoderSettings] = field(default=None, repr=False)
 
 
 def load_config() -> dict:
