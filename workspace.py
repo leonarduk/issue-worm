@@ -855,9 +855,13 @@ _DIVIDER_MARKER_RE = re.compile(r"^={5,9}[ \t]*$")
 _DIFF_SEARCH_MARKER_RE = re.compile(r"^-{3,9} ?SEARCH[ \t]*$")
 _DIFF_DIVIDER_MARKER_RE = re.compile(r"^\+{3,9} ?REPLACE[ \t]*$")
 # Files where a line of "=" is legitimate content (a setext/rst heading
-# underline), so a divider-shaped line inside a REPLACE part is kept rather
+# underline, an AsciiDoc block delimiter), so a divider-shaped line inside a REPLACE part is kept rather
 # than rejected as a second divider (#338).
-_MARKUP_SUFFIXES = (".md", ".markdown", ".rst", ".txt", ".adoc")
+# Not .txt (#340): the .txt files a coder edits are mostly requirements and
+# constraints, where a pasted "=======" is exactly the mangled-block bug the
+# guard exists for. .adoc stays: AsciiDoc example blocks are delimited by
+# any run of 4+ "=", so a "=======" line is legitimate content there.
+_MARKUP_SUFFIXES = (".md", ".markdown", ".rst", ".adoc")
 _REPLACE_MARKER_RE = re.compile(r"^>{5,9} ?REPLACE[ \t]*$")
 
 # Fallbacks, in order, when a SEARCH block has no exact match. Each is
@@ -2942,8 +2946,28 @@ def verifier_venv_dir(repo_path: str) -> Path:
     root = os.environ.get(VERIFIER_VENV_DIR_ENV) or str(
         Path.home() / ".issue-worm" / "verifier-venvs"
     )
-    key = hashlib.sha1(str(repo).lower().encode("utf-8")).hexdigest()[:10]
-    return Path(root) / f"{repo.name}-{key}"
+    key_path = _venv_key_path(repo)
+    key = hashlib.sha1(key_path.encode("utf-8")).hexdigest()[:10]
+    # The name comes from the same folded path as the hash, so one checkout
+    # spelled two ways maps to one directory name too, not just one hash.
+    return Path(root) / f"{Path(key_path).name}-{key}"
+
+
+# Platforms whose default filesystem ignores case (NTFS, APFS/HFS+), where
+# "C:\Repo" and "c:\repo" are one checkout and must share one venv. A Mac
+# on a case-sensitive APFS volume is the exception this accepts: there, two
+# checkouts differing only in case would still share one, as every
+# checkout on every platform did before #473.
+_CASE_INSENSITIVE_PLATFORMS = ("win32", "darwin")
+
+
+def _venv_key_path(repo: Path) -> str:
+    """``repo`` as the venv key sees it: case folded only where the platform's
+    filesystem is case-insensitive. On Linux, /home/u/Repo and /home/u/repo
+    are different checkouts, and sharing a venv would run one's checks
+    against the other's editable install (#473)."""
+    text = str(repo)
+    return text.lower() if sys.platform in _CASE_INSENSITIVE_PLATFORMS else text
 
 
 def _dependency_digest(repo: Path, install_args: list[list[str]]) -> str:

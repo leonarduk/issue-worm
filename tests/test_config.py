@@ -693,6 +693,18 @@ def test_target_env_vars_does_not_mistake_delimiter_in_path_for_scheme():
     assert env_vars["OLLAMA_ENDPOINT"] == "http://myhost:11434/a://b"
 
 
+def test_target_env_vars_prefixes_a_malformed_single_slash_scheme():
+    """urlparse("http:/host").scheme is "http", but no "http://" follows, so
+    it is not treated as carrying a scheme and gets one prepended. Garbage
+    in, visibly garbage out - the request then fails on an obviously odd
+    URL rather than quietly guessing what was meant (#604)."""
+    target = CoderTarget(name="desk", host="http:/host", model="qwen2.5-coder")
+
+    env_vars = target_env_vars(target)
+
+    assert env_vars["OLLAMA_ENDPOINT"] == "http://http:/host"
+
+
 def test_target_env_vars_preserves_model_tag():
     """The model field is passed through untouched, tag and all."""
     target = CoderTarget(name="desk", host="localhost:11434", model="qwen2.5-coder:7b")

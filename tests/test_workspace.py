@@ -3212,6 +3212,26 @@ def test_literal_diff_search_line_in_replace_text_fails_loudly_with_a_hint(tail)
     assert "truncated" not in message
 
 
+@pytest.mark.parametrize(
+    ("path", "kept"),
+    [("doc.md", True), ("doc.rst", True), ("doc.adoc", True), ("requirements.txt", False), ("a.py", False)],
+)
+def test_second_divider_is_content_only_in_markup_files(path, kept):
+    """A "=======" inside a REPLACE part is legitimate in markup (a heading
+    underline, an AsciiDoc block delimiter) and a mangled block anywhere
+    else - including .txt, where it would land in a requirements file
+    (#338, #340)."""
+    body = "<<<<<<< SEARCH\nold\n=======\nnew\n=======\n>>>>>>> REPLACE\n"
+    output = f"=== FILE: {path} ===\n=== MODE: EDIT ===\n{body}=== END FILE ===\n"
+
+    if kept:
+        (change,) = parse_coder_output(output, [path])
+        assert _apply_search_replace("old\n", change.body, path)[0] == "new\n=======\n"
+    else:
+        with pytest.raises(MalformedOutputError, match="second '=======' divider"):
+            parse_coder_output(output, [path])
+
+
 def test_mode_full_carries_a_literal_diff_search_line():
     """The way out the hint names. No EDIT block can carry a SEARCH-shaped
     line in its REPLACE text - the canonical form reads one as a missing
