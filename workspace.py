@@ -2110,6 +2110,7 @@ def ci_check_env(
     *,
     home: str,
     venv_dir: str | None = None,
+    is_windows: bool | None = None,
 ) -> dict[str, str]:
     """The full environment for the target repo's CI-check subprocess.
 
@@ -2149,17 +2150,21 @@ def ci_check_env(
     ``os.environ`` here reintroduces exactly the leak this exists to stop.
     A ``None`` value in ``extra_env`` is dropped rather than coerced to the
     string ``"None"``.
+
+    ``is_windows`` defaults to the running platform; it exists so the
+    Windows branch can be tested off Windows, where patching ``os.name``
+    itself would break ``pathlib`` (#251), as for :func:`_prefer_git_bash`.
     """
-    passthrough = (
-        _CI_ENV_PASSTHROUGH_WINDOWS if os.name == "nt" else _CI_ENV_PASSTHROUGH_POSIX
-    )
+    if is_windows is None:
+        is_windows = os.name == "nt"
+    passthrough = _CI_ENV_PASSTHROUGH_WINDOWS if is_windows else _CI_ENV_PASSTHROUGH_POSIX
     env: dict[str, str] = {}
     for key in passthrough:
         value = os.environ.get(key)
         if value is not None:
             env[key] = value
     env["HOME"] = home
-    if os.name == "nt":
+    if is_windows:
         env["USERPROFILE"] = home
         env["TEMP"] = home
         env["TMP"] = home
@@ -2171,7 +2176,7 @@ def ci_check_env(
         python_path.append(str(repo / "src"))
     env["PYTHONPATH"] = os.pathsep.join(python_path)
     if env.get("PATH"):
-        env["PATH"] = _prefer_git_bash(env["PATH"])
+        env["PATH"] = _prefer_git_bash(env["PATH"], is_windows=is_windows)
     if venv_dir is not None:
         env["PATH"] = os.pathsep.join(
             part for part in (str(_venv_scripts_dir(venv_dir)), env.get("PATH")) if part

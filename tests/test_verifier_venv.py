@@ -332,7 +332,7 @@ def test_run_ci_checks_keeps_the_runner_from_the_tools_own_path(tmp_path):
         patch("workspace.ensure_verifier_venv", return_value=tmp_path / "venv"),
         patch("workspace.shutil.which", return_value="/tool/bin/cicaid") as which,
         # Its own which("bash") lookup on Windows is covered separately.
-        patch("workspace._prefer_git_bash", side_effect=lambda path: path),
+        patch("workspace._prefer_git_bash", side_effect=lambda path, **_: path),
         patch("workspace.subprocess.run", side_effect=fake_run),
     ):
         run_ci_checks(str(tmp_path), ["cicaid", "run-ci-checks", "--all"])
@@ -884,7 +884,7 @@ def test_ci_check_env_applies_the_git_bash_preference(tmp_path, monkeypatch):
     with patch("workspace._prefer_git_bash", return_value="git-bash;original") as prefer:
         env = ci_check_env(str(tmp_path), home=str(tmp_path / "home"))
 
-    prefer.assert_called_once_with("original")
+    prefer.assert_called_once_with("original", is_windows=os.name == "nt")
     assert env["PATH"] == "git-bash;original"
 
 
@@ -895,9 +895,9 @@ def test_ci_check_env_orders_venv_then_git_bash_then_the_original_path(
     scripts must come first, Git Bash's usr/bin next, then the inherited
     PATH - swapping the two prepends in ci_check_env must fail this.
 
-    _prefer_git_bash is still the real function; only its is_windows
-    default is pinned to True, because ci_check_env takes the platform from
-    os.name and this runs on Linux CI too."""
+    _prefer_git_bash is still the real function; ci_check_env is told the
+    platform is Windows (is_windows=True, #251), since this runs on Linux
+    CI too."""
     git_root = _git_for_windows(tmp_path / "Git")
     system32 = str(tmp_path / "Windows" / "System32")
     git_cmd = str(git_root / "cmd")
@@ -909,16 +909,11 @@ def test_ci_check_env_orders_venv_then_git_bash_then_the_original_path(
         }
     )
     venv = tmp_path / "venv"
-    real_prefer = workspace._prefer_git_bash
 
-    with (
-        patch("workspace.shutil.which", side_effect=which),
-        patch(
-            "workspace._prefer_git_bash",
-            side_effect=lambda path: real_prefer(path, is_windows=True),
-        ),
-    ):
-        env = ci_check_env(str(tmp_path), home=str(tmp_path / "home"), venv_dir=str(venv))
+    with patch("workspace.shutil.which", side_effect=which):
+        env = ci_check_env(
+            str(tmp_path), home=str(tmp_path / "home"), venv_dir=str(venv), is_windows=True
+        )
 
     assert env["PATH"].split(os.pathsep) == [
         str(workspace._venv_scripts_dir(venv)),

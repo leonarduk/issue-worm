@@ -966,6 +966,50 @@ def test_ci_check_env_is_an_allowlist_not_a_copy_of_os_environ(repo, tmp_path, m
     assert set(env) <= documented, sorted(set(env) - documented)
 
 
+_WINDOWS_ESSENTIALS = {
+    "SYSTEMROOT": r"C:\Windows",
+    "SYSTEMDRIVE": "C:",
+    "WINDIR": r"C:\Windows",
+    "COMSPEC": r"C:\Windows\system32\cmd.exe",
+    "PATHEXT": ".COM;.EXE;.BAT",
+    "PROGRAMDATA": r"C:\ProgramData",
+}
+
+
+def test_ci_check_env_windows_branch_passes_what_windows_needs(repo, tmp_path, monkeypatch):
+    """The Windows branch of the allowlist (#251): the variables a Windows
+    process can't start without, and the throwaway home as USERPROFILE,
+    TEMP and TMP - never the POSIX locale/TZ set or TMPDIR."""
+    for key, value in _WINDOWS_ESSENTIALS.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("LANG", "en_GB.UTF-8")
+    monkeypatch.setenv("TZ", "UTC")
+
+    env = ci_check_env(repo, home=str(tmp_path), is_windows=True)
+
+    for key, value in _WINDOWS_ESSENTIALS.items():
+        assert env[key] == value, key
+    for key in ("HOME", "USERPROFILE", "TEMP", "TMP"):
+        assert env[key] == str(tmp_path), key
+    for key in ("TMPDIR", "LANG", "TZ"):
+        assert key not in env, key
+
+
+def test_ci_check_env_posix_branch_leaves_out_the_windows_set(repo, tmp_path, monkeypatch):
+    """The mirror image: off Windows none of the Windows-only variables pass,
+    even when set, and the temp dir is TMPDIR."""
+    for key, value in _WINDOWS_ESSENTIALS.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("LANG", "en_GB.UTF-8")
+
+    env = ci_check_env(repo, home=str(tmp_path), is_windows=False)
+
+    for key in (*_WINDOWS_ESSENTIALS, "USERPROFILE", "TEMP", "TMP"):
+        assert key not in env, key
+    assert env["TMPDIR"] == str(tmp_path)
+    assert env["LANG"] == "en_GB.UTF-8"
+
+
 def test_ci_check_env_extra_env_is_a_delta_that_wins(repo, tmp_path):
     env = ci_check_env(
         repo, {"OLLAMA_ENDPOINT": "http://pc-a:11434", "HOME": "/elsewhere"}, home=str(tmp_path)
