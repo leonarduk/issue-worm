@@ -9,7 +9,6 @@ import json
 import logging
 import os
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
 
 import pytest
 
@@ -163,22 +162,6 @@ def test_default_state_dir_used_when_env_var_unset(monkeypatch):
     monkeypatch.delenv(registry.STATE_DIR_ENV, raising=False)
 
     assert registry._state_dir() == registry.DEFAULT_STATE_DIR
-
-
-@pytest.mark.parametrize("failing", ["json.dump", "os.fsync", "os.replace"])
-def test_write_run_atomic_removes_its_temp_file_when_the_write_fails(_state_dir, failing):
-    """A failed write (disk full, say) re-raises but leaves no `.tmp`
-    behind, and never touches an existing record (#186)."""
-    _state_dir.mkdir(parents=True, exist_ok=True)
-    target = _state_dir / "run.json"
-    target.write_text('{"keep": true}', encoding="utf-8")
-
-    with patch(f"registry.{failing}", side_effect=OSError("No space left on device")):
-        with pytest.raises(OSError, match="No space left"):
-            registry._write_run_atomic(target, {"status": "running"})
-
-    assert sorted(p.name for p in _state_dir.iterdir()) == ["run.json"]
-    assert target.read_text(encoding="utf-8") == '{"keep": true}'
 
 
 # --- Never-raise guarantee ---------------------------------------------

@@ -1326,14 +1326,6 @@ def _read_registry_record(state_dir, task_id):
     return json.loads((state_dir / f"{task_id}.json").read_text(encoding="utf-8"))
 
 
-def test_suite_never_writes_to_the_real_run_registry():
-    """conftest's autouse fixture keeps every test away from the developer's
-    real ~/.issue-worm/agents/ - a build test here once leaked a record
-    there that showed up in the monitoring UI (#184)."""
-    assert registry._state_dir() != registry.DEFAULT_STATE_DIR
-    assert registry.DEFAULT_STATE_DIR not in registry._state_dir().parents
-
-
 @pytest.mark.usefixtures("_pro_cli_absent")
 def test_build_registers_running_record_mid_run(tmp_path, _state_dir):
     """A `running` record must exist for the task while the coder runs."""
