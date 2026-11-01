@@ -12,6 +12,8 @@ overwrite the sentinel themselves.
 """
 
 import ast
+import importlib
+import importlib.util
 import inspect
 import json
 import os
@@ -111,6 +113,78 @@ def test_core_command_reports_unavailable(command, monkeypatch, capsys):
     assert "issue-worm-pro" in captured.err
 
 
+def _write_importable_pro_cli(directory, marker):
+    """A genuine `pro_cli.py` on disk that records being imported, so a test
+    can tell a real import apart from a sentinel-blocked one."""
+    (directory / "pro_cli.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('imported')\n"
+        "def main():\n"
+        "    raise SystemExit(0)\n"
+    )
+
+
+@pytest.mark.usefixtures("_pro_cli_absent")
+def test_pro_cli_absent_beats_a_genuinely_importable_pro_cli(tmp_path, monkeypatch, capsys):
+    """`_pro_cli_absent` (and conftest's identical autouse sentinel) must
+    keep `cli.main()` on the free-tier path even when a real `pro_cli` is
+    importable - the dev-machine case they exist for (#231). If the probe
+    ever moved from `import pro_cli` to `importlib.util.find_spec`, which a
+    `None` in `sys.modules` doesn't fool, this fails instead of ~30 tests
+    silently dispatching to the real pro.
+
+    The second half is the control: with the sentinel lifted, the same
+    module really is imported, so the first half isn't passing only
+    because the fake was never reachable."""
+    marker = tmp_path / "imported"
+    _write_importable_pro_cli(tmp_path, marker)
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    with patch.object(sys, "argv", ["issue-worm", "triage"]), pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 2
+    assert "issue-worm-pro" in capsys.readouterr().err
+    assert not marker.exists()
+
+    monkeypatch.delitem(sys.modules, "pro_cli")
+    assert cli._try_import_pro_cli() is not None
+    assert marker.exists()
+
+
+def test_try_import_pro_cli_returns_none_when_pro_cli_is_genuinely_absent(monkeypatch):
+    """The real absent-module path, without the `sys.modules` sentinel the
+    rest of the suite uses to simulate it (#377): `pro_cli` removed from
+    `sys.modules` and from every `sys.path` entry, so `import pro_cli`
+    raises a genuine `ModuleNotFoundError`. `_try_import_pro_cli` is the
+    exact probe `main` dispatches on, and it imports lazily, so no reload
+    of `cli` is needed.
+
+    Skips where an import hook outside `sys.path` (e.g. a setuptools
+    editable-install finder on `sys.meta_path`) still finds pro: removing
+    that would mean unpicking the developer's environment. CI never has
+    pro installed, so it always runs there."""
+    monkeypatch.delitem(sys.modules, "pro_cli", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "path",
+        [
+            entry
+            for entry in sys.path
+            if not (os.path.exists(os.path.join(entry or ".", "pro_cli.py"))
+                    or os.path.isdir(os.path.join(entry or ".", "pro_cli")))
+        ],
+    )
+    importlib.invalidate_caches()
+    if importlib.util.find_spec("pro_cli") is not None:
+        pytest.skip("pro_cli is reachable through an import hook outside sys.path")
+
+    with pytest.raises(ModuleNotFoundError):
+        import pro_cli  # noqa: F401
+
+    assert cli._try_import_pro_cli() is None
+
+
 @pytest.mark.parametrize("command", ["triage", "poll"])
 def test_core_command_dispatches_to_pro_cli_when_installed(command, monkeypatch, capsys):
     """#352: pro_cli.main() re-parses the original sys.argv itself (it has
@@ -136,7 +210,7 @@ def test_core_command_dispatches_to_pro_cli_when_installed(command, monkeypatch,
     assert "issue-worm-pro" not in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("command", ["triage", "poll"])
+@pytest.mark.parametrize("command", ["triage", "poll", "build"])
 def test_core_command_help_dispatches_before_this_shells_own_parser(command, monkeypatch, capsys):
     """The bug #352 flags as the reason it survived review: --help used to
     be swallowed by this shell's own placeholder subparser, silently
@@ -149,6 +223,11 @@ def test_core_command_help_dispatches_before_this_shells_own_parser(command, mon
     "dispatched after parse_args() picked it out of args.command." Only
     --help (unknown to the placeholder subparser under the old design)
     actually distinguishes the two.
+
+    `build` is included since #372 made it pro-dispatchable (#92): with
+    pro installed, `build --help` must show pro's flags, not this shell's.
+    Asserting the dispatch is the contract this shell owns - the flags
+    pro then prints are pro's own concern and tested there.
 
     Overwrites the autouse `_neutralize_pro_cli` sentinel with a MagicMock
     so the dispatch path is exercised regardless of whether pro is
@@ -191,14 +270,19 @@ def test_core_command_help_falls_back_to_this_shell_when_pro_not_installed(
 
 
 @pytest.mark.parametrize("flag", ["--version", "--vers"])
-@pytest.mark.parametrize("command", ["triage", "poll"])
+@pytest.mark.parametrize("command", ["triage", "poll", "build"])
 def test_version_flag_wins_over_dispatch_regardless_of_abbreviation(
     flag, command, monkeypatch, capsys
 ):
     """`--version` (and argparse's own abbreviations of it, like --vers)
     must always mean "print this shell's version and exit," even combined
     with a core command and even with pro_cli installed - dispatching to
-    pro here would silently print pro's version instead."""
+    pro here would silently print pro's version instead. `build` joined
+    the dispatchable commands under #372, so it is covered too (#97).
+
+    Only a top-level `--version` (before the command) is this shell's:
+    `issue-worm build --version` deliberately goes to pro, which owns the
+    subcommand's flags - see the #195 note in `main`."""
     # Overwrites the autouse `_neutralize_pro_cli` sentinel with a
     # MagicMock so the "pro installed" branch is exercised even when pro
     # is genuinely absent from the machine running the suite.
@@ -2382,10 +2466,16 @@ def _pins_pro_cli_via_ast(tree: ast.AST) -> bool:
                 return True
         if attr == "setattr" and len(args) >= 2:
             target, name = args[0], args[1]
+            # The target must be `cli` itself, as the setitem branch above
+            # demands `sys.modules`: patching `_try_import_pro_cli` on any
+            # other object leaves cli's dispatch untouched (#370). An alias
+            # (`import cli as c`) isn't recognised - this module only ever
+            # spells it `cli`, and a false "unpinned" is the safe failure.
+            is_cli = isinstance(target, ast.Name) and target.id == "cli"
             is_try_import = (
                 isinstance(name, ast.Constant) and name.value == "_try_import_pro_cli"
             )
-            if is_try_import:
+            if is_cli and is_try_import:
                 return True
     return False
 
@@ -2467,6 +2557,22 @@ def test_pins_pro_cli_via_ast_rejects_a_bare_mention_in_a_comment():
         '    monkeypatch.setitem(sys.modules, "pro_cli", None)\n'
     )
     assert _pins_pro_cli_via_ast(real_pin) is True
+
+
+@pytest.mark.parametrize(
+    "call, expected",
+    [
+        ('monkeypatch.setattr(cli, "_try_import_pro_cli", lambda: None)', True),
+        ('monkeypatch.setattr(other, "_try_import_pro_cli", lambda: None)', False),
+        ('monkeypatch.setattr(cli.sub, "_try_import_pro_cli", lambda: None)', False),
+    ],
+    ids=["cli", "other-module", "cli-attribute"],
+)
+def test_pins_pro_cli_via_ast_setattr_needs_cli_as_its_target(call, expected):
+    """Only patching `cli._try_import_pro_cli` controls dispatch; the same
+    name patched on another object pins nothing (#370)."""
+    tree = ast.parse(f"def test_x(monkeypatch):\n    {call}\n")
+    assert _pins_pro_cli_via_ast(tree) is expected
 
     real_pin_via_try_import = ast.parse(
         'def test_x(monkeypatch):\n'
