@@ -372,8 +372,8 @@ what the check exists to surface.
 
 The automated pipeline (a deterministic, bounded Coder → Verifier →
 Analyser retry loop with a fixed revision budget and independent
-verification, plus LLM-based issue triage/review; a human still approves
-and merges every PR) is the part of issue-worm that's actually hard to
+verification, whose output is a pull request for a human to review, plus
+LLM-based issue triage/review) is the part of issue-worm that's actually hard to
 reproduce, and is kept in a private package, issue-worm-pro. Contact
 the maintainer for access, or watch this repo — a payment link is
 planned. See the [open-core split](docs/monetization-split-plan.md) for a

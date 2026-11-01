@@ -4,9 +4,9 @@ Issue in, PR out: create files an issue (guided), history reports what
 was done, and build runs one standalone, single-pass review+implement
 attempt via a local Ollama coder. The full automated pipeline - a
 deterministic, bounded Coder -> Verifier -> Analyser retry loop with a
-fixed revision budget and a human approving the PR, plus a scheduler
-(`triage`, `poll`) - is part of `issue-worm-pro`, a private package; see
-the README for access.
+fixed revision budget whose output is a PR for a human to review, plus
+a scheduler (`triage`, `poll`) - is part of `issue-worm-pro`, a private
+package; see the README for access.
 """
 
 import argparse
