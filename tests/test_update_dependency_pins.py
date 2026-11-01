@@ -371,11 +371,13 @@ def _http_error(code, headers=None):
 def test_http_json_names_a_rate_limit(code, headers):
     """A rate-limited call says so (#144), instead of a bare 403 that reads
     like a permissions problem."""
-    with patch("urllib.request.urlopen", side_effect=_http_error(code, headers)):
+    original = _http_error(code, headers)
+    with patch("urllib.request.urlopen", side_effect=original):
         with pytest.raises(PinError, match="GitHub API rate limit exceeded") as exc:
             _http_json("https://api.example.invalid")
 
     assert exc.value.status == code
+    assert exc.value.__cause__ is original  # the HTTP response stays reachable (#773)
 
 
 def test_http_json_reports_other_http_errors_with_their_status():
