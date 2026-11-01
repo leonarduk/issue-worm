@@ -1769,13 +1769,26 @@ def test_ensure_gitignored_in_a_linked_worktree_writes_the_shared_exclude(repo, 
     worktree = tmp_path / "linked"
     _git(repo, "worktree", "add", "-q", str(worktree))
 
+    def rev_parse(*args):
+        # Relative output is relative to the worktree (git's cwd), never to
+        # this process's cwd.
+        return (worktree / _git(str(worktree), "rev-parse", *args).stdout.strip()).resolve()
+
+    # The git fact this relies on, checked against whatever git runs this
+    # test: from a linked worktree --git-path info/exclude is the *common*
+    # dir's exclude, not one under the per-worktree gitdir.
+    common_exclude = rev_parse("--git-common-dir") / "info" / "exclude"
+    assert rev_parse("--git-path", "info/exclude") == common_exclude
+    assert common_exclude == _exclude_path(repo).resolve()
+    per_worktree = rev_parse("--git-dir")
+    assert per_worktree != rev_parse("--git-common-dir")
+
     ensure_gitignored(str(worktree))
 
     shared = _exclude_path(repo)  # <main>/.git/info/exclude
     lines = shared.read_text(encoding="utf-8").splitlines()
     for pattern in WORM_GITIGNORE_PATTERNS:
         assert pattern in lines
-    per_worktree = Path(_git(str(worktree), "rev-parse", "--git-dir").stdout.strip())
     assert not (per_worktree / "info" / "exclude").exists()
 
     (worktree / ".issue-worm").mkdir()
