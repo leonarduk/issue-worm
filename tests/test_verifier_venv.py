@@ -1413,16 +1413,3 @@ def test_venv_dir_folds_case_only_on_case_insensitive_platforms(
     lower = verifier_venv_dir(str(tmp_path / "repo"))
 
     assert (upper.name.split("-")[-1] == lower.name.split("-")[-1]) is shared
-
-
-@pytest.mark.parametrize("name", ["PIP_TARGET", "PIP_PREFIX", "PIP_USER", "PIP_ROOT"])
-def test_setup_env_drops_pip_settings_that_install_outside_the_venv(monkeypatch, name):
-    """These would put the target's dependencies somewhere other than the
-    venv its checks then run in (#474); other PIP_* settings still pass."""
-    monkeypatch.setenv(name, "/elsewhere")
-    monkeypatch.setenv("PIP_FIND_LINKS", "/wheels")
-
-    env = workspace._venv_setup_env()
-
-    assert name not in env
-    assert env["PIP_FIND_LINKS"] == "/wheels"

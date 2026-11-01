@@ -2757,16 +2757,6 @@ _VENV_SETUP_PASSTHROUGH = (
 )
 
 
-# pip settings that move installs out of the interpreter's own prefix -
-# into a target or prefix directory, the user site, or under another root.
-# Passed into the verifier venv's setup they would silently install the
-# target's dependencies outside the venv the checks then run in (#474).
-# A denylist, not an allowlist: every other PIP_* (index, mirrors, certs,
-# find-links, constraints, timeouts, config file) is how an offline or
-# corporate setup reaches its packages at all, and still applies.
-_PIP_INSTALL_LOCATION_VARS = frozenset({"PIP_TARGET", "PIP_PREFIX", "PIP_USER", "PIP_ROOT"})
-
-
 def _venv_scripts_dir(venv_dir: str | Path) -> Path:
     return Path(venv_dir) / ("Scripts" if os.name == "nt" else "bin")
 
@@ -3005,13 +2995,7 @@ def _venv_setup_env() -> dict[str, str]:
         for key in (*passthrough, *_VENV_SETUP_PASSTHROUGH)
         if key in os.environ
     }
-    env.update(
-        {
-            key: value
-            for key, value in os.environ.items()
-            if key.startswith("PIP_") and key not in _PIP_INSTALL_LOCATION_VARS
-        }
-    )
+    env.update({key: value for key, value in os.environ.items() if key.startswith("PIP_")})
     env["PYTHONIOENCODING"] = "utf-8"
     return env
 
