@@ -32,8 +32,11 @@ test gets a fresh sentinel and no state leaks between tests.
 """
 
 import sys
+from pathlib import Path
 
 import pytest
+
+import registry
 
 
 @pytest.fixture(autouse=True)
@@ -47,3 +50,66 @@ def _neutralize_pro_cli(monkeypatch):
     fixture and therefore wins.
     """
     monkeypatch.setitem(sys.modules, "pro_cli", None)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_registry_state_dir(tmp_path_factory, monkeypatch):
+    """Point the run registry at a fresh temp dir for every test (#184).
+
+    Without this, any test that reaches `registry.register` - directly or
+    through `cli._run_build` - wrote into the developer's real
+    `~/.issue-worm/agents/`: fabricated runs showed up in the monitoring
+    UI, and `register()`'s pruning could delete genuine run history. Suite
+    -wide and autouse so a new test can't reintroduce the leak by
+    forgetting a fixture. A `tmp_path_factory` dir, not `tmp_path`, so it
+    never appears inside a test's own workspace listing. Tests that need a
+    specific state dir (tests/test_registry.py, test_cli's `_state_dir`)
+    set the variable again in their own fixture, which wins.
+    """
+    monkeypatch.setenv(registry.STATE_DIR_ENV, str(tmp_path_factory.mktemp("issue-worm-state")))
+
+
+class RealRegistryWriteError(RuntimeError):
+    """A test reached the developer's real run registry (#184)."""
+
+
+def _is_in_real_state_dir(path) -> bool:
+    real = registry.DEFAULT_STATE_DIR.resolve()
+    target = Path(path).resolve()
+    return target == real or real in target.parents
+
+
+@pytest.fixture(autouse=True)
+def _forbid_real_registry_writes(monkeypatch):
+    """Tripwire behind `_isolate_registry_state_dir`: fail any test that
+    tries to write or prune inside the real `registry.DEFAULT_STATE_DIR`.
+
+    Wraps the registry's only two mutators - `_write_run_atomic` (behind
+    register/heartbeat/finish) and `_prune_terminal_records` (the deletes
+    in register) - so the write is blocked before it happens. Each attempt
+    is also recorded and asserted on at teardown, because `register()` and
+    friends swallow exceptions by design and would otherwise hide the
+    raise. Yields the list of attempts so the tripwire's own tests can
+    inspect (and clear) it.
+    """
+    attempts: list[Path] = []
+    real_write = registry._write_run_atomic
+    real_prune = registry._prune_terminal_records
+
+    def _check(path) -> None:
+        if _is_in_real_state_dir(path):
+            attempts.append(Path(path))
+            raise RealRegistryWriteError(f"test reached the real run registry: {path}")
+
+    def _guarded_write(path, record):
+        _check(path)
+        real_write(path, record)
+
+    def _guarded_prune():
+        _check(registry._state_dir())
+        real_prune()
+
+    monkeypatch.setattr(registry, "_write_run_atomic", _guarded_write)
+    monkeypatch.setattr(registry, "_prune_terminal_records", _guarded_prune)
+    yield attempts
+    assert not attempts, f"tests must not touch the real run registry: {attempts}"
