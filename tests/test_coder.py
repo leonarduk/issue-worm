@@ -1,5 +1,6 @@
 """Tests for the coders used by the free-tier `build` flow."""
 
+import logging
 import sys
 from unittest.mock import MagicMock, patch
 
@@ -150,16 +151,69 @@ def test_gpu_strategy_whitespace_only_value_falls_back_to_conservative(monkeypat
     assert calls == ["conservative"]
 
 
-def test_gpu_strategy_falls_back_when_ollama_tools_gpu_missing(monkeypatch):
+def test_gpu_strategy_falls_back_when_ollama_tools_gpu_missing(monkeypatch, caplog):
     """OLLAMA_GPU_STRATEGY set, but ollama_tools.gpu isn't importable (e.g.
     an older ollama-tools install without the STRATEGIES constant) - this
-    must still fall back to conservative rather than raising."""
+    must still fall back to conservative rather than raising, and say so,
+    since the user explicitly asked for a strategy (#468)."""
     monkeypatch.setenv("OLLAMA_GPU_STRATEGY", "proportional")
     calls: list[str] = []
     _fake_ollama_tools(monkeypatch, calls)
     monkeypatch.delitem(sys.modules, "ollama_tools.gpu", raising=False)
-    _default_ollama_model()
+    with caplog.at_level(logging.WARNING, logger="coder"):
+        _default_ollama_model()
     assert calls == ["conservative"]
+    assert "ollama_tools.gpu is not installed" in caplog.text
+    assert "'proportional'" in caplog.text
+
+
+class _RaisingFinder:
+    """A meta-path finder whose import of ollama_tools.gpu blows up the way
+    a broken install does (a non-ImportError from the module's own code)."""
+
+    def find_spec(self, name, path=None, target=None):
+        if name == "ollama_tools.gpu":
+            raise RuntimeError("broken ollama-tools install")
+        return None
+
+
+@pytest.mark.parametrize("value", ["proportional", "yolo"])
+def test_gpu_strategy_falls_back_when_ollama_tools_gpu_raises(monkeypatch, caplog, value):
+    """ollama_tools.gpu present but failing on import must not break coder
+    construction: the broad except falls back to conservative and warns
+    (#467)."""
+    monkeypatch.setenv("OLLAMA_GPU_STRATEGY", value)
+    calls: list[str] = []
+    _fake_ollama_tools(monkeypatch, calls)
+    monkeypatch.delitem(sys.modules, "ollama_tools.gpu", raising=False)
+    # A __path__ makes the fake ollama_tools a package, so importing its
+    # submodule consults sys.meta_path (and the raising finder) instead of
+    # failing early with "not a package".
+    monkeypatch.setattr(sys.modules["ollama_tools"], "__path__", [], raising=False)
+    monkeypatch.setattr(sys, "meta_path", [_RaisingFinder(), *sys.meta_path])
+    with caplog.at_level(logging.WARNING, logger="coder"):
+        _default_ollama_model()
+    assert calls == ["conservative"]
+    assert "failed to import" in caplog.text
+    assert "not installed" not in caplog.text  # the other branch, not this one
+
+
+@pytest.mark.parametrize("value", [None, "", "   "])
+def test_gpu_strategy_unset_never_imports_ollama_tools_gpu(monkeypatch, caplog, value):
+    """Unset or blank: conservative, silently, and ollama_tools.gpu is not
+    even imported - so a missing or broken one can't matter (#467, #468)."""
+    if value is None:
+        monkeypatch.delenv("OLLAMA_GPU_STRATEGY", raising=False)
+    else:
+        monkeypatch.setenv("OLLAMA_GPU_STRATEGY", value)
+    calls: list[str] = []
+    _fake_ollama_tools(monkeypatch, calls)
+    monkeypatch.delitem(sys.modules, "ollama_tools.gpu", raising=False)
+    monkeypatch.setattr(sys, "meta_path", [_RaisingFinder(), *sys.meta_path])
+    with caplog.at_level(logging.WARNING, logger="coder"):
+        _default_ollama_model()
+    assert calls == ["conservative"]
+    assert caplog.text == ""
 
 
 def test_local_ollama_coder_uses_default_ollama_model_when_unset(monkeypatch):

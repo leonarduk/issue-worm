@@ -104,6 +104,14 @@ def _gpu_strategy() -> str:
     try:
         from ollama_tools.gpu import STRATEGIES
     except ImportError:
+        # Only reachable with the env var set (unset returned above), so the
+        # user explicitly asked for a strategy: say why it is being ignored,
+        # as the other two fallbacks do (#468).
+        logger.warning(
+            "OLLAMA_GPU_STRATEGY=%r was set but ollama_tools.gpu is not "
+            "installed (ollama-tools missing or too old); using %r",
+            raw, _DEFAULT_GPU_STRATEGY,
+        )
         return _DEFAULT_GPU_STRATEGY
     except Exception:  # noqa: BLE001 - a broken ollama-tools install must not break coder construction
         logger.warning(
