@@ -1013,6 +1013,33 @@ def test_progress_command_stage_done_requires_elapsed():
 
 
 @pytest.mark.usefixtures("_pro_cli_absent")
+@pytest.mark.parametrize(
+    ("mode", "target"),
+    [
+        (["--stage-start", "verifier"], "record_stage_start"),
+        (["--pr-url", "https://github.com/o/r/pull/9"], "finish"),
+        (["--failure", "boom"], "finish"),
+    ],
+    ids=["stage-start", "pr-url", "failure"],
+)
+def test_progress_command_rejects_elapsed_without_stage_done(mode, target):
+    """--elapsed only means something with --stage-done; alongside any
+    other mode it is a wiring bug in the caller, rejected rather than
+    silently ignored (#380)."""
+    with patch.object(
+        sys,
+        "argv",
+        ["issue-worm", "progress", "--issue", "5", "--repo", "o/r", *mode, "--elapsed", "3"],
+    ), patch.object(progress_reporter, target) as mock_target, pytest.raises(
+        SystemExit
+    ) as exc:
+        cli.main()
+
+    assert exc.value.code == 2
+    mock_target.assert_not_called()
+
+
+@pytest.mark.usefixtures("_pro_cli_absent")
 def test_progress_command_stage_done_with_elapsed_dispatches():
     with patch.object(
         sys,
@@ -1497,6 +1524,40 @@ def test_build_records_failed_run_when_build_coder_raises_config_error(tmp_path,
     assert len(records) == 1
     assert records[0]["status"] == "failed"
     assert records[0]["failure_category"] == "coder_unreachable"
+
+
+@pytest.mark.usefixtures("_pro_cli_absent")
+@pytest.mark.parametrize(
+    ("output", "apply_error"),
+    [
+        ("no file sections here at all", None),
+        ("=== FILE: a.py ===\n=== MODE: FULL ===\nx = 1\n=== END FILE ===\n", WorkspaceError("reset failed")),
+        ("=== FILE: a.py ===\n=== MODE: FULL ===\nx = 1\n=== END FILE ===\n", OSError("disk full")),
+    ],
+    ids=["malformed-output", "workspace-error", "os-error"],
+)
+def test_build_records_output_shape_failure_to_history(tmp_path, _state_dir, output, apply_error):
+    """Coder output that can't be parsed or applied is a shape failure,
+    not a coder outage: the history record says output_shape, so a caller
+    can retry on shape (#401)."""
+    ready = ReviewResult(ready=True, files=["a.py"], done="it works")
+    with patch.object(
+        sys, "argv", ["issue-worm", "build", "5", "--repo", "o/r"]
+    ), patch("cli._fetch_issue_body", return_value="body"), patch(
+        "cli.review_issue", return_value=ready
+    ), patch("cli.ensure_base_clone", return_value=str(tmp_path)), patch(
+        "cli.build_coder"
+    ) as mock_build_coder, patch(
+        "cli.apply_file_change", side_effect=apply_error
+    ), pytest.raises(SystemExit) as exc:
+        mock_build_coder.return_value.propose.return_value = output
+        cli.main()
+
+    assert exc.value.code == 1
+    records = _read_history_records(tmp_path)
+    assert len(records) == 1
+    assert records[0]["status"] == "failed"
+    assert records[0]["failure_category"] == "output_shape"
 
 
 @pytest.mark.usefixtures("_pro_cli_absent")
