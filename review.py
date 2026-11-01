@@ -91,25 +91,26 @@ def merge_implementation_notes(issue_body: str, section: str) -> str:
     to them left the issue with duplicate headings, which `review_issue`
     tolerates (it takes the first ready section) but a human reading the
     issue should not have to. Uses `review_issue`'s own section rules; text
-    outside those sections is kept verbatim, and `section`'s own trailing
-    newline is kept either way.
+    outside those sections is kept verbatim, spacing around them included.
     """
     issue_body = issue_body or ""
     matches = list(_SECTION_RE.finditer(issue_body))
     if not matches:
         return f"{issue_body}\n\n{section}"
     merged = issue_body
-    # Later sections first, so earlier offsets stay valid. Each is removed
-    # with the blank lines before it; its tail (`\n## next` or nothing)
-    # stays.
+    # Later sections first, so earlier offsets stay valid. A removed
+    # section takes its own text and the newline that led into the next
+    # heading; the blank lines before it then separate what surrounds it.
     for match in reversed(matches[1:]):
-        merged = merged[: match.start()].rstrip("\n") + merged[match.end():]
+        before, after = merged[: match.start()], merged[match.end():]
+        merged = before + after.lstrip("\n") if after else before.rstrip("\n") + "\n"
     first = matches[0]
-    tail = merged[first.end():]
-    replacement = section.lstrip("\n")
-    if tail:
-        replacement = replacement.rstrip("\n")
-    return merged[: first.start()] + replacement + tail
+    # The drafted section takes the replaced one's trailing newlines, so
+    # the spacing before whatever follows is unchanged.
+    old_text = first.group(0)
+    newlines = len(old_text) - len(old_text.rstrip("\n"))
+    replacement = section.strip("\n") + "\n" * newlines
+    return merged[: first.start()] + replacement + merged[first.end():]
 
 
 # A fenced code block's opening line: up to 3 spaces of indent, then 3+

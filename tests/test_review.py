@@ -346,7 +346,7 @@ def test_merge_implementation_notes_replaces_a_malformed_section_in_place():
     merged = merge_implementation_notes(body, _HEALED)
 
     assert merged == (
-        "Intro.\n\n## Implementation notes\nFILES: a.py\nDONE: it works\n## Other\nKeep me.\n"
+        "Intro.\n\n## Implementation notes\nFILES: a.py\nDONE: it works\n\n## Other\nKeep me.\n"
     )
     assert merged.lower().count("## implementation notes") == 1
     assert review_issue(merged).done == "it works"
@@ -357,7 +357,7 @@ def test_merge_implementation_notes_replaces_a_trailing_section():
 
     merged = merge_implementation_notes(body, _HEALED)
 
-    # Ends with the drafted section's own newline, as the append path does.
+    # The replaced section ended with one newline, and so does the result.
     assert merged == "Intro.\n\n" + _HEALED
     assert review_issue(merged).ready is True
 
@@ -372,9 +372,10 @@ def test_merge_implementation_notes_collapses_every_malformed_section():
 
     merged = merge_implementation_notes(body, _HEALED)
 
+    # Blank-line separation between the surviving sections is untouched.
     assert merged == (
-        "Intro.\n\n## Implementation notes\nFILES: a.py\nDONE: it works\n"
-        "## Context\nKeep me.\n## Trailer\nKeep me too.\n"
+        "Intro.\n\n## Implementation notes\nFILES: a.py\nDONE: it works\n\n"
+        "## Context\nKeep me.\n\n## Trailer\nKeep me too.\n"
     )
     assert merged.lower().count("## implementation notes") == 1
     assert review_issue(merged).done == "it works"
