@@ -181,6 +181,25 @@ def test_write_run_atomic_removes_its_temp_file_when_the_write_fails(_state_dir,
     assert target.read_text(encoding="utf-8") == '{"keep": true}'
 
 
+def test_write_run_atomic_reraises_the_write_error_when_cleanup_also_fails(
+    _state_dir, caplog
+):
+    """If removing the `.tmp` fails too, the original write error is still
+    the one that propagates, and the cleanup failure is logged, not raised
+    in its place (#746)."""
+    _state_dir.mkdir(parents=True, exist_ok=True)
+    target = _state_dir / "run.json"
+
+    with patch("registry.os.replace", side_effect=OSError("No space left on device")), patch(
+        "pathlib.Path.unlink", side_effect=PermissionError("unlink denied")
+    ), caplog.at_level(logging.DEBUG, logger="registry"):
+        with pytest.raises(OSError, match="No space left"):
+            registry._write_run_atomic(target, {"status": "running"})
+
+    assert "could not remove" in caplog.text
+    assert "unlink denied" in caplog.text
+
+
 # --- Never-raise guarantee ---------------------------------------------
 
 
