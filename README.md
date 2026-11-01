@@ -354,6 +354,11 @@ requires the private package.
 For a component-by-component breakdown of the public shell and private
 pipeline, see the [open-core split](./docs/monetization-split-plan.md).
 
+## Assets
+
+The logo, where issue-worm uses it, and how you may use it are described in
+[docs/README.md](docs/README.md).
+
 ## License
 
 MIT — see [LICENSE](./LICENSE).
