@@ -411,12 +411,14 @@ def test_http_json_reports_other_http_errors_with_their_status():
     """A 403 that isn't a rate limit is a real permission failure, and a 404
     keeps its status so latest_version can add its token hint."""
     for code in (403, 404):
-        with patch("urllib.request.urlopen", side_effect=_http_error(code, {"X-RateLimit-Remaining": "41"})):
+        original = _http_error(code, {"X-RateLimit-Remaining": "41"})
+        with patch("urllib.request.urlopen", side_effect=original):
             with pytest.raises(PinError) as exc:
                 _http_json("https://api.example.invalid")
 
         assert "rate limit" not in str(exc.value)
         assert exc.value.status == code
+        assert exc.value.__cause__ is original  # chained like the rate-limit path (#782)
 
 
 def test_latest_free_does_not_pass_token():
