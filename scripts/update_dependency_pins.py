@@ -265,8 +265,10 @@ def _http_json(url: str, token: str | None = None) -> dict:
             ) from exc
         raise PinError(f"failed to fetch {url}: {exc}", status=exc.code) from exc
     except (OSError, ValueError) as exc:
-        # OSError covers URLError/HTTPError/timeouts; ValueError covers
-        # JSONDecodeError. Any of these means the version is uncheckable.
+        # HTTPError (an OSError) is handled above, with its status. What is
+        # left: OSError for URLError (DNS, refused connection) and timeouts,
+        # ValueError for JSONDecodeError. Any of these means the version is
+        # uncheckable, and there is no HTTP status to report.
         # KeyboardInterrupt/SystemExit (BaseException) are intentionally
         # never swallowed.
         raise PinError(f"failed to fetch {url}: {exc}") from exc
