@@ -4576,36 +4576,41 @@ def test_run_revision_attempt_uses_the_configured_step_timeout(repo, monkeypatch
 
 
 def test_steps_share_one_budget_and_stop_when_it_runs_out(repo):
-    """The first step uses most of the budget; the second gets only what is
-    left and is stopped with a budget message, not a per-step one; the third
-    never runs (#421)."""
+    """Each step is within its own timeout, but together they are not: the
+    second step gets only what the first left of the total, is stopped with
+    a budget message rather than a per-step one, and the third never runs
+    (#421)."""
     path = _commit_workflow(repo, "on: pull_request\n")
     diff = _apply_and_diff(
-        repo, path, _workflow_with_steps("sleep 1.2", "sleep 10", "echo third-ran")
+        repo, path, _workflow_with_steps("sleep 1.5", "sleep 10", "echo third-ran")
     )
 
-    # Wide margins: 0.8s of budget is left for the second step, which a
-    # slow CI runner still can't mistake for its 3s per-step timeout.
+    # Total above the per-step timeout - the real "many steps add up" case.
+    # Wide margins: the first step finishes 1s inside its 2.5s timeout, and
+    # the second has ~1.5s of the 3s total left, well short of its own 2.5s.
     passed, output = workspace._run_new_workflow_step_scripts(
-        repo, diff, None, timeout=3, total_timeout=2.0
+        repo, diff, None, timeout=2.5, total_timeout=3.0
     )
 
     assert passed is False
-    assert "budget for all new workflow steps ran out" in output
+    assert "the 3s budget for all new workflow steps ran out" in output
     assert "third-ran" not in output
 
 
-def test_a_lone_step_keeps_its_full_timeout_when_the_total_is_smaller(repo):
-    """The total never cuts a step below its own per-step allowance."""
+def test_a_lone_step_keeps_its_full_timeout_when_the_total_is_smaller(repo, caplog):
+    """The total never cuts a step below its own per-step allowance - and
+    a total set that low is raised with a warning, not silently."""
     path = _commit_workflow(repo, "on: pull_request\n")
     diff = _apply_and_diff(repo, path, _workflow_with_steps("sleep 0.4 && echo done"))
 
-    passed, output = workspace._run_new_workflow_step_scripts(
-        repo, diff, None, timeout=5, total_timeout=0.1
-    )
+    with caplog.at_level(logging.WARNING, logger="workspace"):
+        passed, output = workspace._run_new_workflow_step_scripts(
+            repo, diff, None, timeout=5, total_timeout=0.1
+        )
 
     assert passed is True
     assert "done" in output
+    assert "total budget 0.1s is below the per-step timeout 5s" in caplog.text
 
 
 def test_a_step_is_not_started_once_the_budget_is_spent():

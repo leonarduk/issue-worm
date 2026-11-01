@@ -2566,6 +2566,15 @@ def _run_new_workflow_step_scripts(
         timeout = resolve_workflow_step_timeout(repo_path)
     if total_timeout is None:
         total_timeout = resolve_workflow_steps_total_timeout(repo_path)
+    if total_timeout < timeout:
+        # A lone step always keeps its full allowance, so a total below it
+        # can't be honoured; say so rather than silently raising it.
+        logger.warning(
+            "Workflow-step total budget %gs is below the per-step timeout %gs; using %gs",
+            total_timeout,
+            timeout,
+            timeout,
+        )
     budget = max(total_timeout, timeout)
     deadline = time.monotonic() + budget
     all_passed = True

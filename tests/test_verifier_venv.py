@@ -1120,6 +1120,9 @@ def test_workflow_step_timeouts_resolve_like_the_ci_timeout(
     monkeypatch.delenv(env_name, raising=False)
 
     assert resolve(str(tmp_path)) == getattr(workspace, default_attr)
+    monkeypatch.setenv(env_name, "-5")
+    assert resolve(str(tmp_path)) == getattr(workspace, default_attr)
+    monkeypatch.delenv(env_name)
 
     repo = tmp_path / "repo"
     repo.mkdir()
