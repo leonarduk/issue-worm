@@ -1249,10 +1249,33 @@ def _every_hunk_has_a_preimage(diff_text: str) -> bool:
     hunks = re.split(r"(?m)^@@ .*$", diff_text)[1:]
     if not hunks:
         return False
-    return all(
-        any(line.startswith("-") and not line.startswith("---") for line in hunk.splitlines())
-        for hunk in hunks
-    )
+    return all(_hunk_removes_a_line(hunk.splitlines()) for hunk in hunks)
+
+
+def _hunk_removes_a_line(lines: list[str]) -> bool:
+    """True when a hunk body has a removed (`-`) line.
+
+    Every `-` line in a hunk body is a removal - including `---flag`, the
+    removal of a line whose content is `--flag` (#254), which a plain
+    "not `---`" test misread as a header and so denied a real preimage.
+    The one exception is a following file's `--- a/x` / `+++ b/x` header
+    pair, which lands at the tail of the previous hunk when a section
+    carries more than one file's diff (#247): it is a header only when
+    the next line is its `+++` half. A removed `-- x` line directly
+    followed by an added `++ y` line reads the same way and is skipped
+    too - the safe direction, since it can only deny the opt-in -C0 rung.
+    """
+    for i, line in enumerate(lines):
+        if not line.startswith("-"):
+            continue
+        is_header = (
+            line.startswith("--- ")
+            and i + 1 < len(lines)
+            and lines[i + 1].startswith("+++ ")
+        )
+        if not is_header:
+            return True
+    return False
 
 
 _APPLY_LADDER: tuple[tuple[str, tuple[str, ...]], ...] = (
