@@ -51,6 +51,7 @@ import json
 import os
 import re
 import sys
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -194,7 +195,28 @@ _USER_AGENT = "issue-worm-update-dependency-pins"
 
 
 class PinError(Exception):
-    """A pin is missing, drifted, or could not be checked."""
+    """A pin is missing, drifted, or could not be checked.
+
+    ``status`` is the HTTP status when a GitHub API call failed with one,
+    so callers can react to a specific response (a 404) rather than to any
+    failure at all.
+    """
+
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def _is_rate_limited(exc: urllib.error.HTTPError) -> bool:
+    """GitHub's rate-limit responses: 429, or a 403 that says so in its
+    headers (primary limit exhausted, or a secondary limit's Retry-After).
+    Any other 403 is a real permission problem and is reported as one."""
+    if exc.code == 429:
+        return True
+    headers = exc.headers or {}
+    return exc.code == 403 and (
+        headers.get("X-RateLimit-Remaining") == "0" or headers.get("Retry-After") is not None
+    )
 
 
 def _spec(dep: str) -> _Spec:
@@ -231,6 +253,17 @@ def _http_json(url: str, token: str | None = None) -> dict:
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if _is_rate_limited(exc):
+            # Said plainly (#144): a bare "HTTP Error 403: Forbidden" reads
+            # like a permissions problem and sends the reader the wrong way.
+            raise PinError(
+                f"GitHub API rate limit exceeded fetching {url} (HTTP {exc.code}) - "
+                "wait for it to reset, or set GITHUB_TOKEN for the higher "
+                "authenticated limit",
+                status=exc.code,
+            ) from exc
+        raise PinError(f"failed to fetch {url}: {exc}", status=exc.code) from exc
     except (OSError, ValueError) as exc:
         # OSError covers URLError/HTTPError/timeouts; ValueError covers
         # JSONDecodeError. Any of these means the version is uncheckable.
@@ -254,10 +287,14 @@ def latest_version(dep: str, token: str | None = None) -> str:
     try:
         data = _http_json(spec.releases_api, token=token if spec.needs_token else None)
     except PinError as exc:
-        if spec.needs_token:
+        # Only a 404 earns the token hint (#149): GitHub answers a private
+        # repo it won't show you with 404. A timeout, a 500 or a rate limit
+        # already says what went wrong, and blaming the token would mislead.
+        if spec.needs_token and exc.status == 404:
             raise PinError(
                 f"{exc} - for the private leonarduk/{spec.repo_slug} a 404 usually "
-                "means the token has expired or lost read access to that repo"
+                "means the token has expired or lost read access to that repo",
+                status=exc.status,
             ) from exc
         raise
     tag = data.get("tag_name", "")

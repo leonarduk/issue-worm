@@ -12,10 +12,12 @@ import re
 import shutil
 import subprocess
 import sys
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
@@ -23,6 +25,7 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 from update_dependency_pins import (  # noqa: E402
     CICAID_PINS,
     PinError,
+    _http_json,
     _versions_equal,
     apply_update,
     current_pin,
@@ -325,10 +328,66 @@ def test_latest_pro_without_token_raises_clear_error():
 def test_latest_pro_404_error_names_the_likely_cause():
     with patch(
         "update_dependency_pins._http_json",
-        side_effect=PinError("failed to fetch https://example.invalid: HTTP Error 404"),
+        side_effect=PinError("failed to fetch https://example.invalid: HTTP Error 404", status=404),
     ):
         with pytest.raises(PinError, match="token has expired or lost read access"):
             latest_version("cicaid-devtools-pro", token="secret")
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        PinError("failed to fetch https://example.invalid: HTTP Error 500", status=500),
+        PinError("failed to fetch https://example.invalid: timed out"),
+        PinError("GitHub API rate limit exceeded fetching https://example.invalid", status=403),
+    ],
+    ids=["server-error", "timeout", "rate-limit"],
+)
+def test_latest_pro_non_404_error_propagates_unchanged(error):
+    """Only a 404 means "token expired or lost access"; any other failure
+    is re-raised as-is rather than blamed on the token (#149)."""
+    with patch("update_dependency_pins._http_json", side_effect=error):
+        with pytest.raises(PinError) as exc:
+            latest_version("cicaid-devtools-pro", token="secret")
+
+    assert exc.value is error
+
+
+def _http_error(code, headers=None):
+    return urllib.error.HTTPError(
+        "https://api.example.invalid", code, "Forbidden", headers or {}, None
+    )
+
+
+@pytest.mark.parametrize(
+    ("code", "headers"),
+    [
+        (403, {"X-RateLimit-Remaining": "0"}),
+        (403, {"Retry-After": "60"}),
+        (429, {}),
+    ],
+    ids=["primary-limit", "secondary-limit", "too-many-requests"],
+)
+def test_http_json_names_a_rate_limit(code, headers):
+    """A rate-limited call says so (#144), instead of a bare 403 that reads
+    like a permissions problem."""
+    with patch("urllib.request.urlopen", side_effect=_http_error(code, headers)):
+        with pytest.raises(PinError, match="GitHub API rate limit exceeded") as exc:
+            _http_json("https://api.example.invalid")
+
+    assert exc.value.status == code
+
+
+def test_http_json_reports_other_http_errors_with_their_status():
+    """A 403 that isn't a rate limit is a real permission failure, and a 404
+    keeps its status so latest_version can add its token hint."""
+    for code in (403, 404):
+        with patch("urllib.request.urlopen", side_effect=_http_error(code, {"X-RateLimit-Remaining": "41"})):
+            with pytest.raises(PinError) as exc:
+                _http_json("https://api.example.invalid")
+
+        assert "rate limit" not in str(exc.value)
+        assert exc.value.status == code
 
 
 def test_latest_free_does_not_pass_token():
@@ -639,6 +698,50 @@ def test_pin_reader_takes_only_the_first_line_of_duplicates(tmp_path, lines, exp
     )
 
     assert result.stdout == (f"{expected}\n" if expected else "")
+
+
+def _skip_step_script() -> str:
+    """The workflow's `skip` step, with its two expressions filled in."""
+    steps = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["update"]["steps"]
+    (step,) = [s for s in steps if s.get("id") == "skip"]
+    return (
+        step["run"]
+        .replace("${{ matrix.dependency }}", "cicaid-devtools")
+        .replace("${{ steps.check.outputs.branch_version }}", "0.9.0")
+    )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+@pytest.mark.parametrize(("count", "skip"), [("0", "false"), ("1", "true"), ("2", "true")])
+def test_skip_step_skips_only_when_a_pr_for_the_branch_is_open(tmp_path, count, skip):
+    """The skip step asks gh how many open PRs have this bump's branch as
+    their head; any at all means the bump is already proposed (#146)."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "gh").write_text(
+        '#!/bin/sh\nprintf \'%s\\n\' "$*" > "$GH_ARGS"\nprintf \'%s\\n\' "$PR_COUNT_STUB"\n'
+    )
+    (bin_dir / "gh").chmod(0o755)
+    output = tmp_path / "github_output"
+    args = tmp_path / "gh_args"
+
+    result = subprocess.run(
+        ["bash", "-e", "-c", _skip_step_script()],
+        env={
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+            "GITHUB_OUTPUT": str(output),
+            "GITHUB_REPOSITORY": "owner/name",
+            "GH_ARGS": str(args),
+            "PR_COUNT_STUB": count,
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert output.read_text() == f"skip={skip}\n"
+    assert "--head deps/cicaid-devtools-v0.9.0 --state open" in args.read_text()
 
 
 def test_script_imports_only_stdlib():
