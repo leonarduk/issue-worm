@@ -1774,12 +1774,9 @@ def test_ensure_gitignored_in_a_linked_worktree_writes_the_shared_exclude(repo, 
         # this process's cwd.
         return (worktree / _git(str(worktree), "rev-parse", *args).stdout.strip()).resolve()
 
-    # The git fact this relies on, checked against whatever git runs this
-    # test: from a linked worktree --git-path info/exclude is the *common*
-    # dir's exclude, not one under the per-worktree gitdir.
-    common_exclude = rev_parse("--git-common-dir") / "info" / "exclude"
-    assert rev_parse("--git-path", "info/exclude") == common_exclude
-    assert common_exclude == _exclude_path(repo).resolve()
+    # A linked worktree has its own git dir, distinct from the common one
+    # that holds the info/exclude git actually reads.
+    assert rev_parse("--git-common-dir") / "info" / "exclude" == _exclude_path(repo).resolve()
     per_worktree = rev_parse("--git-dir")
     assert per_worktree != rev_parse("--git-common-dir")
 

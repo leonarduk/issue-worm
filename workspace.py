@@ -1847,20 +1847,20 @@ def ensure_gitignored(
     never shows up in ``git status`` for :func:`_workspace_is_dirty` to
     trip on, so nothing needs to commit it.
 
-    Best-effort: resolved via ``git rev-parse --git-path info/exclude`` so
-    it works whether ``.git`` is an ordinary directory or (in a worktree)
-    a file pointing elsewhere. In a linked worktree git classifies
-    ``info/exclude`` as shared state, so ``--git-path`` already returns the
-    main repository's ``.git/info/exclude`` - the one git reads there; a
-    per-worktree ``info/exclude`` is never consulted (#395). git runs with
-    ``cwd=repo_path`` (see :func:`_run_git`), so a relative result is
-    relative to ``repo_path`` and joining the two is correct for a relative
-    ``repo_path`` too - the Scheduler's default is "." (#396). If ``repo_path`` isn't a git checkout at all
-    (or the exclude file can't be read/written), this is logged and left
-    alone rather than failing the caller's pass over it.
+    Best-effort: the file is ``<git rev-parse --git-common-dir>/info/exclude``,
+    which is the one git reads whether ``.git`` is an ordinary directory or
+    (in a linked worktree) a file pointing elsewhere - a per-worktree
+    ``info/exclude`` is never consulted (#395). Naming the common dir
+    explicitly doesn't rely on git's internal table of which paths
+    ``--git-path`` treats as shared. git runs with ``cwd=repo_path`` (see
+    :func:`_run_git`), so a relative result is relative to ``repo_path``
+    and joining the two is correct for a relative ``repo_path`` too - the
+    Scheduler's default is "." (#396). If ``repo_path`` isn't a git
+    checkout at all (or the exclude file can't be read/written), this is
+    logged and left alone rather than failing the caller's pass over it.
     """
     result = _run_git(
-        repo_path, "rev-parse", "--git-path", "info/exclude", check=False
+        repo_path, "rev-parse", "--git-common-dir", check=False
     )
     if result.returncode != 0:
         logger.warning(
@@ -1870,7 +1870,7 @@ def ensure_gitignored(
             result.stderr.strip(),
         )
         return
-    exclude_path = Path(repo_path) / result.stdout.strip()
+    exclude_path = Path(repo_path) / result.stdout.strip() / "info" / "exclude"
     # Sibling of info/exclude, so always inside the git dir (never the
     # working tree). Deliberately not "exclude.lock": "<file>.lock" is
     # git's own lockfile convention, and a stale one could confuse tooling.
