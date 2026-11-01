@@ -733,6 +733,21 @@ def test_build_coder_rejects_config_supplied_settings_missing_a_value(monkeypatc
         build_coder(RoleConfig(model_source="cloud", remote=RemoteCoderSettings()))
 
 
+def test_build_coder_cloud_falls_back_to_defaults_for_explicit_none():
+    """An explicit None for the DeepSeek endpoint/model still means the
+    provider default, as `os.getenv(...) or DEFAULT` did before #223."""
+    role = RoleConfig(
+        model_source="cloud",
+        remote=RemoteCoderSettings(
+            deepseek_api_key="sk-test", deepseek_endpoint=None, deepseek_model=None
+        ),
+    )
+
+    coder = build_coder(role)
+
+    assert (coder.endpoint, coder.model) == (DEFAULT_DEEPSEEK_ENDPOINT, DEFAULT_DEEPSEEK_MODEL)
+
+
 def test_build_coder_reads_settings_via_config_for_a_role_without_them(monkeypatch):
     """A role built by hand (or anything RoleConfig-shaped) carries no
     settings; build_coder gets them from config.py's reader at call time,

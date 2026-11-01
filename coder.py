@@ -39,7 +39,7 @@ from typing import Protocol
 
 import requests
 
-from config import (  # noqa: F401 - DEFAULT_DEEPSEEK_* re-exported for callers
+from config import (
     DEFAULT_DEEPSEEK_ENDPOINT,
     DEFAULT_DEEPSEEK_MODEL,
     _env_int,
@@ -552,8 +552,10 @@ def build_coder(role_config) -> Coder:
                 "set — see issue-worm-pro's .env-example-deepseek. (cloud "
                 "currently only supports DeepSeek.)"
             )
-        endpoint = remote.deepseek_endpoint
-        model = remote.deepseek_model
+        # `or`, as before #223: an explicit None (or "") from a caller still
+        # means the provider default, not a coder with no endpoint.
+        endpoint = remote.deepseek_endpoint or DEFAULT_DEEPSEEK_ENDPOINT
+        model = remote.deepseek_model or DEFAULT_DEEPSEEK_MODEL
         return RemoteOpenAICoder(
             endpoint=endpoint,
             model=model,
