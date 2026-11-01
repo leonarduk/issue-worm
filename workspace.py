@@ -1849,7 +1849,13 @@ def ensure_gitignored(
 
     Best-effort: resolved via ``git rev-parse --git-path info/exclude`` so
     it works whether ``.git`` is an ordinary directory or (in a worktree)
-    a file pointing elsewhere. If ``repo_path`` isn't a git checkout at all
+    a file pointing elsewhere. In a linked worktree git classifies
+    ``info/exclude`` as shared state, so ``--git-path`` already returns the
+    main repository's ``.git/info/exclude`` - the one git reads there; a
+    per-worktree ``info/exclude`` is never consulted (#395). git runs with
+    ``cwd=repo_path`` (see :func:`_run_git`), so a relative result is
+    relative to ``repo_path`` and joining the two is correct for a relative
+    ``repo_path`` too - the Scheduler's default is "." (#396). If ``repo_path`` isn't a git checkout at all
     (or the exclude file can't be read/written), this is logged and left
     alone rather than failing the caller's pass over it.
     """

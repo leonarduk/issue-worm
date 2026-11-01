@@ -1728,6 +1728,66 @@ def test_ensure_gitignored_survives_a_hard_reset(repo):
     assert _git(repo, "status", "--porcelain").stdout.strip() == ""
 
 
+@pytest.mark.parametrize("how", ["dot-from-inside", "name-from-parent", "from-subdir"])
+def test_ensure_gitignored_with_a_relative_repo_path(tmp_path, monkeypatch, how):
+    """The Scheduler's default WORKSPACE_ROOT is ".": a relative repo_path
+    must still write the repo's own .git/info/exclude (#396). _run_git runs
+    git with cwd=repo_path, so --git-path's relative output is relative to
+    repo_path and the join is correct. The repo sits under tmp_path so the
+    parent directory checked below is owned by this test."""
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    _git(str(repo_dir), "init", "-q")
+    repo = str(repo_dir)
+    if how == "dot-from-inside":
+        monkeypatch.chdir(repo_dir)
+        relative = "."
+    elif how == "name-from-parent":
+        monkeypatch.chdir(repo_dir.parent)
+        relative = repo_dir.name
+    else:
+        (repo_dir / "sub").mkdir()
+        monkeypatch.chdir(repo_dir / "sub")
+        relative = "."
+
+    ensure_gitignored(relative)
+
+    lines = _exclude_path(repo).read_text(encoding="utf-8").splitlines()
+    for pattern in WORM_GITIGNORE_PATTERNS:
+        assert pattern in lines
+    assert not (repo_dir / ".gitignore").exists()
+    # A wrong join would have created a stray .git/info/ next to the cwd.
+    assert not (repo_dir / "sub" / ".git").exists()
+    assert not (repo_dir.parent / ".git").exists()
+
+
+def test_ensure_gitignored_in_a_linked_worktree_writes_the_shared_exclude(repo, tmp_path):
+    """In a linked worktree git reads the *main* repo's .git/info/exclude,
+    never a per-worktree one; --git-path info/exclude already resolves
+    there, so the bookkeeping files stay invisible even after the reset and
+    clean every attempt does (#395)."""
+    worktree = tmp_path / "linked"
+    _git(repo, "worktree", "add", "-q", str(worktree))
+
+    ensure_gitignored(str(worktree))
+
+    shared = _exclude_path(repo)  # <main>/.git/info/exclude
+    lines = shared.read_text(encoding="utf-8").splitlines()
+    for pattern in WORM_GITIGNORE_PATTERNS:
+        assert pattern in lines
+    per_worktree = Path(_git(str(worktree), "rev-parse", "--git-dir").stdout.strip())
+    assert not (per_worktree / "info" / "exclude").exists()
+
+    (worktree / ".issue-worm").mkdir()
+    (worktree / ".issue-worm" / "usage.jsonl").write_text("{}\n", encoding="utf-8")
+    (worktree / ".env").write_text("K=v\n", encoding="utf-8")
+    _git(str(worktree), "reset", "--hard", "-q")
+    _git(str(worktree), "clean", "-fdq")
+    assert _git(str(worktree), "status", "--porcelain").stdout.strip() == ""
+    # clean -fd skips ignored files: the bookkeeping survived, still hidden.
+    assert (worktree / ".issue-worm" / "usage.jsonl").exists()
+
+
 def _ensure_gitignored_worker(repo_path: str, patterns: tuple[str, ...], barrier):
     """Top-level worker for the concurrency test (must be picklable for
     multiprocessing's spawn context on Windows)."""
