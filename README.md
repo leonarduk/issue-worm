@@ -164,6 +164,7 @@ full commit SHA instead.
 |---|---|---|
 | `issue` | yes | Number of the issue to work. |
 | `github-token` | yes | A PAT or GitHub App token with `contents: write`, `pull-requests: write`, and `issues: read` on the target repo. A classic PAT's `repo` scope covers all three; a fine-grained PAT needs each granted separately — `issues: read` is easy to miss, since only the issue-body fetch needs it, and that runs (and fails) before the push/PR steps ever do. Also grant `issues: write` (included in a classic PAT's `repo` scope already) for two best-effort features that silently no-op without it instead of failing the build: self-heal persisting its drafted section back onto the issue, and the live progress comment (see below) actually being posted/edited — `issues: read` is not enough to write a comment. The built-in `secrets.GITHUB_TOKEN` is **not** sufficient either way — a PR opened (or pushed to) with it deliberately does not trigger other workflow runs, so anything gated on the PR (CI, review bots, required checks) would never fire. |
+| `close-issue` | no | Whether the commit and PR carry `Closes #N`, so merging the PR closes the issue. Default `true`; any casing of `true` counts, and anything else (e.g. `false`) keeps the issue open after merge — useful when the PR only addresses part of it. |
 | `license-key` | no | Reserved for the pro engine. Currently accepted and logged only — installing the pro wheel from a license key is a separate, unimplemented piece of work ([leonarduk/issue-worm-pro#584](https://github.com/leonarduk/issue-worm-pro/issues/584)). Omit it (the default) to run the free engine, which is everything the action does today. |
 
 ### `runs-on` options
@@ -186,6 +187,32 @@ Either way the action does not branch on which one you picked — the
 `runs-on:` line in your own job is the only place that decision is made;
 `CODER_MODEL_SOURCE` and its matching secrets in your own `env:` block are
 what actually select the coder.
+
+#### Self-hosted runner prerequisites
+
+GitHub-hosted runners already have everything below. A self-hosted runner
+needs:
+
+- **`bash`, `git` and the GitHub CLI (`gh`) on `PATH`.** `gh` is the one
+  most often missing: the action uses it before it has even checked out
+  the repo, to label and comment on the issue, and later to fetch the
+  issue body and open the PR.
+- **A working `actions/setup-python` for Python 3.12.** The action creates
+  its venv with the interpreter that step provides, not whatever `python`
+  the runner has, so pyenv shims or a stripped system Python don't matter.
+  The step needs either network access to download Python 3.12 or a runner
+  tool cache that already has it. Its CPython builds include the `venv` and
+  `ensurepip` modules the venv needs.
+- **Network access to github.com and PyPI**, for the action's own
+  `pip install` and its dependencies.
+- **Standard POSIX tools**: `awk`, `sed`, `grep`, `tr`, `head`, `mktemp`
+  and `xargs`.
+
+A quick check on the runner, before setup-python is involved:
+
+```bash
+for tool in bash git gh awk sed grep tr head mktemp xargs; do command -v "$tool" >/dev/null || echo "missing: $tool"; done
+```
 
 ### What the action does
 
