@@ -164,7 +164,9 @@ def test_validate_issue_input_step_accepts_only_digits(tmp_path, value, ok):
         assert "::error::The 'issue' input must be a numeric issue number" in result.stdout
 
 
-_USES_ISSUE = re.compile(r"\binputs\.issue\b")  # not inputs.issue_number
+# The interpolation itself, so a step counts only when it actually receives
+# the value - not inputs.issue_number, nor a prose mention of the name.
+_USES_ISSUE = re.compile(r"\$\{\{\s*inputs\.issue\s*\}\}")
 
 
 def _strings(value):
@@ -188,23 +190,28 @@ def _issue_input_users(steps: list[dict]) -> list[str]:
     ]
 
 
+def _guard_runs_first(steps: list[dict]) -> bool:
+    """The property #365 depends on: the validation step is the first step,
+    and so the first of those that receive `inputs.issue`."""
+    users = _issue_input_users(steps)
+    return steps[0]["name"] == "Validate issue input" and users[:1] == ["Validate issue input"]
+
+
 def test_issue_input_is_validated_before_any_other_step_uses_it():
     """The guard is only worth anything if it runs first: every step that
     receives `inputs.issue` comes after it (#365)."""
-    users = _issue_input_users(_steps())
-    assert users[0] == "Validate issue input"
-    assert _steps()[0]["name"] == "Validate issue input"
+    assert _guard_runs_first(_steps())
 
 
 def test_issue_input_check_catches_a_consumer_moved_before_the_guard():
-    """The check above, shown to fail: move the first step after the guard
-    that uses `inputs.issue` ahead of it."""
+    """The same predicate as above, shown to fail: move the first step
+    after the guard that receives `inputs.issue` ahead of it."""
     steps = _steps()
     guard = steps.pop(0)
     consumer = next(i for i, step in enumerate(steps) if step["name"] in _issue_input_users(steps))
     steps.insert(consumer + 1, guard)
 
-    assert _issue_input_users(steps)[0] != "Validate issue input"
+    assert not _guard_runs_first(steps)
 
 
 def test_step_checks_do_not_depend_on_action_yml_indentation():
@@ -244,7 +251,7 @@ case "$*" in
     for arg in "$@"; do
       case "$arg" in body=@*) cp "${arg#body=@}" "$STUB_LOG/patched_body" ;; esac
     done ;;
-  "api -X POST repos/"*"/issues/7/labels"*) ;;
+  "api -X POST repos/owner/name/issues/7/labels"*) ;;
   *)
     # A call the step didn't make when this stub was written: fail loudly
     # so the test is updated, not quietly fed an empty answer (#756).
