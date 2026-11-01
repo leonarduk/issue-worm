@@ -4395,6 +4395,67 @@ def test_added_content_lines_starting_like_diff_headers_still_count():
     assert _post_apply_lines(hunk) == [("keep", False), ("---", True), ("++x", True)]
 
 
+def test_step_with_a_nested_with_list_and_a_trailing_shell(repo):
+    """A list nested in the step's `with:` doesn't end the step early, so
+    its own `shell:` after the list still applies (#424)."""
+    from workspace import _extract_new_workflow_run_scripts
+
+    workflow = (
+        "on: pull_request\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    steps:\n"
+        "      - run: Write-Host hi\n"
+        "        with:\n"
+        "          args:\n"
+        "            - a\n"
+        "            - b\n"
+        "        shell: pwsh\n"
+    )
+    path = _commit_workflow(repo, "on: pull_request\n")
+    diff = _apply_and_diff(repo, path, workflow)
+
+    assert _extract_new_workflow_run_scripts(diff, repo) == [(path, "Write-Host hi", "pwsh")]
+
+
+@pytest.mark.parametrize("gap", ["        # trailing comment\n", "\n", "\n        # comment\n\n"])
+def test_trailing_comment_or_blank_before_next_step_keeps_steps_apart(repo, gap):
+    from workspace import _extract_new_workflow_run_scripts
+
+    base = (
+        "on: pull_request\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    steps:\n"
+        "      - run: echo a\n"
+        + gap
+        + "      - run: echo b\n"
+    )
+    path = _commit_workflow(repo, base)
+    diff = _apply_and_diff(repo, path, base.replace("echo b", "echo B"))
+
+    assert _extract_new_workflow_run_scripts(diff, repo) == [(path, "echo B", None)]
+
+
+def test_unparseable_text_rebuilt_from_partial_hunks_is_skipped_not_failed():
+    """Without repo_path the file is rebuilt from the hunks, which may be
+    partial - a parse failure there is not evidence the workflow is bad."""
+    from workspace import _extract_new_workflow_run_scripts
+
+    diff = (
+        "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n"
+        "--- a/.github/workflows/ci.yml\n"
+        "+++ b/.github/workflows/ci.yml\n"
+        "@@ -40,3 +40,3 @@\n"
+        "         run: |\n"
+        "-          echo old\n"
+        "+          echo new\n"
+        "       - name: next\n"
+    )
+
+    assert _extract_new_workflow_run_scripts(diff) == []
+
+
 def test_crlf_workflow_is_parsed(repo):
     """CRLF line endings are YAML's to handle (#417)."""
     from workspace import _extract_new_workflow_run_scripts

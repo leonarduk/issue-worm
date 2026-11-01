@@ -2461,17 +2461,20 @@ def _extract_new_workflow_run_scripts(
     applied, from disk, and the diff's added-line numbers say which steps
     were touched. Without it - or when the file is gone - the post-apply
     text is rebuilt from the diff's own hunk lines, which is the whole file
-    when the hunks cover it. A step the diff only shows as surrounding
-    context is never re-executed.
+    when the hunks cover it; text rebuilt that way that fails to parse is
+    skipped, since it may just be partial. A step the diff only shows as
+    surrounding context is never re-executed.
 
-    Raises _WorkflowParseError when a touched workflow is not valid YAML.
+    Raises _WorkflowParseError when a touched workflow read from disk is
+    not valid YAML (or not UTF-8).
     """
     scripts: list[tuple[str, str, str | None]] = []
     for path, hunk_lines in _iter_diff_files(diff_output):
         if not _WORKFLOW_DIFF_PATH_RE.match(path):
             continue
         on_disk = Path(repo_path, path) if repo_path else None
-        if on_disk is not None and on_disk.is_file():
+        from_disk = on_disk is not None and on_disk.is_file()
+        if from_disk:
             try:
                 text = on_disk.read_text(encoding="utf-8")
             except UnicodeDecodeError as exc:
@@ -2488,6 +2491,10 @@ def _extract_new_workflow_run_scripts(
         try:
             steps = _workflow_run_steps(text)
         except yaml.YAMLError as exc:
+            if not from_disk:
+                # Rebuilt from hunks that may not cover the whole file, so a
+                # parse failure here says nothing about the real workflow.
+                continue
             raise _WorkflowParseError(f"[{path}] workflow is not valid YAML: {exc}") from exc
         for first, end, script, shell in steps:
             if any(first <= line < end for line in added):
