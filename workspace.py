@@ -862,9 +862,31 @@ def _parse_search_replace_blocks(body: str, path: str) -> list[tuple[str, str]]:
     # comment above): such a block may end at the next SEARCH marker or at
     # the end of the body instead of at a '>>>>>>> REPLACE' line.
     diff_style = False
+    # True when the current block was opened by a SEARCH marker that ended
+    # the previous diff-style block. Such a marker may really have been a
+    # literal "--- SEARCH" line in that block's REPLACE text - the one thing
+    # a grammar with no closing line can't tell apart (#478) - so a divider
+    # missing from this block gets a hint saying so instead of a misleading
+    # "truncated" message.
+    split_off = False
 
     def is_search_marker(text: str) -> bool:
         return bool(_SEARCH_MARKER_RE.match(text) or _DIFF_SEARCH_MARKER_RE.match(text))
+
+    def no_divider(number: int) -> MalformedOutputError:
+        message = (
+            f"MODE: EDIT section for {path!r}: SEARCH block {number} has no "
+            "'=======' (or '+++ REPLACE') divider"
+        )
+        if split_off:
+            # MODE: FULL, not the canonical block form: a SEARCH-shaped line
+            # inside any EDIT block's REPLACE text is read as a marker.
+            message += (
+                f" - if block {number - 1}'s REPLACE text contains a literal "
+                "'--- SEARCH' line, no EDIT block can carry it: write that "
+                "file with MODE: FULL instead"
+            )
+        return MalformedOutputError(message)
 
     for line in body.splitlines():
         stripped = line.rstrip("\r")
@@ -872,16 +894,14 @@ def _parse_search_replace_blocks(body: str, path: str) -> list[tuple[str, str]]:
             if is_search_marker(stripped):
                 state, search, replace = "search", [], []
                 diff_style = bool(_DIFF_SEARCH_MARKER_RE.match(stripped))
+                split_off = False
         elif state == "search":
             if _DIVIDER_MARKER_RE.match(stripped) or _DIFF_DIVIDER_MARKER_RE.match(
                 stripped
             ):
                 state = "replace"
             elif is_search_marker(stripped) or _REPLACE_MARKER_RE.match(stripped):
-                raise MalformedOutputError(
-                    f"MODE: EDIT section for {path!r}: SEARCH block "
-                    f"{len(blocks) + 1} has no '=======' divider"
-                )
+                raise no_divider(len(blocks) + 1)
             else:
                 search.append(line)
         else:  # replace
@@ -898,6 +918,7 @@ def _parse_search_replace_blocks(body: str, path: str) -> list[tuple[str, str]]:
                 blocks.append(("\n".join(search), "\n".join(replace)))
                 state, search, replace = "search", [], []
                 diff_style = bool(_DIFF_SEARCH_MARKER_RE.match(stripped))
+                split_off = True
             elif _DIVIDER_MARKER_RE.match(stripped) and not path.lower().endswith(
                 _MARKUP_SUFFIXES
             ):
@@ -917,6 +938,13 @@ def _parse_search_replace_blocks(body: str, path: str) -> list[tuple[str, str]]:
         # Diff-style has no closing line: end of body closes the block.
         blocks.append(("\n".join(search), "\n".join(replace)))
         state = "outside"
+    if state == "search" and split_off:
+        # A block split off the previous diff-style block and still waiting
+        # for its divider at the end of the body: far more likely a literal
+        # "--- SEARCH" in that block's REPLACE text than a truncated reply,
+        # so say that rather than "not closed ... truncated" (#478). A
+        # block opened from outside keeps the truncation message below.
+        raise no_divider(len(blocks) + 1)
     if state != "outside":
         raise MalformedOutputError(
             f"MODE: EDIT section for {path!r}: block {len(blocks) + 1} is not "

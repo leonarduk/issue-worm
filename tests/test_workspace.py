@@ -2805,7 +2805,7 @@ def test_parse_edit_section_ignores_fences_and_prose_around_blocks():
     "body, match",
     [
         ("just prose, no blocks\n", "contains no"),
-        ("<<<<<<< SEARCH\nx\n>>>>>>> REPLACE\n", "no '=======' divider"),
+        ("<<<<<<< SEARCH\nx\n>>>>>>> REPLACE\n", "no '=======' \\(or '\\+\\+\\+ REPLACE'\\) divider"),
         ("<<<<<<< SEARCH\nx\n=======\ny\n", "not closed.*truncated"),
         (
             "<<<<<<< SEARCH\nx\n=======\ny\n<<<<<<< SEARCH\n",
@@ -2914,6 +2914,109 @@ def test_canonical_block_accepts_a_diff_style_divider_but_still_needs_closing():
     unclosed = "=== FILE: a.py ===\n=== MODE: EDIT ===\n<<<<<<< SEARCH\nx\n+++ REPLACE\ny\n=== END FILE ===\n"
     with pytest.raises(MalformedOutputError, match="not closed.*truncated"):
         parse_coder_output(unclosed, ["a.py"])
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "--- SEARCH\nmore of the doc\n",  # text continues after the line
+        "--- SEARCH\n",  # the line is the last thing in the REPLACE text
+        "--- SEARCH\ndoc\n>>>>>>> REPLACE\n",  # then closed explicitly
+    ],
+)
+def test_literal_diff_search_line_in_replace_text_fails_loudly_with_a_hint(tail):
+    """A diff-style block has no closing line, so a literal '--- SEARCH' in
+    its REPLACE text can't be told from the next block's opener (#478). It
+    must never silently truncate the REPLACE: the split-off "block" has no
+    divider, and the error says so - naming both accepted dividers (#479) -
+    with the canonical form as the way out, instead of claiming the reply
+    was truncated."""
+    body = "--- SEARCH\nx = 1\n+++ REPLACE\nx = 2\n" + tail
+    output = f"=== FILE: a.md ===\n=== MODE: EDIT ===\n{body}=== END FILE ===\n"
+
+    with pytest.raises(MalformedOutputError) as exc:
+        parse_coder_output(output, ["a.md"])
+
+    message = str(exc.value)
+    assert "SEARCH block 2 has no '=======' (or '+++ REPLACE') divider" in message
+    assert "block 1's REPLACE text contains a literal '--- SEARCH' line" in message
+    assert "write that file with MODE: FULL instead" in message
+    assert "truncated" not in message
+
+
+def test_mode_full_carries_a_literal_diff_search_line():
+    """The way out the hint names. No EDIT block can carry a SEARCH-shaped
+    line in its REPLACE text - the canonical form reads one as a missing
+    '>>>>>>> REPLACE' - but a MODE: FULL body is plain content (#478)."""
+    content = "# Grammar\n\n--- SEARCH\nold\n+++ REPLACE\nnew"
+    canonical = "<<<<<<< SEARCH\nold\n=======\nnew\n--- SEARCH\n>>>>>>> REPLACE\n"
+    with pytest.raises(MalformedOutputError, match="before the next SEARCH"):
+        workspace._parse_search_replace_blocks(canonical, "a.md")
+
+    (change,) = parse_coder_output(_full_file_output("a.md", content), ["a.md"])
+
+    assert change.body == content
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        pytest.param(
+            "--- SEARCH\na\n+++ REPLACE\nb\n>>>>>>> REPLACE\n"
+            "<<<<<<< SEARCH\nc\n=======\nd\n>>>>>>> REPLACE\n",
+            [("a", "b"), ("c", "d")],
+            id="diff-then-canonical",
+        ),
+        pytest.param(
+            "<<<<<<< SEARCH\nc\n=======\nd\n>>>>>>> REPLACE\n"
+            "--- SEARCH\na\n+++ REPLACE\nb\n",
+            [("c", "d"), ("a", "b")],
+            id="canonical-then-diff",
+        ),
+        pytest.param(
+            "--- SEARCH\na\n+++ REPLACE\nb\n>>>>>>> REPLACE\n"
+            "<<<<<<< SEARCH\nc\n+++ REPLACE\nd\n>>>>>>> REPLACE\n",
+            [("a", "b"), ("c", "d")],
+            id="diff-then-canonical-with-plus-divider",
+        ),
+        pytest.param(
+            "--- SEARCH\na\n+++ REPLACE\nb\n--- SEARCH\nc\n+++ REPLACE\nd\n",
+            [("a", "b"), ("c", "d")],
+            id="diff-then-diff",
+        ),
+    ],
+)
+def test_mixed_block_styles_in_one_body(body, expected):
+    """diff_style is re-derived whenever a SEARCH marker opens a block, so
+    one block's style never leaks into the next (#480)."""
+    assert workspace._parse_search_replace_blocks(body, "a.py") == expected
+
+
+@pytest.mark.parametrize(
+    ("body", "match"),
+    [
+        pytest.param(
+            # The canonical block after a diff-style one still needs its own
+            # closing line: the diff-style end-of-body leniency doesn't leak.
+            "--- SEARCH\na\n+++ REPLACE\nb\n>>>>>>> REPLACE\n"
+            "<<<<<<< SEARCH\nc\n=======\nd\n",
+            "block 2 is not closed.*truncated",
+            id="diff-then-unclosed-canonical",
+        ),
+        pytest.param(
+            # Nor does a canonical block's strictness leak into a later
+            # diff-style one... but a canonical block can't be ended by the
+            # next SEARCH marker at all.
+            "<<<<<<< SEARCH\nc\n=======\nd\n"
+            "--- SEARCH\na\n+++ REPLACE\nb\n",
+            "no '>>>>>>> REPLACE' line before the next SEARCH",
+            id="unclosed-canonical-then-diff",
+        ),
+    ],
+)
+def test_mixed_block_styles_keep_each_blocks_own_closing_rule(body, match):
+    with pytest.raises(MalformedOutputError, match=match):
+        workspace._parse_search_replace_blocks(body, "a.py")
 
 
 def test_search_replace_exact_match_applies_blocks_in_order():
