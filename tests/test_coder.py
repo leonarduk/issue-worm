@@ -334,6 +334,30 @@ def test_format_instructions_use_edit_mode_for_large_existing_file(tmp_path):
     assert f"large.py: MODE: {MODE_FULL}" not in instructions
 
 
+def test_format_instructions_logs_why_an_unstattable_file_gets_full_mode(
+    tmp_path, monkeypatch, caplog
+):
+    """A file that exists but can't be stat'ed falls back to FULL - and
+    says why at DEBUG, rather than leaving the mode choice unexplained (#470)."""
+    (tmp_path / "large.py").write_text("x" * SIZE_THRESHOLD, encoding="utf-8")
+
+    def _denied(self, *args, **kwargs):
+        raise PermissionError("stat denied")
+
+    # is_file() swallows stat errors itself, so pin it True to reach the
+    # explicit stat() whose failure is the case under test.
+    monkeypatch.setattr(coder.Path, "is_file", lambda self: True)
+    monkeypatch.setattr(coder.Path, "stat", _denied)
+    with caplog.at_level(logging.DEBUG, logger="coder"):
+        instructions = _build_format_instructions(str(tmp_path), ["large.py"])
+
+    assert f"large.py: MODE: {MODE_FULL}" in instructions
+    (record,) = [r for r in caplog.records if r.name == "coder"]
+    assert record.levelno == logging.DEBUG
+    assert "large.py" in record.getMessage()
+    assert "stat denied" in record.getMessage()
+
+
 def test_format_instructions_use_full_mode_for_missing_large_path(tmp_path):
     # The path doesn't exist, so there is nothing to search/replace even
     # though its eventual size would be large.

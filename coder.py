@@ -626,8 +626,10 @@ def _mode_for_file(workspace_dir: str, path: str) -> str:
     try:
         if path_obj.is_file() and path_obj.stat().st_size >= SIZE_THRESHOLD:
             return MODE_EDIT
-    except OSError:
-        pass
+    except OSError as exc:
+        # Unreadable metadata: FULL is the safe mode (no SEARCH text to
+        # match against), but say why, or the mode choice is a mystery (#470).
+        logger.debug("Could not stat %s (%s); using MODE %s", path_obj, exc, MODE_FULL)
     return MODE_FULL
 
 
