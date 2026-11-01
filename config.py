@@ -205,9 +205,11 @@ _VALID_CODER_BACKENDS = {"native"}
 def _parse_coder_backend(raw: str) -> str:
     """Parse CODER_BACKEND, falling back to 'native' on an unknown value.
 
-    Whitespace is stripped before validation, matching _parse_log_level -
-    a value like " native" (leading space from an env file or shell
-    quoting) is a formatting artifact, not a different backend.
+    Whitespace is stripped and case folded before validation, matching
+    _parse_log_level - a value like " native" (leading space from an env
+    file or shell quoting) or "Native" is a formatting artifact, not a
+    different backend. An empty or whitespace-only value is not a backend
+    name either, and falls back to 'native' with the same warning.
 
     "aider" was a valid value until issue-worm-pro removed its Aider
     backend (a same-model benchmark re-run found it no better than the
@@ -221,6 +223,9 @@ def _parse_coder_backend(raw: str) -> str:
             "was removed); using 'native'"
         )
         return "native"
+    # Case-insensitive, like the retired "aider" check above (#352):
+    # "NATIVE" is a spelling of native, not a different backend.
+    value = value.lower()
     if value not in _VALID_CODER_BACKENDS:
         logger.warning(
             "CODER_BACKEND=%r is not one of %s; using 'native'",
