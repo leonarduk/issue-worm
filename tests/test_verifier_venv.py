@@ -1187,6 +1187,8 @@ def _real_git_diff(tmp_path: Path, names: list[str], rename: tuple[str, str] | N
         'q"uote.txt',  # a double quote: quoted and backslash-escaped
         "my file.txt",  # spaces alone: git does NOT quote these
         "x b/y.txt",  # an embedded " b/": the old regex split here
+        "x b/y b/z.txt",  # " b/" twice: still split at the header's midpoint
+        "foo b/bar",
         "plain.py",
     ],
 )

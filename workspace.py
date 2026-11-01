@@ -3021,7 +3021,10 @@ def _diff_header_paths(rest: str) -> tuple[str, str] | None:
         left, right = rest[:cut], rest[cut + 1 :]
     else:
         # "a/P b/P" is 2 * len("a/P") + 1 long: the separator's space sits
-        # exactly in the middle.
+        # exactly in the middle - however many " b/" P itself contains - so
+        # this matches every non-rename. Only a rename (sides differ) falls
+        # through to the first-" b/" guess, and changed_paths_from_diff
+        # replaces that guess with the block's rename from/to lines.
         half = (len(rest) - 1) // 2
         if rest[half : half + 3] == " b/" and rest[2:half] == rest[half + 3 :]:
             left, right = rest[:half], rest[half + 1 :]
