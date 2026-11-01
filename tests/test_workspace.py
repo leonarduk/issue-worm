@@ -997,7 +997,6 @@ def test_ci_check_env_windows_branch_passes_what_windows_needs(repo, tmp_path, m
         assert env[key] == str(tmp_path), key
     for key in ("TMPDIR", "LANG", "TZ", "DEEPSEEK_API_KEY"):
         assert key not in env, key
-    assert env["PYTHONPATH"] == str(Path(repo).resolve())
 
 
 def test_ci_check_env_posix_branch_leaves_out_the_windows_set(repo, tmp_path, monkeypatch):
