@@ -35,6 +35,8 @@ import sys
 
 import pytest
 
+import registry
+
 
 @pytest.fixture(autouse=True)
 def _neutralize_pro_cli(monkeypatch):
@@ -47,3 +49,20 @@ def _neutralize_pro_cli(monkeypatch):
     fixture and therefore wins.
     """
     monkeypatch.setitem(sys.modules, "pro_cli", None)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_registry_state_dir(tmp_path_factory, monkeypatch):
+    """Point the run registry at a fresh temp dir for every test (#184).
+
+    Without this, any test that reaches `registry.register` - directly or
+    through `cli._run_build` - wrote into the developer's real
+    `~/.issue-worm/agents/`: fabricated runs showed up in the monitoring
+    UI, and `register()`'s pruning could delete genuine run history. Suite
+    -wide and autouse so a new test can't reintroduce the leak by
+    forgetting a fixture. A `tmp_path_factory` dir, not `tmp_path`, so it
+    never appears inside a test's own workspace listing. Tests that need a
+    specific state dir (tests/test_registry.py, test_cli's `_state_dir`)
+    set the variable again in their own fixture, which wins.
+    """
+    monkeypatch.setenv(registry.STATE_DIR_ENV, str(tmp_path_factory.mktemp("issue-worm-state")))
