@@ -17,7 +17,9 @@ def _steps(text: str | None = None) -> list[dict]:
     """Every step of the composite action (or of ``text``), as YAML parses it."""
     if text is None:
         text = ACTION.read_text(encoding="utf-8")
-    return yaml.safe_load(text)["runs"]["steps"]
+    steps = (yaml.safe_load(text) or {}).get("runs", {}).get("steps")
+    assert isinstance(steps, list) and steps, "action.yml has no runs.steps list"
+    return steps
 
 
 def _run_steps() -> list[dict]:
@@ -162,28 +164,57 @@ def test_validate_issue_input_step_accepts_only_digits(tmp_path, value, ok):
         assert "::error::The 'issue' input must be a numeric issue number" in result.stdout
 
 
+_USES_ISSUE = re.compile(r"\binputs\.issue\b")  # not inputs.issue_number
+
+
+def _strings(value):
+    """Every string nested anywhere inside a parsed YAML value."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _strings(item)
+
+
+def _issue_input_users(steps: list[dict]) -> list[str]:
+    """Names of the steps that receive `inputs.issue`, in run order."""
+    return [
+        step["name"]
+        for step in steps
+        if any(_USES_ISSUE.search(text) for key, value in step.items() if key != "name" for text in _strings(value))
+    ]
+
+
 def test_issue_input_is_validated_before_any_other_step_uses_it():
     """The guard is only worth anything if it runs first: every step that
     receives `inputs.issue` comes after it (#365)."""
-    steps = _steps()
-    # \b: `inputs.issue` itself, not `inputs.issue_number` or the like.
-    uses_issue = re.compile(r"\binputs\.issue\b")
-    users = [
-        step["name"]
-        for step in steps
-        if uses_issue.search(yaml.safe_dump({k: v for k, v in step.items() if k != "name"}))
-    ]
+    users = _issue_input_users(_steps())
     assert users[0] == "Validate issue input"
-    assert steps[0]["name"] == "Validate issue input"
+    assert _steps()[0]["name"] == "Validate issue input"
 
 
-def test_step_parsing_does_not_depend_on_action_yml_indentation():
-    """The reason for parsing YAML (#758): re-indenting action.yml must not
-    change what the tests see."""
+def test_issue_input_check_catches_a_consumer_moved_before_the_guard():
+    """The check above, shown to fail: move the first step after the guard
+    that uses `inputs.issue` ahead of it."""
+    steps = _steps()
+    guard = steps.pop(0)
+    consumer = next(i for i, step in enumerate(steps) if step["name"] in _issue_input_users(steps))
+    steps.insert(consumer + 1, guard)
+
+    assert _issue_input_users(steps)[0] != "Validate issue input"
+
+
+def test_step_checks_do_not_depend_on_action_yml_indentation():
+    """The reason for parsing YAML (#758): with action.yml re-indented, the
+    same steps, scripts and input users are found."""
     original = ACTION.read_text(encoding="utf-8")
     reindented = yaml.safe_dump(yaml.safe_load(original), indent=4, sort_keys=False, width=1000)
     assert reindented != original
 
+    assert _issue_input_users(_steps(reindented)) == _issue_input_users(_steps())
     assert _steps(reindented) == _steps()
 
 
