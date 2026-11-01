@@ -692,6 +692,79 @@ def test_build_coder_lmstudio_unreachable_server_raises(monkeypatch):
             build_coder(RoleConfig(model_source="lmstudio"))
 
 
+def test_build_coder_lmstudio_discovery_strips_endpoint_trailing_slash(monkeypatch):
+    """The trailing-slash test above sets LMSTUDIO_MODEL, so it never
+    reaches discovery; this one does, and pins the URL actually requested
+    (#413)."""
+    monkeypatch.delenv("LMSTUDIO_MODEL", raising=False)
+    monkeypatch.setenv("LMSTUDIO_ENDPOINT", "http://gpu-box:1234/")
+
+    with patch(
+        "coder.requests.get",
+        return_value=_lmstudio_models_response("qwen2.5-coder-7b"),
+    ) as mock_get:
+        coder = build_coder(RoleConfig(model_source="lmstudio"))
+
+    assert mock_get.call_args.args[0] == "http://gpu-box:1234/v1/models"
+    assert coder.model == "qwen2.5-coder-7b"
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        requests.ConnectionError("refused"),
+        requests.exceptions.ConnectTimeout("connect timed out"),
+    ],
+    ids=["refused", "connect-timeout"],
+)
+def test_lmstudio_discovery_server_not_running_logs_without_traceback(
+    monkeypatch, caplog, exc
+):
+    """Nothing listening is the expected zero-config failure: one INFO
+    line naming the URL, no traceback, still the CoderConfigError (#412)."""
+    monkeypatch.delenv("LMSTUDIO_MODEL", raising=False)
+    monkeypatch.delenv("LMSTUDIO_ENDPOINT", raising=False)
+    caplog.set_level(logging.DEBUG, logger="coder")
+
+    with patch("coder.requests.get", side_effect=exc):
+        with pytest.raises(CoderConfigError, match="LMSTUDIO_MODEL"):
+            build_coder(RoleConfig(model_source="lmstudio"))
+
+    records = [r for r in caplog.records if r.name == "coder"]
+    assert [r.levelno for r in records] == [logging.INFO]
+    assert records[0].exc_info is None
+    assert f"{DEFAULT_LMSTUDIO_ENDPOINT}/v1/models" in records[0].getMessage()
+
+
+@pytest.mark.parametrize(
+    "side_effect",
+    [
+        requests.exceptions.SSLError("bad certificate"),
+        requests.exceptions.ProxyError("proxy refused"),
+        requests.exceptions.ReadTimeout("read timed out"),
+        requests.HTTPError("500 Server Error"),
+        ValueError("malformed JSON"),
+    ],
+    ids=["ssl", "proxy", "read-timeout", "http-error", "bad-json"],
+)
+def test_lmstudio_discovery_unexpected_failure_keeps_traceback(
+    monkeypatch, caplog, side_effect
+):
+    """Something answered but the lookup still failed: keep the WARNING
+    with its traceback, since that is the only place the cause shows."""
+    monkeypatch.delenv("LMSTUDIO_MODEL", raising=False)
+    monkeypatch.delenv("LMSTUDIO_ENDPOINT", raising=False)
+    caplog.set_level(logging.DEBUG, logger="coder")
+
+    with patch("coder.requests.get", side_effect=side_effect):
+        with pytest.raises(CoderConfigError, match="LMSTUDIO_MODEL"):
+            build_coder(RoleConfig(model_source="lmstudio"))
+
+    records = [r for r in caplog.records if r.name == "coder"]
+    assert [r.levelno for r in records] == [logging.WARNING]
+    assert records[0].exc_info is not None
+
+
 def test_build_coder_lmstudio_no_loaded_models_raises(monkeypatch):
     monkeypatch.delenv("LMSTUDIO_MODEL", raising=False)
 

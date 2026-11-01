@@ -332,6 +332,20 @@ class CoderConfigError(ValueError):
     """
 
 
+def _is_server_not_running(exc: requests.ConnectionError) -> bool:
+    """True when `exc` means nothing answered at the endpoint.
+
+    SSLError and ProxyError subclass ConnectionError but mean a server or
+    proxy *did* answer and something is misconfigured, so they keep the
+    traceback. ConnectTimeout is a ConnectionError too and counts as not
+    running; a ReadTimeout (server up, too slow) is not a ConnectionError
+    and is left to the general handler.
+    """
+    return not isinstance(
+        exc, (requests.exceptions.SSLError, requests.exceptions.ProxyError)
+    )
+
+
 def _discover_lmstudio_model(endpoint: str) -> str:
     """Return a model id from LM Studio's `/v1/models`, or "" if the server
     is unreachable or has nothing to offer.
@@ -350,9 +364,17 @@ def _discover_lmstudio_model(endpoint: str) -> str:
             for entry in (response.json().get("data") or [])
             if isinstance(entry, dict) and entry.get("id")
         ]
-    except (requests.RequestException, ValueError, AttributeError, TypeError):
+    except requests.ConnectionError as exc:
         # Caller turns an empty result into an actionable CoderConfigError
         # naming the endpoint, so this only needs to record the cause.
+        if _is_server_not_running(exc):
+            # The expected zero-config failure (#412): a traceback for
+            # "nothing is listening" is noise ahead of the caller's error.
+            logger.info("LM Studio not reachable at %s: %s", url, exc)
+        else:
+            logger.warning("LM Studio model lookup at %s failed", url, exc_info=True)
+        return ""
+    except (requests.RequestException, ValueError, AttributeError, TypeError):
         logger.warning("LM Studio model lookup at %s failed", url, exc_info=True)
         return ""
 
