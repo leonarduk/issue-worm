@@ -2353,7 +2353,9 @@ def _post_apply_lines(hunk_lines: list[str]) -> list[tuple[str, bool]]:
     unchanged context the diff carries for readability)."""
     result: list[tuple[str, bool]] = []
     for line in hunk_lines:
-        if line.startswith("+++") or line.startswith("---") or line.startswith("@@"):
+        # No `---`/`+++` skip: _iter_diff_files keeps a file's header out of
+        # its hunk lines, so such a line here is an added `++x` (content).
+        if line.startswith("@@"):
             continue
         if line.startswith("+"):
             result.append((line[1:], True))
@@ -2376,7 +2378,9 @@ def _added_line_numbers(hunk_lines: list[str]) -> set[int]:
         if header:
             line = int(header.group("start")) - 1
             continue
-        if line is None or text.startswith(("+++", "---")):
+        # _iter_diff_files never puts a file's own `---`/`+++` header in
+        # hunk_lines, so an added `++x` / `---` line here is content.
+        if line is None:
             continue
         if text.startswith("+"):
             added.add(line)
@@ -2415,6 +2419,7 @@ def _workflow_run_steps(text: str):
     Raises yaml.YAMLError when ``text`` is not valid YAML.
     """
     root = yaml.compose(text, Loader=yaml.SafeLoader)
+    lines = text.splitlines()
     steps = []
     jobs = _mapping_get(root, "jobs")
     if not isinstance(jobs, yaml.MappingNode):
@@ -2429,10 +2434,20 @@ def _workflow_run_steps(text: str):
             script = _scalar(_mapping_get(step, "run"))
             if script is None or not script.strip():
                 continue
-            end = step.end_mark.line + (1 if step.end_mark.column else 0)
+            end = _node_end_line(step, lines)
             shell = _scalar(_mapping_get(step, "shell")) or job_shell
             steps.append((step.start_mark.line, end, script.strip("\n"), shell))
     return steps
+
+
+def _node_end_line(node, lines: list[str]) -> int:
+    """The exclusive end line of a composed node. Its end mark sits on the
+    next token - for a step, the next step's `- ` - so that line belongs to
+    the node only when something of the node precedes the mark on it."""
+    line, column = node.end_mark.line, node.end_mark.column
+    if line < len(lines) and lines[line][:column].strip():
+        return line + 1
+    return line
 
 
 def _extract_new_workflow_run_scripts(
@@ -2457,7 +2472,12 @@ def _extract_new_workflow_run_scripts(
             continue
         on_disk = Path(repo_path, path) if repo_path else None
         if on_disk is not None and on_disk.is_file():
-            text = on_disk.read_text(encoding="utf-8", errors="replace")
+            try:
+                text = on_disk.read_text(encoding="utf-8")
+            except UnicodeDecodeError as exc:
+                # GitHub reads workflows as UTF-8 too; replacing bytes here
+                # would run a script GitHub never would.
+                raise _WorkflowParseError(f"[{path}] workflow is not valid UTF-8: {exc}") from exc
             added = _added_line_numbers(hunk_lines)
         else:
             lines = _post_apply_lines(hunk_lines)

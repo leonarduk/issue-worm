@@ -4369,6 +4369,32 @@ def test_editing_one_step_mid_file_runs_only_that_step(repo):
     assert scripts == [(path, "echo second\necho changed", None)]
 
 
+def test_adding_a_step_right_after_another_runs_only_the_new_one(repo):
+    """A step's YAML end mark sits on the next step's `- `, so that line
+    must not count as part of the earlier step: adding a step directly
+    below an existing one re-runs only the new step."""
+    from workspace import _extract_new_workflow_run_scripts
+
+    path = _commit_workflow(repo, _LONG_WORKFLOW)
+    new = _LONG_WORKFLOW.replace(
+        "      - name: third\n", "      - name: inserted\n        run: echo inserted\n      - name: third\n"
+    )
+    diff = _apply_and_diff(repo, path, new)
+
+    assert _extract_new_workflow_run_scripts(diff, repo) == [(path, "echo inserted", None)]
+
+
+def test_added_content_lines_starting_like_diff_headers_still_count():
+    """Hunk lines never carry the file's own `---`/`+++` header, so an
+    added `---` or `++x` line is content and is counted."""
+    from workspace import _added_line_numbers, _post_apply_lines
+
+    hunk = ["@@ -1 +1,3 @@", " keep", "+---", "+++x"]
+
+    assert _added_line_numbers(hunk) == {1, 2}
+    assert _post_apply_lines(hunk) == [("keep", False), ("---", True), ("++x", True)]
+
+
 def test_crlf_workflow_is_parsed(repo):
     """CRLF line endings are YAML's to handle (#417)."""
     from workspace import _extract_new_workflow_run_scripts
@@ -4440,6 +4466,19 @@ def test_defaults_run_shell_applies_to_steps_without_their_own(repo, defaults_at
     diff = _apply_and_diff(repo, path, workflow)
 
     assert _extract_new_workflow_run_scripts(diff, repo) == [(path, "echo hi", expected)]
+
+
+def test_non_utf8_workflow_fails_the_attempt(repo):
+    path = _commit_workflow(repo, "on: pull_request\n")
+    target = Path(repo) / path
+    target.write_bytes(b"on: pull_request\njobs:\n  lint:\n    steps:\n      - run: echo \xe9\n")
+    diff = subprocess.run(["git", "diff", "--", path], cwd=repo, capture_output=True, text=True,
+                          errors="replace").stdout
+
+    passed, output = workspace._run_new_workflow_step_scripts(repo, diff, None, timeout=30)
+
+    assert passed is False
+    assert "not valid UTF-8" in output
 
 
 def test_invalid_workflow_yaml_fails_the_attempt(repo):
