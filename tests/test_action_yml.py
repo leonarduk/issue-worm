@@ -114,7 +114,12 @@ def test_install_step_fails_when_pro_cli_is_importable(tmp_path, importable):
     isolation held (#291)."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    (bin_dir / "python").symlink_to(sys.executable)
+    # -S: no site-packages, so a pro_cli installed in the developer's own
+    # environment (e.g. alongside issue-worm-pro) can't leak into the
+    # "isolated" case; PYTHONPATH below is still honoured for "leaked".
+    fake_python = bin_dir / "python"
+    fake_python.write_text(f'#!/bin/sh\nexec "{sys.executable}" -S "$@"\n')
+    fake_python.chmod(0o755)
     site = tmp_path / "site"
     site.mkdir()
     if importable:
