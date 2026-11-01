@@ -146,3 +146,46 @@ updates the workflow to match.
     install or with empty output.
 - If the workflow starts using another module, argument or output, add it to
   the contract surface table in the same PR.
+
+## The floating `nightly` tag
+
+Every night, [`nightly-tag.yml`](../.github/workflows/nightly-tag.yml) moves a
+lightweight tag named `nightly` to the tip of `main`. It leaves the tag alone
+when `main` hasn't changed. The same workflow runs in the sibling repos
+(cicaid, and the pro repos).
+
+- **It is a tag, not a release.** Every version checker and dependency-pin
+  updater across these repos reads `releases/latest`, and `nightly` must never
+  show up there.
+- **The name deliberately contains no digit.**
+  - setuptools-scm's default `git describe --match '*[0-9]*'` can't derive a
+    package version from it.
+  - The release workflow's `v*` tag filter never fires on it.
+  - A dated name such as `nightly-2026-01-31` would break the first of these.
+- **It is force-moved.** A clone that already has the tag needs
+  `git fetch --force --tags` (or
+  `git fetch origin +refs/tags/nightly:refs/tags/nightly`) to see its new
+  position.
+
+### Nightly integration
+
+An hour later,
+[`nightly-integration.yml`](../.github/workflows/nightly-integration.yml)
+installs each sibling in `NIGHTLY_DEPS` at the exact commit its `nightly` tag
+points to, then runs this repo's tests against them. That answers "does `main`
+still work with what upstream merged today?" a day before anyone cuts a
+release. The pins themselves are left untouched.
+
+- **Before swapping,** the run asserts that each sibling was installed from
+  this repo's own pin. A removed pin therefore fails the run instead of passing
+  silently.
+- **After swapping,** it asserts that each sibling is at exactly the commit
+  recorded in the job summary.
+- **On failure,** it opens a tracking issue, or comments on the existing one.
+  The next green run closes it.
+- **A missing `nightly` tag makes the run test `main`.** This is intentional
+  bootstrap behaviour: an upstream repo whose first nightly-tag run hasn't
+  happened yet has no tag. The run emits a `::warning::` saying so, and the job
+  summary shows `main` in the Ref column. A run that keeps testing `main` long
+  after the sibling's nightly-tag workflow should have run means that workflow
+  is broken in the sibling, not here.

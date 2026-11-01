@@ -53,11 +53,45 @@ jobs:
       - name: Install package and test dependencies
         run: python -m pip install --upgrade pip && python -m pip install -e ".[dev]"
 
+      # Before swapping, prove each sibling came in from this repo's own pin
+      # (#502): if the pin were ever removed, the base install would pick up
+      # whatever resolves, the swap would still "work", and the run would
+      # pass without ever testing the pinned -> nightly transition. The pin
+      # is read through the same stdlib helper the pin updater uses, so this
+      # tracks every bump with nothing hardcoded.
+      - name: Assert each sibling is installed at its pinned release
+        run: |
+          for spec in $NIGHTLY_DEPS; do
+            pkg="${spec%%=*}"
+            pin="$(python -c 'import sys; sys.path.insert(0, "scripts"); from update_dependency_pins import PinError, current_pin
+          try:
+              print(current_pin(sys.argv[1]))
+          except PinError as exc:
+              sys.exit(f"::error::{exc}")' "$pkg")"
+            got="$(python -c 'import json, sys; from importlib.metadata import PackageNotFoundError, distribution
+          try:
+              d = distribution(sys.argv[1]).read_text("direct_url.json")
+          except PackageNotFoundError:
+              d = None
+          print(json.loads(d).get("vcs_info", {}).get("requested_revision", "") if d else "")' "$pkg")"
+            # A pin is a v-prefixed tag; "main" is the one ref without a "v".
+            want="v$pin"; [ "$pin" = main ] && want=main
+            if [ "$got" != "$want" ]; then
+              echo "::error::$pkg should be installed from its pin ($want) before the swap, but is at ${got:-no git revision (not installed, or not from a git URL)}."
+              exit 1
+            fi
+            echo "$pkg starts at its pinned $want."
+          done
+
       # --no-deps: the project install above already pulled every
       # dependency, and letting pip re-resolve would fight this repo's own
       # direct-URL pin on the same package.
       - name: Swap sibling packages for their nightly commits
         run: |
+          # Start the record empty, so the verify step only ever sees this
+          # run's commits even if the step is somehow run twice on one
+          # runner (#501).
+          : > "$RUNNER_TEMP/nightly-shas"
           {
             echo "### Sibling packages under test"
             echo "| Package | Ref | Commit |"
@@ -67,6 +101,12 @@ jobs:
             pkg="${spec%%=*}"
             url="https://github.com/${spec#*=}.git"
             ref=nightly
+            # Both patterns are needed (#500): for an annotated tag,
+            # `ls-remote <url> refs/tags/nightly` prints only the tag
+            # *object*; the peeled commit line (refs/tags/nightly^{}) appears
+            # only when that second pattern is asked for. nightly-tag.yml
+            # makes it lightweight today, but this must not resolve to a tag
+            # object if that ever changes.
             sha="$(git ls-remote "$url" refs/tags/nightly 'refs/tags/nightly^{}' \
               | awk '$2 ~ /\^\{\}$/ { peeled = $1 } $2 !~ /\^\{\}$/ { plain = $1 } END { print (peeled != "" ? peeled : plain) }')"
             if [ -z "$sha" ]; then
@@ -88,7 +128,11 @@ jobs:
           # --no-deps. Fail on that - it is drift the pins need to catch up
           # with - but only when a swapped sibling is the one complaining;
           # unrelated drift in the base install just warns, so it can't open
-          # a tracking issue blaming the siblings.
+          # a tracking issue blaming the siblings. pip check prints one line
+          # per *requiring* package ("<name> <version> requires <dep>, which
+          # is not installed."), so when several packages need the same
+          # missing dep each gets its own line, and the line-anchored match
+          # below still finds the sibling's (#503).
           if ! report="$(python -m pip check 2>&1)"; then
             echo "$report"
             names=""
