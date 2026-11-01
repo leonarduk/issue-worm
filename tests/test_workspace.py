@@ -1320,6 +1320,8 @@ def test_apply_ladder_is_ordered_strictest_first_and_context_0_is_opt_in(monkeyp
         # Removing a line whose content is `--flag` renders as `---flag` (#254).
         ("@@ -1 +1 @@\n---flag\n+--other\n", True),
         ("@@ -1 +1 @@\n-\n+b\n", True),
+        # A bare `---` removes a line whose content is `--`.
+        ("@@ -1 +1 @@\n---\n+b\n", True),
         # `\ No newline at end of file` is not a removed line (#254).
         ("@@ -1,0 +1 @@\n+b\n\\ No newline at end of file\n", False),
         # A removed `-- x` next to an added `++ y` is still a removal (#247).
@@ -1328,12 +1330,27 @@ def test_apply_ladder_is_ordered_strictest_first_and_context_0_is_opt_in(monkeyp
     ],
     ids=[
         "replacement", "pure-addition", "mixed", "all-replacements",
-        "removed-double-dash", "removed-empty-line", "no-newline-marker",
+        "removed-double-dash", "removed-empty-line", "removed-bare-double-dash",
+        "no-newline-marker",
         "dash-dash-then-plus-plus", "no-hunks",
     ],
 )
 def test_every_hunk_has_a_preimage(diff, expected):
     assert _every_hunk_has_a_preimage("--- a/a.py\n+++ b/a.py\n" + diff) is expected
+
+
+def test_every_apply_rung_recounts(monkeypatch):
+    """_hunk_removes_a_line counts any `-` line as a removal, a following
+    file's `--- a/x` header included. That is only sound because every
+    rung passes --recount, so git reads such a header the same way and a
+    multi-file section never applies (#719). Pin it on the rungs directly,
+    the opt-in context-0 rung included."""
+    monkeypatch.setenv(APPLY_CONTEXT0_ENV, "1")
+
+    rungs = _apply_ladder()
+
+    assert [name for name, _ in rungs][-1] == "context-0"
+    assert all("--recount" in flags for _, flags in rungs)
 
 
 def test_apply_refuses_a_section_carrying_a_second_files_diff(repo_with_context):
