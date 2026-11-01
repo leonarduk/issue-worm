@@ -966,6 +966,9 @@ def test_ci_check_env_is_an_allowlist_not_a_copy_of_os_environ(repo, tmp_path, m
     assert set(env) <= documented, sorted(set(env) - documented)
 
 
+# Spelled out rather than imported from workspace._CI_ENV_PASSTHROUGH_WINDOWS
+# on purpose: a test reading the constant could never notice an entry being
+# dropped from it (#775).
 _WINDOWS_ESSENTIALS = {
     "SYSTEMROOT": r"C:\Windows",
     "SYSTEMDRIVE": "C:",
@@ -984,6 +987,7 @@ def test_ci_check_env_windows_branch_passes_what_windows_needs(repo, tmp_path, m
         monkeypatch.setenv(key, value)
     monkeypatch.setenv("LANG", "en_GB.UTF-8")
     monkeypatch.setenv("TZ", "UTC")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "leaked-secret")  # in no allowlist (#776)
 
     env = ci_check_env(repo, home=str(tmp_path), is_windows=True)
 
@@ -991,7 +995,7 @@ def test_ci_check_env_windows_branch_passes_what_windows_needs(repo, tmp_path, m
         assert env[key] == value, key
     for key in ("HOME", "USERPROFILE", "TEMP", "TMP"):
         assert env[key] == str(tmp_path), key
-    for key in ("TMPDIR", "LANG", "TZ"):
+    for key in ("TMPDIR", "LANG", "TZ", "DEEPSEEK_API_KEY"):
         assert key not in env, key
 
 
