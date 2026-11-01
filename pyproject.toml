@@ -32,6 +32,9 @@ dependencies = [
     # Direct imports in version_checker.py (the update check).
     "packaging>=24,<27",
     "requests>=2.34.2,<3",
+    # workspace.py parses touched GitHub Actions workflows to find the
+    # `run:` steps to execute (#424).
+    "PyYAML>=6,<7",
 ]
 
 [project.optional-dependencies]

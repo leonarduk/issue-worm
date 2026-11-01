@@ -57,10 +57,11 @@ import shutil
 import subprocess
 import tempfile
 import sys
-import textwrap
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
+
+import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -2149,21 +2150,21 @@ def _reject_base_environment_kwarg(func_name: str, kwargs: dict) -> None:
 # sails through verification as a passing attempt: "CI passed" is true
 # only because nothing ran the new step at all. The helpers below close
 # that gap by extracting each `run:` step this diff touched - added
-# wholesale, or an existing step whose body/shell was edited - from the
-# diff's post-apply content and actually executing it against the repo
+# wholesale, or an existing step any of whose lines it edited - from the
+# applied workflow file and actually executing it against the repo
 # before the attempt is accepted.
 WORKFLOW_STEP_TIMEOUT = 120.0
 
 _WORKFLOW_DIFF_PATH_RE = re.compile(r"^\.github/workflows/.+\.ya?ml$")
-_RUN_BLOCK_RE = re.compile(r"^(\s*)(?:-\s*)?run:\s*[|>][+-]?\s*$")
-_RUN_INLINE_RE = re.compile(r"^(\s*)(?:-\s*)?run:\s*(\S.*)$")
-_STEP_START_RE = re.compile(r"^(\s*)-\s")
-# `shell:` may be the step's first key, in which case it sits on the
-# `- ` line itself - so it allows the same optional dash the two
-# `run:` patterns above do. Without it such a step reads as having no
-# `shell:` at all and its body runs under bash, which is the false
-# rejection the unsupported-shell skip exists to avoid.
-_SHELL_RE = re.compile(r"^\s*(?:-\s*)?shell:\s*(\S+)\s*$")
+# Steps are read with a YAML parser, not line regexes (#424): a block
+# scalar holding `---`, `run:` or a nested `shell:` key, CRLF line endings,
+# and step boundaries are all the parser's problem, and it gets them right.
+
+
+class _WorkflowParseError(Exception):
+    """A touched workflow file is not valid YAML - GitHub would refuse to
+    run it at all, so the attempt fails rather than being waved through."""
+
 
 # Commands used to execute an extracted step body, keyed by its `shell:`
 # value (GitHub Actions default, unset, is bash on Linux runners - the
@@ -2352,7 +2353,9 @@ def _post_apply_lines(hunk_lines: list[str]) -> list[tuple[str, bool]]:
     unchanged context the diff carries for readability)."""
     result: list[tuple[str, bool]] = []
     for line in hunk_lines:
-        if line.startswith("+++") or line.startswith("---") or line.startswith("@@"):
+        # No `---`/`+++` skip: _iter_diff_files keeps a file's header out of
+        # its hunk lines, so such a line here is an added `++x` (content).
+        if line.startswith("@@"):
             continue
         if line.startswith("+"):
             result.append((line[1:], True))
@@ -2362,99 +2365,140 @@ def _post_apply_lines(hunk_lines: list[str]) -> list[tuple[str, bool]]:
     return result
 
 
-def _step_shell(lines: list[tuple[str, bool]], run_index: int) -> str | None:
-    """The `shell:` value declared on the same step as ``lines[run_index]``
-    (the step's ``run:`` key), or ``None`` if it doesn't set one -
-    ``shell:`` may appear before or after ``run:`` in the step mapping."""
-    run_text = lines[run_index][0]
-    run_indent = len(run_text) - len(run_text.lstrip())
+_HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(?P<start>\d+)(?:,\d+)? @@")
 
-    start = 0
-    dash_indent = run_indent
-    for k in range(run_index, -1, -1):
-        text = lines[k][0]
-        indent = len(text) - len(text.lstrip())
-        if _STEP_START_RE.match(text) and indent <= run_indent:
-            start, dash_indent = k, indent
-            break
 
-    end = len(lines)
-    for k in range(start + 1, len(lines)):
-        text = lines[k][0]
-        indent = len(text) - len(text.lstrip())
-        if _STEP_START_RE.match(text) and indent <= dash_indent:
-            end = k
-            break
-
-    # Only the step's *own* keys count. A `shell:` nested under `with:`
-    # belongs to the action being invoked, not to this step, and reading
-    # it would skip a step that actually runs under the default shell.
-    dash_text = lines[start][0]
-    after_dash = dash_text.find("-", dash_indent) + 1
-    key_indent = after_dash + len(dash_text[after_dash:]) - len(dash_text[after_dash:].lstrip())
-
-    for k in range(start, end):
-        text = lines[k][0]
-        if k != start and len(text) - len(text.lstrip()) != key_indent:
+def _added_line_numbers(hunk_lines: list[str]) -> set[int]:
+    """0-based line numbers, in the file as it reads after this diff, of
+    every line the diff adds."""
+    added: set[int] = set()
+    line = None
+    for text in hunk_lines:
+        header = _HUNK_HEADER_RE.match(text)
+        if header:
+            line = int(header.group("start")) - 1
             continue
-        match = _SHELL_RE.match(text)
-        if match:
-            return match.group(1)
+        # _iter_diff_files never puts a file's own `---`/`+++` header in
+        # hunk_lines, so an added `++x` / `---` line here is content.
+        if line is None:
+            continue
+        if text.startswith("+"):
+            added.add(line)
+            line += 1
+        elif text.startswith(" "):
+            line += 1
+        # '-' (removed) and '\ No newline at end of file': no new-file line.
+    return added
+
+
+def _mapping_get(node, key: str):
+    """The value node for ``key`` in a composed YAML mapping, else None."""
+    if not isinstance(node, yaml.MappingNode):
+        return None
+    for key_node, value_node in node.value:
+        if isinstance(key_node, yaml.ScalarNode) and key_node.value == key:
+            return value_node
     return None
 
 
+def _scalar(node) -> str | None:
+    return node.value if isinstance(node, yaml.ScalarNode) else None
+
+
+def _default_shell(node) -> str | None:
+    """`defaults: run: shell:` declared on a workflow or job mapping."""
+    return _scalar(_mapping_get(_mapping_get(_mapping_get(node, "defaults"), "run"), "shell"))
+
+
+def _workflow_run_steps(text: str):
+    """``(first_line, end_line, script, shell)`` for each ``run:`` step in
+    a workflow file, lines 0-based and end-exclusive. ``shell`` resolves as
+    GitHub does: the step's own `shell:`, else the job's then the
+    workflow's `defaults: run: shell:`, else None (bash).
+
+    Raises yaml.YAMLError when ``text`` is not valid YAML.
+    """
+    root = yaml.compose(text, Loader=yaml.SafeLoader)
+    lines = text.splitlines()
+    steps = []
+    jobs = _mapping_get(root, "jobs")
+    if not isinstance(jobs, yaml.MappingNode):
+        return steps
+    workflow_shell = _default_shell(root)
+    for _, job in jobs.value:
+        job_shell = _default_shell(job) or workflow_shell
+        step_list = _mapping_get(job, "steps")
+        if not isinstance(step_list, yaml.SequenceNode):
+            continue
+        for step in step_list.value:
+            script = _scalar(_mapping_get(step, "run"))
+            if script is None or not script.strip():
+                continue
+            end = _node_end_line(step, lines)
+            shell = _scalar(_mapping_get(step, "shell")) or job_shell
+            steps.append((step.start_mark.line, end, script.strip("\n"), shell))
+    return steps
+
+
+def _node_end_line(node, lines: list[str]) -> int:
+    """The exclusive end line of a composed node. Its end mark sits on the
+    next token - for a step, the next step's `- ` - so that line belongs to
+    the node only when something of the node precedes the mark on it."""
+    line, column = node.end_mark.line, node.end_mark.column
+    if line < len(lines) and lines[line][:column].strip():
+        return line + 1
+    return line
+
+
 def _extract_new_workflow_run_scripts(
-    diff_output: str,
+    diff_output: str, repo_path: str | None = None
 ) -> list[tuple[str, str, str | None]]:
     """``(path, script, shell)`` for each ``run:`` step this diff touched
     in a ``.github/workflows/*.yml`` file - added wholesale, or an
-    existing step whose body or ``shell:`` this diff edited.
+    existing step any of whose lines this diff added or edited.
 
-    A step is only included when at least one line of it (its ``run:``
-    key, its body, or its ``shell:`` key) is a line this diff actually
-    *adds* - an untouched step that merely sits near a real change (and so
-    appears as surrounding context) is never re-executed.
+    The file is parsed as YAML (#424). With ``repo_path`` it is read as
+    applied, from disk, and the diff's added-line numbers say which steps
+    were touched. Without it - or when the file is gone - the post-apply
+    text is rebuilt from the diff's own hunk lines, which is the whole file
+    when the hunks cover it; text rebuilt that way that fails to parse is
+    skipped, since it may just be partial. A step the diff only shows as
+    surrounding context is never re-executed.
+
+    Raises _WorkflowParseError when a touched workflow read from disk is
+    not valid YAML (or not UTF-8).
     """
     scripts: list[tuple[str, str, str | None]] = []
     for path, hunk_lines in _iter_diff_files(diff_output):
         if not _WORKFLOW_DIFF_PATH_RE.match(path):
             continue
-        lines = _post_apply_lines(hunk_lines)
-        i = 0
-        while i < len(lines):
-            text, touched = lines[i]
-            block_match = _RUN_BLOCK_RE.match(text)
-            if block_match:
-                # The block body is what is indented past the `run:` key -
-                # which is not the same as past the start of the line when
-                # `run:` is the step's first key, because the `- ` sits in
-                # between. Measuring from the line start there treats the
-                # step's own sibling keys (`env:`, `shell:`,
-                # `working-directory:`, ...) as body lines and appends them
-                # to the script, so a correct step fails on `env: command
-                # not found` - a false rejection.
-                indent = text.index("run:")
-                step_touched = touched
-                i += 1
-                body_lines = []
-                while i < len(lines):
-                    btext, btouched = lines[i]
-                    if btext.strip() == "" or len(btext) - len(btext.lstrip()) > indent:
-                        body_lines.append(btext)
-                        step_touched = step_touched or btouched
-                        i += 1
-                    else:
-                        break
-                script = textwrap.dedent("\n".join(body_lines)).strip("\n")
-                if step_touched and script.strip():
-                    shell = _step_shell(lines, i - len(body_lines) - 1)
-                    scripts.append((path, script, shell))
+        on_disk = Path(repo_path, path) if repo_path else None
+        from_disk = on_disk is not None and on_disk.is_file()
+        if from_disk:
+            try:
+                text = on_disk.read_text(encoding="utf-8")
+            except UnicodeDecodeError as exc:
+                # GitHub reads workflows as UTF-8 too; replacing bytes here
+                # would run a script GitHub never would.
+                raise _WorkflowParseError(f"[{path}] workflow is not valid UTF-8: {exc}") from exc
+            added = _added_line_numbers(hunk_lines)
+        else:
+            lines = _post_apply_lines(hunk_lines)
+            text = "\n".join(line for line, _ in lines) + "\n"
+            added = {index for index, (_, touched) in enumerate(lines) if touched}
+        if not added:
+            continue
+        try:
+            steps = _workflow_run_steps(text)
+        except yaml.YAMLError as exc:
+            if not from_disk:
+                # Rebuilt from hunks that may not cover the whole file, so a
+                # parse failure here says nothing about the real workflow.
                 continue
-            inline_match = _RUN_INLINE_RE.match(text)
-            if inline_match and touched:
-                shell = _step_shell(lines, i)
-                scripts.append((path, inline_match.group(2), shell))
-            i += 1
+            raise _WorkflowParseError(f"[{path}] workflow is not valid YAML: {exc}") from exc
+        for first, end, script, shell in steps:
+            if any(first <= line < end for line in added):
+                scripts.append((path, script, shell))
     return scripts
 
 
@@ -2481,8 +2525,14 @@ def _run_new_workflow_step_scripts(
     body that needs Actions runtime context - a ``${{ }}`` expression or
     an environment variable nothing here defines (see
     :func:`_unsupported_step_context`).
+
+    A touched workflow that is not valid YAML fails the attempt outright:
+    GitHub would refuse to run any of it.
     """
-    scripts = _extract_new_workflow_run_scripts(diff_output)
+    try:
+        scripts = _extract_new_workflow_run_scripts(diff_output, repo_path)
+    except _WorkflowParseError as exc:
+        return False, str(exc)
     if not scripts:
         return True, ""
     all_passed = True
