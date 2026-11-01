@@ -7,7 +7,9 @@ happens from a test, only from a genuine build/Action run.
 """
 
 import json
+import subprocess
 import sys
+import tempfile
 from unittest.mock import patch
 
 import pytest
@@ -427,3 +429,28 @@ def test_start_degrades_gracefully_when_cicaid_devtools_is_absent(monkeypatch):
     monkeypatch.setitem(sys.modules, "cicaid_devtools", None)
 
     pr.start("owner/repo", 1)  # must not raise
+
+
+def test_update_progress_comment_propagates_a_raising_gh_and_cleans_up(
+    monkeypatch, tmp_path
+):
+    """A `gh` that raises (timeout, not on PATH) propagates as itself -
+    not as an UnboundLocalError on `result` - and the temp body file is
+    still removed. Swallowing it is the caller's job, pinned by
+    test_a_raising_gh_call_is_swallowed_and_never_raises (#382)."""
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    seen = []
+
+    def _timeout(*args, **kwargs):
+        # The body file exists here, under tmp_path, while gh "runs" - so
+        # the empty-directory check below proves removal, not absence.
+        seen.extend(p.name for p in tmp_path.iterdir())
+        raise subprocess.TimeoutExpired(cmd="gh", timeout=1)
+
+    monkeypatch.setattr(pr.subprocess, "run", _timeout)
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        pr._update_progress_comment("owner/repo", 123, "body")
+
+    assert len(seen) == 1 and seen[0].endswith(".md")
+    assert list(tmp_path.iterdir()) == []
