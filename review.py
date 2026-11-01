@@ -81,6 +81,23 @@ def _split_files(raw: str) -> list[str]:
     return [f.strip() for f in raw.split(",") if f.strip()]
 
 
+def merge_implementation_notes(issue_body: str, section: str) -> str:
+    """`issue_body` with the drafted `section` in place of its first
+    `## Implementation notes` section, or appended when it has none.
+
+    Self-heal only runs on a body `review_issue` rejected, so an existing
+    section here is a malformed one. Appending next to it (#264) left the
+    issue with two `## Implementation notes` headings - harmless to
+    `review_issue`, which takes the first ready one, but a confusing issue
+    for the human reading it. Same section rules as `review_issue`; text
+    outside the replaced section is kept verbatim.
+    """
+    match = _SECTION_RE.search(issue_body or "")
+    if match is None:
+        return f"{issue_body}\n\n{section}"
+    return issue_body[: match.start()] + section.strip("\n") + issue_body[match.end():]
+
+
 # A fenced code block's opening line: up to 3 spaces of indent, then 3+
 # backticks or tildes (CommonMark). Only a run of the same character at
 # least as long closes it.

@@ -11,7 +11,12 @@ from pathlib import Path
 
 import pytest
 
-from review import draft_implementation_notes, extract_done_line, review_issue
+from review import (
+    draft_implementation_notes,
+    extract_done_line,
+    merge_implementation_notes,
+    review_issue,
+)
 
 
 def test_well_scoped_issue_is_ready():
@@ -324,3 +329,33 @@ def test_action_yml_done_line_runs_under_bash(tmp_path, body, expected):
 
     assert result.returncode == 0, result.stderr
     assert result.stdout == expected
+
+
+# --- merge_implementation_notes: self-heal without duplicate headings (#264) ---
+
+_HEALED = "## Implementation notes\nFILES: a.py\nDONE: it works\n"
+
+
+def test_merge_implementation_notes_appends_when_there_is_no_section():
+    assert merge_implementation_notes("plain body", _HEALED) == f"plain body\n\n{_HEALED}"
+
+
+def test_merge_implementation_notes_replaces_a_malformed_section_in_place():
+    body = "Intro.\n\n## Implementation notes\nFILES: a.py\n\n## Other\nKeep me.\n"
+
+    merged = merge_implementation_notes(body, _HEALED)
+
+    assert merged == (
+        "Intro.\n\n## Implementation notes\nFILES: a.py\nDONE: it works\n## Other\nKeep me.\n"
+    )
+    assert merged.lower().count("## implementation notes") == 1
+    assert review_issue(merged).done == "it works"
+
+
+def test_merge_implementation_notes_replaces_a_trailing_section():
+    body = "Intro.\n\n## IMPLEMENTATION NOTES\nDONE:\n"
+
+    merged = merge_implementation_notes(body, _HEALED)
+
+    assert merged == "Intro.\n\n" + _HEALED.rstrip("\n")
+    assert review_issue(merged).ready is True
