@@ -2778,6 +2778,46 @@ def test_apply_refuses_a_full_rewrite_that_dropped_most_of_the_file(repo):
     assert target.read_text() == _numbered_lines(400)
 
 
+@pytest.mark.parametrize(
+    ("kept", "refused"), [(50, True), (300, False)], ids=["truncated", "deletion"]
+)
+def test_apply_judges_a_rewrite_of_a_file_that_is_not_valid_utf8(repo, kept, refused):
+    """The existing file is read with errors="replace": a stray non-UTF-8
+    byte must neither crash the check nor stop it counting lines (#447)."""
+    target = Path(repo) / "big.py"
+    original = _numbered_lines(399).encode() + b"latin1 = '\xe9'\n"
+    target.write_bytes(original)
+    (change,) = parse_coder_output(
+        _full_file_output("big.py", _numbered_lines(kept).rstrip("\n")), ["big.py"]
+    )
+
+    if refused:
+        with pytest.raises(MalformedOutputError, match=rf"keeps {kept} of 400 lines"):
+            apply_file_change(repo, change)
+        assert target.read_bytes() == original
+    else:
+        assert apply_file_change(repo, change) is None
+        assert target.read_text() == _numbered_lines(kept)
+
+
+@pytest.mark.parametrize(("kept", "refused"), [(200, True), (201, False)])
+def test_truncation_threshold_ignores_a_missing_final_newline(repo, kept, refused):
+    """A 400-line file whose last line is unterminated still counts as 400
+    lines, while the body gets a newline appended - so the boundary stays
+    exactly at half, not shifted by one either way (#448)."""
+    target = Path(repo) / "big.py"
+    target.write_text(_numbered_lines(400).rstrip("\n"))
+    (change,) = parse_coder_output(
+        _full_file_output("big.py", _numbered_lines(kept).rstrip("\n")), ["big.py"]
+    )
+
+    if refused:
+        with pytest.raises(MalformedOutputError, match=rf"keeps {kept} of 400 lines"):
+            apply_file_change(repo, change)
+    else:
+        assert apply_file_change(repo, change) is None
+
+
 def test_apply_allows_a_large_but_deliberate_deletion(repo):
     """Removing a quarter of a big file is a normal change, not truncation."""
     target = Path(repo) / "big.py"
