@@ -17,6 +17,8 @@ import importlib.util
 import inspect
 import json
 import os
+import shutil
+import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from types import ModuleType
@@ -1367,6 +1369,40 @@ def test_build_reports_apply_failure_without_crashing(tmp_path, capsys):
 
     assert exc.value.code == 1
     assert "git apply failed" in capsys.readouterr().err
+
+
+def _installed_entry_point() -> str | None:
+    """The `issue-worm` console script installed next to this interpreter
+    (CI's `pip install -e .`), or None in a checkout that never installed it."""
+    scripts = os.path.dirname(sys.executable)
+    return shutil.which("issue-worm", path=scripts) or shutil.which("issue-worm")
+
+
+@pytest.mark.skipif(_installed_entry_point() is None, reason="issue-worm is not installed")
+def test_console_script_exits_one_with_a_config_error(tmp_path):
+    """The real installed shim, in a real process (#327): a malformed
+    CODER_TARGETS must reach the shell as exit status 1 with the message on
+    stderr. The in-process test below can't see the shim swallowing the
+    code or main() returning instead of exiting. `status` rather than
+    `build`, so an issue-worm-pro installed beside it can't take over."""
+    result = subprocess.run(
+        [_installed_entry_point(), "status"],
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "CODER_TARGETS": "host:notaport",
+            "ISSUE_WORM_SKIP_UPDATE_CHECK": "1",
+            "HOME": str(tmp_path),
+        },
+        timeout=60,
+        check=False,
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "Config error" in result.stderr
+    assert "host:notaport" in result.stderr
 
 
 @pytest.mark.parametrize("bad_targets", ["invalid", "host:notaport", "a:b:c"])
