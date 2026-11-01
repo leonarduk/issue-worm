@@ -982,17 +982,20 @@ def _leading_ws(line: str) -> str:
 
 
 def _reindent(
-    lines: list[str], search_lines: list[str], matched: list[str], path: str, number: int
+    lines: list[str], search_lines: list[str], matched: list[str]
 ) -> list[str]:
     """Shift ``lines`` by the indentation difference between the first
     non-blank SEARCH line and the file line it matched.
 
     A line indented less than that SEARCH line (a dedent, e.g. a REPLACE
     that closes the block it edits) keeps its offset relative to it (#314)
-    rather than being left where it was. A dedent deeper than the file
-    line's own indentation has nowhere to go, so it fails the block rather
-    than silently landing at the wrong level. Indentation with no prefix
-    relation to the SEARCH line's (tabs against spaces) is left as is.
+    rather than being left where it was. That is all or nothing per block:
+    if the deepest dedent would go below column 0 (SEARCH quoted deeper
+    than the file has it, then a new top-level `def` at column 0, say),
+    no dedented line has a relative position to keep, and every one keeps
+    its literal indentation as before #314 - shifting only some would
+    split a block from its own body. Indentation with no prefix relation
+    to the SEARCH line's (tabs against spaces) is left as is too.
     """
     for want, got in zip(search_lines, matched):
         if want.strip():
@@ -1002,6 +1005,12 @@ def _reindent(
         return lines
     if old == new:
         return lines
+    dedents = [
+        len(old) - len(indent)
+        for indent in (_leading_ws(line) for line in lines if line.strip())
+        if old.startswith(indent) and indent != old
+    ]
+    shift_dedents = not dedents or max(dedents) <= len(new)
     out = []
     for line in lines:
         indent = _leading_ws(line)
@@ -1009,16 +1018,8 @@ def _reindent(
             out.append(line)
         elif indent.startswith(old):
             out.append(new + line[len(old) :])
-        elif old.startswith(indent):
-            dedent = len(old) - len(indent)
-            if dedent > len(new):
-                raise MalformedOutputError(
-                    f"MODE: EDIT block {number} for {path!r}: a REPLACE line "
-                    f"dedents {dedent} columns below its SEARCH text, past the "
-                    "matched lines' own indentation - copy the SEARCH text "
-                    "with its real indentation"
-                )
-            out.append(new[: len(new) - dedent] + line[len(indent) :])
+        elif old.startswith(indent) and shift_dedents:
+            out.append(new[: len(new) - (len(old) - len(indent))] + line[len(indent) :])
         else:
             out.append(line)
     return out
@@ -1094,7 +1095,7 @@ def _apply_one_block(
             matched = [line.rstrip("\r\n") for line in file_lines[start : start + size]]
             new_lines = replace.splitlines()
             if rung == EDIT_RUNG_INDENT:
-                new_lines = _reindent(new_lines, search_lines, matched, path, number)
+                new_lines = _reindent(new_lines, search_lines, matched)
             # Each replacement line takes the terminator of the matched line
             # at the same position (the last one's past the end), so a
             # mixed-EOL region keeps its shape instead of being normalised

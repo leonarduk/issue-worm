@@ -3394,21 +3394,31 @@ def test_search_replace_indentation_tolerant_fallback_dedent_to_exactly_column_z
     assert text == "if x:\n    y = 2\nw = 3\nz = 0\n"
 
 
-def test_search_replace_indentation_tolerant_fallback_refuses_an_impossible_dedent():
-    """A dedent deeper than the matched lines' own indentation has no right
-    answer; fail the block instead of writing it at the wrong level."""
-    content = "def f(x):\n    if x:\n        y = 1\n"
+def test_search_replace_indentation_tolerant_fallback_keeps_column_zero_lines():
+    """A dedent deeper than the matched lines' own indentation has no
+    relative position, so the line keeps its literal indentation as it did
+    before #314. The real case: SEARCH quoted deeper than the file has it,
+    then a new top-level function at column 0 - which must stay there, not
+    be rejected or shifted."""
+    content = "class A:\n    def f(self):\n        return 1\n"
     body = (
         "<<<<<<< SEARCH\n"
-        "            if x:\n"
+        "            return 1\n"
         "=======\n"
-        "            if x:\n"
-        "z = 0\n"
+        "            return 2\n"
+        "\n"
+        "\n"
+        "def g():\n"
+        "    return 3\n"
         ">>>>>>> REPLACE\n"
     )
 
-    with pytest.raises(MalformedOutputError, match="dedents 12 columns"):
-        _apply_search_replace(content, body, "a.py")
+    text, rung = _apply_search_replace(content, body, "a.py")
+
+    assert rung == "edit-indentation-tolerant"
+    assert text == (
+        "class A:\n    def f(self):\n        return 2\n\n\ndef g():\n    return 3\n"
+    )
 
 
 def test_edit_applying_one_change_to_several_similar_functions_is_not_a_loop():
