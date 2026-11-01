@@ -28,7 +28,12 @@ from config import ConfigError, load_config
 from coder import CoderConfigError, build_coder
 from history import DEFAULT_HISTORY_PATH, get_run, load_runs, record_run
 from registry import finish, heartbeat, list_runs, register
-from review import ReviewResult, draft_implementation_notes, review_issue
+from review import (
+    ReviewResult,
+    draft_implementation_notes,
+    merge_implementation_notes,
+    review_issue,
+)
 from version_checker import PACKAGE_NAME, check_and_prompt, installed_version
 from workspace import (
     CATEGORY_CODER_UNREACHABLE,
@@ -238,8 +243,9 @@ def _list_repo_top_level_files(repo: str) -> list[str]:
 def _try_persist_implementation_notes(
     repo: str, issue_number: int, section: str
 ) -> bool:
-    """Best-effort: append the auto-drafted section to the real issue body
-    on GitHub, so a human reading the issue (or the next run) sees the
+    """Best-effort: write the auto-drafted section into the real issue body
+    on GitHub (replacing a malformed one, else appended - see
+    `review.merge_implementation_notes`), so a human reading the issue (or the next run) sees the
     same scope this run used instead of it existing only in this
     process's memory. Never raises and never fails the build - a token
     without `issues: write` (this action only documents needing
@@ -265,7 +271,7 @@ def _try_persist_implementation_notes(
         response = requests.patch(
             url,
             headers=headers,
-            json={"body": f"{current_body}\n\n{section}"},
+            json={"body": merge_implementation_notes(current_body, section)},
             timeout=GITHUB_API_TIMEOUT,
         )
         response.raise_for_status()
@@ -301,11 +307,11 @@ def _self_heal_scope(
     section = draft_implementation_notes(body, repo_files, coder)
     if section is None:
         return None
-    healed_body = f"{body}\n\n{section}"
+    healed_body = merge_implementation_notes(body, section)
     review = review_issue(healed_body)
     if not review.ready:
         return None
-    print("⚠ Issue had no `## Implementation notes` section — auto-drafted one:")
+    print("⚠ Issue had no usable `## Implementation notes` section — auto-drafted one:")
     print(f"  FILES: {', '.join(review.files)}")
     print(f"  DONE: {review.done}")
     if _try_persist_implementation_notes(repo, issue_number, section):

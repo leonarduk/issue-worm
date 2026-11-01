@@ -27,7 +27,7 @@ import cli
 import progress_reporter
 import registry
 from coder import CoderConfigError
-from review import ReviewResult
+from review import ReviewResult, review_issue
 from workspace import CATEGORY_OUTPUT_SHAPE, FileChange, MalformedOutputError, WorkspaceError
 
 # The `_pro_cli_absent` fixture below is now redundant with the autouse
@@ -744,6 +744,26 @@ def test_self_heal_scope_returns_healed_review_and_body(capsys):
     assert "saved to the GitHub issue" in out
 
 
+def test_self_heal_scope_replaces_a_malformed_section_instead_of_appending(capsys):
+    """A body whose own section is malformed gets the drafted section in
+    its place, not a second `## Implementation notes` heading (#264)."""
+    section = "## Implementation notes\nFILES: a.py\nDONE: it works\n"
+    body = "Fix it.\n\n## Implementation notes\nFILES: a.py\n"
+    with patch("cli.build_coder"), patch(
+        "cli._list_repo_top_level_files", return_value=["a.py"]
+    ), patch("cli.draft_implementation_notes", return_value=section), patch(
+        "cli._try_persist_implementation_notes", return_value=True
+    ):
+        result = cli._self_heal_scope("o/r", 5, body, {})
+
+    assert result is not None
+    review, healed_body = result
+    assert review.done == "it works"
+    assert healed_body == "Fix it.\n\n" + section
+    assert healed_body.count("## Implementation notes") == 1
+    assert review_issue(healed_body).ready is True
+
+
 @pytest.mark.usefixtures("_pro_cli_absent")
 def test_self_heal_scope_banner_says_when_persist_failed(capsys):
     """`_try_persist_implementation_notes` returning False (missing token,
@@ -816,6 +836,23 @@ def test_persist_implementation_notes_patches_appended_body(monkeypatch):
     assert result is True
     assert mock_patch.call_args[0][0] == "https://api.github.com/repos/o/r/issues/5"
     assert mock_patch.call_args[1]["json"]["body"] == "original\n\nhealed section"
+
+
+def test_persist_implementation_notes_replaces_a_malformed_section(monkeypatch):
+    """The issue saved back to GitHub gets one `## Implementation notes`
+    section, not the malformed one plus the drafted one (#264)."""
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    current = "Fix it.\n\n## Implementation notes\nFILES: a.py\n"
+    section = "## Implementation notes\nFILES: a.py\nDONE: it works\n"
+    with patch(
+        "cli.requests.get", return_value=_mock_get_response(200, {"body": current})
+    ), patch(
+        "cli.requests.patch", return_value=_mock_get_response(200, {})
+    ) as mock_patch:
+        assert cli._try_persist_implementation_notes("o/r", 5, section) is True
+
+    patched = mock_patch.call_args[1]["json"]["body"]
+    assert patched == "Fix it.\n\n" + section
 
 
 def test_persist_implementation_notes_returns_false_on_403(monkeypatch):

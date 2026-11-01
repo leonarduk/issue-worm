@@ -81,6 +81,38 @@ def _split_files(raw: str) -> list[str]:
     return [f.strip() for f in raw.split(",") if f.strip()]
 
 
+def merge_implementation_notes(issue_body: str, section: str) -> str:
+    """`issue_body` with its `## Implementation notes` sections replaced by
+    the drafted `section`, or with `section` appended when it has none.
+
+    For self-heal's use: the caller passes a body `review_issue` rejected,
+    so every such section in it is malformed. They collapse into the one
+    drafted section, placed where the first one was (#264). Appending next
+    to them left the issue with duplicate headings, which `review_issue`
+    tolerates (it takes the first ready section) but a human reading the
+    issue should not have to. Uses `review_issue`'s own section rules; text
+    outside those sections is kept verbatim, spacing around them included.
+    """
+    issue_body = issue_body or ""
+    matches = list(_SECTION_RE.finditer(issue_body))
+    if not matches:
+        return f"{issue_body}\n\n{section}"
+    merged = issue_body
+    # Later sections first, so earlier offsets stay valid. A removed
+    # section takes its own text and the newline that led into the next
+    # heading; the blank lines before it then separate what surrounds it.
+    for match in reversed(matches[1:]):
+        before, after = merged[: match.start()], merged[match.end():]
+        merged = before + after.lstrip("\n") if after else before.rstrip("\n") + "\n"
+    first = matches[0]
+    # The drafted section takes the replaced one's trailing newlines, so
+    # the spacing before whatever follows is unchanged.
+    old_text = first.group(0)
+    newlines = len(old_text) - len(old_text.rstrip("\n"))
+    replacement = section.strip("\n") + "\n" * newlines
+    return merged[: first.start()] + replacement + merged[first.end():]
+
+
 # A fenced code block's opening line: up to 3 spaces of indent, then 3+
 # backticks or tildes (CommonMark). Only a run of the same character at
 # least as long closes it.
