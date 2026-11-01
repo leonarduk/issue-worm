@@ -2845,7 +2845,11 @@ def test_parse_keeps_complete_copies_of_a_loop_cut_off_by_the_output_cap():
     changes = parse_coder_output(output, ["a.py"])
 
     assert changes[0].body == "x = 1\ny = 2"
-    assert "dropped 1 unterminated" in changes[0].recovery
+    # Two sections dropped, not one: the second complete copy goes too (#310).
+    assert changes[0].recovery == (
+        "kept the END FILE-terminated section, dropped 1 identical terminated "
+        "duplicate(s) and 1 unterminated draft/looped section(s) (3 emitted)"
+    )
 
 
 def test_parse_rejects_repeats_when_only_unterminated_copies_differ():
@@ -3324,6 +3328,122 @@ def test_search_replace_preserves_crlf_line_endings():
     assert "\n" not in text.replace("\r\n", "")
 
 
+def test_search_replace_keeps_each_lines_own_ending_in_a_mixed_eol_region():
+    """A region mixing CRLF and LF keeps each line's terminator by position;
+    it used to be normalised to the first matched line's ending (#312)."""
+    content = "a = 1\r\nb = 2\nc = 3\r\n"
+    body = "<<<<<<< SEARCH\na = 1\nb = 2\nc = 3\n=======\na = 10\nb = 20\nc = 30\nd = 40\n>>>>>>> REPLACE\n"
+
+    text, rung = _apply_search_replace(content, body, "a.py")
+
+    assert rung == "edit-whitespace-tolerant"
+    # Line 4 is past the matched region: it takes the last matched ending.
+    assert text == "a = 10\r\nb = 20\nc = 30\r\nd = 40\r\n"
+
+
+def test_search_replace_mixed_eol_edit_at_eof_keeps_the_missing_final_newline():
+    content = "a = 1\r\nb = 2"
+    body = "<<<<<<< SEARCH\na = 1\nb = 2\n=======\na = 1\nb = 3\n>>>>>>> REPLACE\n"
+
+    text, _ = _apply_search_replace(content, body, "a.py")
+
+    assert text == "a = 1\r\nb = 3"
+
+
+def test_search_replace_indentation_tolerant_fallback_keeps_a_dedent_relative():
+    """A REPLACE line less indented than the SEARCH text keeps its offset
+    from it; it used to stay at its own literal indentation (#314).
+
+    The SEARCH quotes `y = 1` 12 deep where the file has it 8 deep, so the
+    block shifts left by 4. The REPLACE adds `log(y)` 4 columns left of
+    `y = 2` - after the `if`, in the function body - so it must land 4
+    columns left of the shifted line (column 4), not stay at column 8
+    inside the `if`."""
+    content = "def f(x):\n    if x:\n        y = 1\n    return y\n"
+    body = (
+        "<<<<<<< SEARCH\n"
+        "            y = 1\n"
+        "=======\n"
+        "            y = 2\n"
+        "        log(y)\n"
+        ">>>>>>> REPLACE\n"
+    )
+
+    text, rung = _apply_search_replace(content, body, "a.py")
+
+    assert rung == "edit-indentation-tolerant"
+    assert text == "def f(x):\n    if x:\n        y = 2\n    log(y)\n    return y\n"
+
+
+def test_search_replace_indentation_tolerant_fallback_dedent_to_exactly_column_zero():
+    """The boundary of the dedent rule: a dedent equal to the matched
+    lines' own indentation lands at column 0 and is accepted."""
+    content = "if x:\n    y = 1\nz = 0\n"
+    body = (
+        "<<<<<<< SEARCH\n"
+        "        y = 1\n"
+        "=======\n"
+        "        y = 2\n"
+        "    w = 3\n"
+        ">>>>>>> REPLACE\n"
+    )
+
+    text, rung = _apply_search_replace(content, body, "a.py")
+
+    assert rung == "edit-indentation-tolerant"
+    assert text == "if x:\n    y = 2\nw = 3\nz = 0\n"
+
+
+def test_search_replace_indentation_tolerant_fallback_keeps_column_zero_lines():
+    """A dedent deeper than the matched lines' own indentation has no
+    relative position, so the line keeps its literal indentation as it did
+    before #314. The real case: SEARCH quoted deeper than the file has it,
+    then a new top-level function at column 0 - which must stay there, not
+    be rejected or shifted."""
+    content = "class A:\n    def f(self):\n        return 1\n"
+    body = (
+        "<<<<<<< SEARCH\n"
+        "            return 1\n"
+        "=======\n"
+        "            return 2\n"
+        "\n"
+        "\n"
+        "def g():\n"
+        "    return 3\n"
+        ">>>>>>> REPLACE\n"
+    )
+
+    text, rung = _apply_search_replace(content, body, "a.py")
+
+    assert rung == "edit-indentation-tolerant"
+    assert text == (
+        "class A:\n    def f(self):\n        return 2\n\n\ndef g():\n    return 3\n"
+    )
+
+
+def test_edit_applying_one_change_to_several_similar_functions_is_not_a_loop():
+    """#311's worry: the same small change applied to several similar
+    functions. Each SEARCH must quote something unique (the def line) to
+    be applicable at all, so consecutive blocks are never identical and
+    the repetition detector stays quiet. Pinned so a detector change that
+    would reject such an edit fails here."""
+    names = ["alpha", "beta", "gamma", "delta", "epsilon"]
+    content = "".join(f"def {n}():\n    x = load()\n    return x\n\n" for n in names)
+    blocks = [
+        (
+            f"def {n}():\n    x = load()\n    return x\n",
+            f"def {n}():\n    x = load()\n    return x or None\n",
+        )
+        for n in names
+    ]
+
+    (change,) = parse_coder_output(_edit_output("a.py", *blocks), ["a.py"])
+    text, rung = _apply_search_replace(content, change.body, "a.py")
+
+    assert rung is None
+    assert text.count("return x or None") == len(names)
+
+
 def test_search_replace_missing_search_fails_clearly():
     body = "<<<<<<< SEARCH\nnot in the file\n=======\nx\n>>>>>>> REPLACE\n"
 
@@ -3348,6 +3468,11 @@ def test_search_replace_empty_search_creates_new_file_only():
     assert _apply_search_replace(None, body, "n.py") == ("new = 1\n", None)
     with pytest.raises(MalformedOutputError, match="empty SEARCH"):
         _apply_search_replace(SAMPLE, body, "a.py")
+    # Whitespace-only SEARCH text is "empty" too, so the fallback rungs
+    # (which index the matched lines) only ever see a non-empty block.
+    blank = "<<<<<<< SEARCH\n   \n\n=======\nnew = 1\n>>>>>>> REPLACE\n"
+    with pytest.raises(MalformedOutputError, match="empty SEARCH"):
+        _apply_search_replace(SAMPLE, blank, "a.py")
     with pytest.raises(MalformedOutputError, match="does not exist"):
         _apply_search_replace(
             None, "<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE\n", "n.py"
