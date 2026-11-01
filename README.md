@@ -370,10 +370,12 @@ what the check exists to surface.
 
 ## Access
 
-The automated pipeline (multi-agent retry loop, LLM-based issue
-triage/review) is the part of issue-worm that's actually hard to
-reproduce, and is kept in a private package, issue-worm-pro. Contact
-the maintainer for access, or watch this repo — a payment link is
+The automated pipeline is a deterministic, bounded Coder → Verifier →
+Analyser retry loop with a fixed revision budget and independent
+verification; its output is a pull request for a human to review. That
+pipeline and the LLM-based issue triage/review are the parts of
+issue-worm that are actually hard to reproduce, and they are kept in a
+private package, issue-worm-pro. Contact the maintainer for access, or watch this repo — a payment link is
 planned. See the [open-core split](docs/monetization-split-plan.md) for a
 complete list of what is available in this MIT-licensed package and what
 requires the private package.

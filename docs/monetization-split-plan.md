@@ -31,12 +31,14 @@ This shell works standalone for:
 
 ## What's in `issue-worm-pro` (private)
 
-The multi-agent pipeline that turns an issue into a verified PR:
+The deterministic, bounded pipeline that turns an issue into a verified PR:
 
-- **Orchestration** — a Coder → Verifier → Analyser retry loop
+- **Orchestration** — a Coder → Verifier → Analyser retry loop with a fixed
+  revision budget; the Verifier runs the target repo's own checks
+  independently of the Coder, and the result is a PR for a human to review
 - **Scheduling** — polling, dispatch, and label-lifecycle management across
   a repo's open issues
-- **Agents** — the coder, analyser, and triage implementations
+- **Stages** — the coder, analyser, and triage implementations
 - Integration with [`cicaid-pro`](https://github.com/leonarduk/cicaid-pro)
   for the underlying LLM calls
 
