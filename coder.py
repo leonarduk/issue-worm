@@ -38,6 +38,7 @@ from typing import Protocol
 
 import requests
 
+from config import _env_int
 from workspace import MODE_EDIT, MODE_FULL, sanitize_file_path
 
 logger = logging.getLogger(__name__)
@@ -192,7 +193,9 @@ class LocalOllamaCoder:
             response.raise_for_status()
             data = response.json()
             return _strip_inline_reasoning(data.get("response") or "", data.get("thinking"))
-        except (requests.RequestException, ValueError):
+        # AttributeError/TypeError: a body that is valid JSON but not the
+        # expected object shape (#234) - still "" rather than a raise.
+        except (requests.RequestException, ValueError, AttributeError, TypeError):
             logger.warning(
                 "Ollama request to %s (model %s) failed",
                 self.endpoint,
@@ -226,6 +229,9 @@ class RemoteOpenAICoder:
     endpoint — any provider that speaks that shape (OpenAI itself, a
     self-hosted vLLM/SGLang/Ollama-serving-OpenAI-API host, or DeepSeek,
     whose API is OpenAI-compatible — see `build_coder`'s `cloud` branch).
+
+    `endpoint` and `model` are required and must be non-empty; the
+    constructor raises `CoderConfigError` (a `ValueError`) otherwise.
     """
 
     def __init__(
@@ -241,8 +247,16 @@ class RemoteOpenAICoder:
         # compatible provider, so build_coder is what supplies one
         # (required REMOTE_LLM_ENDPOINT for `remote`, DeepSeek's fixed
         # endpoint for `cloud`) before ever constructing this class.
+        # Constructing it without one fails here (#233), not later as a
+        # POST to "/v1/chat/completions" or with an empty model name.
         self.endpoint = (endpoint or "").rstrip("/")
         self.model = model or ""
+        for name, value in (("endpoint", self.endpoint), ("model", self.model)):
+            if not value.strip():
+                raise CoderConfigError(
+                    f"RemoteOpenAICoder requires a non-empty {name}; "
+                    "build_coder supplies one from the environment."
+                )
         self.api_key = api_key
         self.timeout = timeout
         # None = don't send `max_tokens` at all (provider default). Not
@@ -304,7 +318,16 @@ class RemoteOpenAICoder:
                     self.max_tokens if self.max_tokens is not None else "provider default",
                 )
             return choices[0].get("message", {}).get("content") or ""
-        except (requests.RequestException, ValueError, KeyError, IndexError, TypeError):
+        # AttributeError: valid JSON of the wrong shape, e.g. a list body
+        # or a non-dict choice (#234) - still "" rather than a raise.
+        except (
+            requests.RequestException,
+            ValueError,
+            KeyError,
+            IndexError,
+            TypeError,
+            AttributeError,
+        ):
             logger.warning(
                 "Remote LLM request to %s (model %s) failed",
                 self.endpoint,
@@ -384,6 +407,35 @@ def _discover_lmstudio_model(endpoint: str) -> str:
     return models[0] if models else ""
 
 
+def _max_tokens_override(model_source: str) -> int | None:
+    """CODER_MAX_TOKENS as a positive int, or None when not configured.
+
+    A global output-token cap for the OpenAI-compatible coders. Unset,
+    blank, 0 and negative all mean "not configured", silently. A value
+    that is not an integer is also ignored, but warned about with what
+    applies instead (#356): the operator meant to set a cap, and the
+    generic "using 0" from `_env_int` named neither outcome.
+    """
+    raw = os.getenv("CODER_MAX_TOKENS")
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        fallback = (
+            f"the default cap of {DEFAULT_DEEPSEEK_MAX_TOKENS} applies"
+            if model_source == "cloud"
+            else "no max_tokens is sent (provider default)"
+        )
+        logger.warning(
+            "CODER_MAX_TOKENS=%r is not an integer; ignoring it, so %s",
+            raw,
+            fallback,
+        )
+        return None
+    return value if value > 0 else None
+
+
 def build_coder(role_config) -> Coder:
     """Construct the right Coder for a role's configured model_source.
 
@@ -406,11 +458,13 @@ def build_coder(role_config) -> Coder:
     # Global, not role-prefixed - one HTTP timeout for whichever coder this
     # factory returns, same as REMOTE_LLM_*/DEEPSEEK_* below.
     timeout = _env_int("CODER_REQUEST_TIMEOUT_SECONDS", REQUEST_TIMEOUT_SECONDS)
-    # Global output-token cap for the OpenAI-compatible coders (remote and
-    # cloud). 0 / negative / non-integer = not configured.
-    max_tokens_override: int | None = _env_int("CODER_MAX_TOKENS", 0)
-    if max_tokens_override is not None and max_tokens_override <= 0:
-        max_tokens_override = None
+    # Only the OpenAI-compatible coders send max_tokens; don't parse (or
+    # warn about) CODER_MAX_TOKENS for a source that never uses it.
+    max_tokens_override = (
+        _max_tokens_override(model_source)
+        if model_source in ("lmstudio", "remote", "cloud")
+        else None
+    )
 
     if model_source == "local":
         # Endpoint/model here are unchanged from before this factory
@@ -518,23 +572,6 @@ def build_coder(role_config) -> Coder:
         "target; expected one of 'local', 'lmstudio', 'remote', 'cloud', or "
         "'claude'."
     )
-
-
-def _env_int(name: str, default: int) -> int:
-    """Parse an int env var, falling back to ``default`` on invalid values.
-
-    Mirrors config.py's own `_env_int` - duplicated rather than imported
-    since coder.py otherwise has no dependency on config.py beyond the
-    `RoleConfig`-shaped duck type `build_coder` already documents.
-    """
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        logger.warning("%s=%r is not an integer; using %s", name, raw, default)
-        return default
 
 
 def _build_prompt(workspace_dir: str, task: str, files: list[str]) -> str:

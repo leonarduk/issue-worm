@@ -222,6 +222,30 @@ def test_local_ollama_coder_uses_default_ollama_model_when_unset(monkeypatch):
     assert local_coder.model == "picked-by-vram"
 
 
+def test_local_ollama_coder_explicit_model_skips_default_ollama_model(monkeypatch):
+    """An explicit model must not even probe for a default: that probe
+    shells out to nvidia-smi when the `vram` extra is installed (#460)."""
+
+    def _must_not_run():
+        raise AssertionError("_default_ollama_model() called despite model=")
+
+    monkeypatch.setattr(coder, "_default_ollama_model", _must_not_run)
+    local_coder = LocalOllamaCoder(model="explicit-model")
+    assert local_coder.model == "explicit-model"
+
+
+@pytest.mark.parametrize(
+    "body", [[], "oops", {"response": 42}], ids=["list", "string", "non-str-response"]
+)
+def test_local_complete_returns_empty_on_wrongly_shaped_json(body):
+    """Valid JSON that is not the expected object must not escape as an
+    AttributeError/TypeError: complete() never raises (#234)."""
+    local = LocalOllamaCoder(endpoint="http://example.invalid", model="m")
+
+    with patch("coder.requests.post", return_value=_mock_response(body)):
+        assert local.complete("p") == ""
+
+
 def test_local_complete_drops_inline_reasoning_before_bare_think_close():
     """qwen3.8-216k on Ollama 0.34: `thinking` comes back empty and the
     reasoning arrives in `response` ahead of a bare </think>."""
@@ -414,6 +438,38 @@ def _mock_chat_response(content):
 
 
 # --- RemoteOpenAICoder -------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "name"),
+    [
+        ({"model": "gpt-5"}, "endpoint"),
+        ({"endpoint": "", "model": "gpt-5"}, "endpoint"),
+        ({"endpoint": "/", "model": "gpt-5"}, "endpoint"),
+        ({"endpoint": "https://api.openai.com"}, "model"),
+        ({"endpoint": "https://api.openai.com", "model": "  "}, "model"),
+    ],
+    ids=["no-endpoint", "empty-endpoint", "slash-endpoint", "no-model", "blank-model"],
+)
+def test_remote_coder_rejects_missing_endpoint_or_model(kwargs, name):
+    """Direct construction fails fast instead of POSTing to a relative
+    URL or with an empty model (#233)."""
+    with pytest.raises(CoderConfigError, match=f"non-empty {name}"):
+        RemoteOpenAICoder(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [[], "oops", {"choices": ["not-a-dict"]}, {"choices": [{"message": "text"}]}],
+    ids=["list", "string", "non-dict-choice", "non-dict-message"],
+)
+def test_remote_complete_returns_empty_on_wrongly_shaped_json(body):
+    """Valid JSON of the wrong shape must not escape as an AttributeError:
+    complete() never raises (#234)."""
+    remote = RemoteOpenAICoder(endpoint="http://example.invalid", model="m")
+
+    with patch("coder.requests.post", return_value=_mock_response(body)):
+        assert remote.complete("p") == ""
 
 
 def test_remote_endpoint_trailing_slash_is_stripped():
@@ -933,6 +989,27 @@ def test_remote_complete_warns_when_output_hit_token_cap(caplog):
     assert "CODER_MAX_TOKENS" in caplog.text
 
 
+@pytest.mark.parametrize(
+    "choice",
+    [
+        {"message": {"content": "done"}, "finish_reason": "stop"},
+        {"message": {"content": "done"}, "finish_reason": None},
+        {"message": {"content": "done"}},
+    ],
+    ids=["stop", "none", "absent"],
+)
+def test_remote_complete_no_truncation_warning_unless_length(caplog, choice):
+    """Only finish_reason == "length" means the cap cut the output off
+    (#357)."""
+    remote = RemoteOpenAICoder(endpoint="http://example.invalid", model="m")
+
+    with patch("coder.requests.post", return_value=_mock_response({"choices": [choice]})):
+        with caplog.at_level("WARNING", logger="coder"):
+            assert remote.complete("p") == "done"
+
+    assert caplog.records == []
+
+
 def test_build_coder_cloud_defaults_max_tokens(monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     monkeypatch.delenv("CODER_MAX_TOKENS", raising=False)
@@ -972,11 +1049,46 @@ def test_build_coder_reads_max_tokens_env_var(model_source, monkeypatch):
     assert coder.max_tokens == 4096
 
 
-@pytest.mark.parametrize("raw", ["0", "-5", "lots"])
-def test_build_coder_cloud_ignores_invalid_max_tokens(raw, monkeypatch):
+@pytest.mark.parametrize(
+    ("raw", "warns"), [("0", False), ("-5", False), ("", False), ("lots", True)]
+)
+def test_build_coder_cloud_ignores_invalid_max_tokens(raw, warns, monkeypatch, caplog):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     monkeypatch.setenv("CODER_MAX_TOKENS", raw)
 
-    coder = build_coder(RoleConfig(model_source="cloud"))
+    with caplog.at_level("WARNING", logger="coder"):
+        coder = build_coder(RoleConfig(model_source="cloud"))
 
     assert coder.max_tokens == DEFAULT_DEEPSEEK_MAX_TOKENS
+    if warns:
+        # Names the variable, the raw value and what applies instead (#356).
+        assert "CODER_MAX_TOKENS='lots'" in caplog.text
+        assert f"default cap of {DEFAULT_DEEPSEEK_MAX_TOKENS}" in caplog.text
+    else:
+        assert caplog.records == []
+
+
+def test_build_coder_local_ignores_max_tokens_silently(monkeypatch, caplog):
+    """LocalOllamaCoder never sends max_tokens, so an unparseable
+    CODER_MAX_TOKENS is irrelevant to it and not worth a warning."""
+    monkeypatch.setenv("CODER_MAX_TOKENS", "lots")
+
+    with caplog.at_level("WARNING"):
+        build_coder(RoleConfig(model_source="local"))
+
+    assert "CODER_MAX_TOKENS" not in caplog.text
+
+
+@pytest.mark.parametrize("model_source", ["remote", "lmstudio"])
+def test_build_coder_warns_when_max_tokens_unparseable(model_source, monkeypatch, caplog):
+    """Without a provider default cap, an ignored override means no
+    max_tokens at all - and the warning says so (#356)."""
+    _set_env_for_model_source(monkeypatch, model_source)
+    monkeypatch.setenv("CODER_MAX_TOKENS", "lots")
+
+    with caplog.at_level("WARNING", logger="coder"):
+        coder = build_coder(RoleConfig(model_source=model_source))
+
+    assert coder.max_tokens is None
+    assert "CODER_MAX_TOKENS='lots'" in caplog.text
+    assert "no max_tokens is sent" in caplog.text
