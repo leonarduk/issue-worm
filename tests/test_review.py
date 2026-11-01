@@ -3,7 +3,15 @@
 free-tier Coder?
 """
 
-from review import draft_implementation_notes, review_issue
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from review import draft_implementation_notes, extract_done_line, review_issue
 
 
 def test_well_scoped_issue_is_ready():
@@ -207,3 +215,112 @@ def test_draft_implementation_notes_heals_past_a_malformed_existing_section():
     merged = review_issue(f"{body}\n\n{section}")
     assert merged.ready is True
     assert merged.done == "it works"
+
+
+# --- extract_done_line: the PR goal line in action.yml (#297, #301-#303) ---
+
+_FENCE = "`" * 3
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("## Implementation notes\nFILES: a.py\nDONE: it works\n", "it works"),
+        # Heading and label both match case-insensitively; value is trimmed.
+        ("## IMPLEMENTATION NOTES\ndone:   it works  \n", "it works"),
+        ("## Implementation notes\r\nDONE: crlf\r\n", "crlf"),
+        # Level 3 is not the section; neither is a DONE outside it.
+        ("### Implementation notes\nDONE: h3\n", ""),
+        ("DONE: top level\n## Implementation notes\nFILES: a.py\n", ""),
+        # Only a DONE at the start of a line counts.
+        ("## Implementation notes\n- DONE: bullet\n  DONE: indented\n", ""),
+        # The section ends at the next level-2 heading.
+        ("## Implementation notes\nFILES: a.py\n## Other\nDONE: later\n", ""),
+        # First section with a non-empty DONE wins.
+        (
+            "## Implementation notes\nDONE:\n## Implementation notes\nDONE: second\n",
+            "second",
+        ),
+        (
+            "## Implementation notes\nDONE: first\n## Implementation notes\nDONE: second\n",
+            "first",
+        ),
+        ("", ""),
+        (None, ""),
+    ],
+    ids=[
+        "basic", "case-insensitive", "crlf", "h3-ignored", "outside-section",
+        "indented-ignored", "stops-at-next-heading", "skips-empty-first",
+        "first-wins", "empty", "none",
+    ],
+)
+def test_extract_done_line(body, expected):
+    assert extract_done_line(body) == expected
+
+
+@pytest.mark.parametrize(
+    "fenced",
+    [
+        f"{_FENCE}\nDONE: example\n{_FENCE}\n",
+        f"{_FENCE}markdown\nDONE: example\n{_FENCE}\n",
+        "~~~\nDONE: example\n~~~\n",
+        # A shorter or different fence does not close a longer one.
+        f"{_FENCE}`\nDONE: example\n{_FENCE}\n~~~~\nDONE: still example\n{_FENCE}`\n",
+    ],
+    ids=["backticks", "info-string", "tildes", "long-fence"],
+)
+def test_extract_done_line_skips_fenced_examples(fenced):
+    """A DONE: inside a pasted template or example is not the goal (#303)."""
+    body = "## Implementation notes\n" + fenced + "DONE: the real goal\n"
+    assert extract_done_line(body) == "the real goal"
+
+
+def test_extract_done_line_unclosed_fence_hides_the_rest():
+    body = f"## Implementation notes\n{_FENCE}\nDONE: example\nDONE: also example\n"
+    assert extract_done_line(body) == ""
+
+
+def _action_done_line_command() -> str:
+    """The `done_line=` line exactly as action.yml runs it."""
+    action = Path(__file__).resolve().parent.parent / "action.yml"
+    (line,) = [
+        ln.strip()
+        for ln in action.read_text(encoding="utf-8").splitlines()
+        if ln.strip().startswith('done_line="$(')
+    ]
+    return line
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("## Implementation notes\nFILES: a.py\nDONE: Done: it works\n", "Done: it works"),
+        (f"## Implementation notes\n{_FENCE}\nDONE: x\n{_FENCE}\n", ""),
+        ("no notes at all", ""),
+        ("", ""),
+    ],
+    ids=["extracts", "fenced", "no-section", "empty-body"],
+)
+def test_action_yml_done_line_runs_under_bash(tmp_path, body, expected):
+    """Runs action.yml's own line in bash, with this interpreter as
+    `python` (as the action's venv is), so the shell wiring - quoting,
+    stdin, the import - is tested, not just the helper (#297, #301)."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "python").symlink_to(sys.executable)
+    script = "set -euo pipefail\n" + _action_done_line_command() + '\nprintf "%s" "$done_line"\n'
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+        "PYTHONPATH": str(Path(__file__).resolve().parent.parent),
+        "issue_body": body,
+    }
+
+    result = subprocess.run(
+        ["bash", "-c", 'issue_body="$issue_body"\n' + script],
+        capture_output=True, text=True, env=env, check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == expected

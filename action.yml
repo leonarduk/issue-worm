@@ -243,9 +243,16 @@ runs:
         fi
 
         # The title is required (it names the branch); the body only feeds
-        # the PR text, so a failure there degrades instead of aborting.
+        # the PR text, so a failure there degrades instead of aborting - but
+        # visibly (#298, #304): a swallowed auth or rate-limit error used to
+        # look exactly like an issue that simply has no DONE: line.
         issue_title="$(gh issue view "$ISSUE" --repo "$REPO" --json title -q .title)"
-        issue_body="$(gh issue view "$ISSUE" --repo "$REPO" --json body -q .body || true)"
+        gh_err="$(mktemp)"
+        if ! issue_body="$(gh issue view "$ISSUE" --repo "$REPO" --json body -q .body 2>"$gh_err")"; then
+          echo "::warning::Could not fetch the body of issue #${ISSUE}, so the PR body will have no goal line or issue excerpt: $(head -c 500 "$gh_err" | tr '\n' ' ')"
+          issue_body=""
+        fi
+        rm -f "$gh_err"
 
         # cicaid's own slugify rather than a port of it, so this is exactly
         # the branch `cicaid work-on-issue` (and so the pro path) would use.
@@ -326,20 +333,13 @@ runs:
 
         changed_files="$(git diff --name-only "$base_commit" HEAD | sed 's/^/- /')"
 
-        # Extract the DONE: line from the issue's ## Implementation notes
-        # section (same scoping as review.py).
-        notes_section="$(printf '%s\n' "$issue_body" | awk '
-          /^##([^#]|$)/ {
-            heading = $0
-            sub(/^##[ \t]*/, "", heading)
-            sub(/[ \t]*$/, "", heading)
-            if (!found && tolower(heading) == "implementation notes") { f = 1; found = 1 }
-            else { f = 0 }
-            next
-          }
-          f { print }
-        ')"
-        done_line="$(printf '%s\n' "$notes_section" | { grep -m1 -i '^DONE:' || true; } | sed -E 's/^DONE:[[:space:]]*//I')"
+        # The DONE: line from the issue's ## Implementation notes, via
+        # review.extract_done_line (installed in this action's venv, so
+        # `python` here is that venv's): the same section rules review.py
+        # gates the build on, fenced examples skipped, and unit-tested in
+        # tests/test_review.py - replacing an awk/grep/sed port that had
+        # drifted from review.py and relied on GNU sed's `I` flag (#301-#303).
+        done_line="$(printf '%s' "$issue_body" | python -c 'import sys; from review import extract_done_line; sys.stdout.write(extract_done_line(sys.stdin.read()))')"
 
         # Why: the issue text outside ## Implementation notes, capped at
         # 500 characters so the PR body stays readable.

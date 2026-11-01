@@ -81,6 +81,59 @@ def _split_files(raw: str) -> list[str]:
     return [f.strip() for f in raw.split(",") if f.strip()]
 
 
+# A fenced code block's opening line: up to 3 spaces of indent, then 3+
+# backticks or tildes (CommonMark). Only a run of the same character at
+# least as long closes it.
+_FENCE_RE = re.compile(r"^[ \t]{0,3}(?P<fence>`{3,}|~{3,})")
+
+
+def _strip_fenced_blocks(text: str) -> str:
+    """`text` without its fenced code blocks (fence lines included).
+
+    An unclosed fence runs to the end, as in CommonMark - an example that
+    was never closed must not leak lines back into what gets scanned.
+    """
+    kept: list[str] = []
+    open_fence = ""
+    for line in text.splitlines():
+        match = _FENCE_RE.match(line)
+        if open_fence:
+            if (
+                match
+                and match.group("fence")[0] == open_fence[0]
+                and len(match.group("fence")) >= len(open_fence)
+                and not line[match.end():].strip()
+            ):
+                open_fence = ""
+            continue
+        if match:
+            open_fence = match.group("fence")
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def extract_done_line(issue_body: str | None) -> str:
+    """The `DONE:` value from an issue's `## Implementation notes`, or "".
+
+    Feeds the goal line of the PR body the GitHub Action opens. It uses
+    the same section rules as `review_issue`: a level-2 heading only
+    (`###` is not one), matched case-insensitively, ending at the next
+    `## ` heading, with `DONE:` matched case-insensitively at the start
+    of a line (an indented or bulleted `- DONE:` is not one). The first
+    section with a non-empty DONE line wins. Unlike `review_issue`,
+    fenced code blocks are skipped first, so a pasted example or template
+    inside the notes is never taken for the real goal (#303).
+    """
+    if not issue_body:
+        return ""
+    for match in _SECTION_RE.finditer(issue_body):
+        done = _DONE_RE.search(_strip_fenced_blocks(match.group("body")))
+        if done and done.group("value").strip():
+            return done.group("value").strip()
+    return ""
+
+
 _SCOPE_DRAFT_PROMPT = (
     "An automated dispatcher will only act on an issue that declares "
     "exactly which files to touch and what a passing result looks like. "
