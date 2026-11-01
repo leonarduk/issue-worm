@@ -1,6 +1,7 @@
 """Structural checks on the composite action's own manifest, action.yml."""
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -12,9 +13,11 @@ import yaml
 ACTION = Path(__file__).resolve().parent.parent / "action.yml"
 
 
-def _steps() -> list[dict]:
-    """Every step of the composite action, as YAML parses it."""
-    return yaml.safe_load(ACTION.read_text(encoding="utf-8"))["runs"]["steps"]
+def _steps(text: str | None = None) -> list[dict]:
+    """Every step of the composite action (or of ``text``), as YAML parses it."""
+    if text is None:
+        text = ACTION.read_text(encoding="utf-8")
+    return yaml.safe_load(text)["runs"]["steps"]
 
 
 def _run_steps() -> list[dict]:
@@ -163,14 +166,25 @@ def test_issue_input_is_validated_before_any_other_step_uses_it():
     """The guard is only worth anything if it runs first: every step that
     receives `inputs.issue` comes after it (#365)."""
     steps = _steps()
+    # \b: `inputs.issue` itself, not `inputs.issue_number` or the like.
+    uses_issue = re.compile(r"\binputs\.issue\b")
     users = [
         step["name"]
         for step in steps
-        if "inputs.issue" in yaml.safe_dump({k: v for k, v in step.items() if k != "name"})
+        if uses_issue.search(yaml.safe_dump({k: v for k, v in step.items() if k != "name"}))
     ]
-    assert steps[0]["name"] == "Validate issue input"
     assert users[0] == "Validate issue input"
-    assert len(users) > 1  # the check is vacuous if nothing else used it
+    assert steps[0]["name"] == "Validate issue input"
+
+
+def test_step_parsing_does_not_depend_on_action_yml_indentation():
+    """The reason for parsing YAML (#758): re-indenting action.yml must not
+    change what the tests see."""
+    original = ACTION.read_text(encoding="utf-8")
+    reindented = yaml.safe_dump(yaml.safe_load(original), indent=4, sort_keys=False, width=1000)
+    assert reindented != original
+
+    assert _steps(reindented) == _steps()
 
 
 # --- Commit, push, verify, and publish (#272, #283, #306, #325) ------------
