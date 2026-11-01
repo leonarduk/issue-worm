@@ -28,7 +28,7 @@ import progress_reporter
 import registry
 from coder import CoderConfigError
 from review import ReviewResult
-from workspace import FileChange, MalformedOutputError, WorkspaceError
+from workspace import CATEGORY_OUTPUT_SHAPE, FileChange, MalformedOutputError, WorkspaceError
 
 # The `_pro_cli_absent` fixture below is now redundant with the autouse
 # `_neutralize_pro_cli` fixture in conftest.py, but is kept for clarity
@@ -1557,7 +1557,7 @@ def test_build_records_output_shape_failure_to_history(tmp_path, _state_dir, out
     records = _read_history_records(tmp_path)
     assert len(records) == 1
     assert records[0]["status"] == "failed"
-    assert records[0]["failure_category"] == "output_shape"
+    assert records[0]["failure_category"] == CATEGORY_OUTPUT_SHAPE
 
 
 @pytest.mark.usefixtures("_pro_cli_absent")
