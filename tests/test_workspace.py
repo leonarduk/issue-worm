@@ -4573,6 +4573,8 @@ def test_run_revision_attempt_uses_the_configured_step_timeout(repo, monkeypatch
 
     assert result.success is False
     assert "timed out after 0.3s" in result.test_output
+    # A lone step under its own limit - the per-step message, not the budget one.
+    assert "budget" not in result.test_output
 
 
 def test_steps_share_one_budget_and_stop_when_it_runs_out(repo):

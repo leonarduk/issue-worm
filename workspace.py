@@ -2629,7 +2629,7 @@ def _run_new_workflow_step_scripts(
                 all_passed = False
                 if step_timeout < timeout:
                     output_parts.append(
-                        f"[{path}] new workflow step stopped after {step_timeout:.0f}s: the "
+                        f"[{path}] new workflow step stopped after {step_timeout:.1f}s: the "
                         f"{budget:g}s budget for all new workflow steps ran out"
                     )
                     break
