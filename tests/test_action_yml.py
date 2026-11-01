@@ -1,52 +1,30 @@
 """Structural checks on the composite action's own manifest, action.yml."""
 
 import os
+import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 ACTION = Path(__file__).resolve().parent.parent / "action.yml"
 
 
-def _run_steps() -> list[dict]:
-    """Each step's `name` and `run: |` script, read by indentation.
-
-    No YAML parser: PyYAML is not a dependency of this package, and every
-    script in action.yml is a literal block (`run: |`), which ends at the
-    first non-blank line indented no deeper than the `run:` key.
-    """
-    lines = ACTION.read_text(encoding="utf-8").splitlines()
-    steps, name = [], "?"
-    i = 0
-    while i < len(lines):
-        stripped = lines[i].lstrip()
-        if stripped.startswith("- name:"):
-            name = stripped.removeprefix("- name:").strip()
-        if stripped == "run: |":
-            key_indent = len(lines[i]) - len(stripped)
-            body = []
-            i += 1
-            while i < len(lines) and (
-                not lines[i].strip() or len(lines[i]) - len(lines[i].lstrip()) > key_indent
-            ):
-                body.append(lines[i])
-                i += 1
-            steps.append({"name": name, "run": "\n".join(body)})
-            continue
-        i += 1
+def _steps(text: str | None = None) -> list[dict]:
+    """Every step of the composite action (or of ``text``), as YAML parses it."""
+    if text is None:
+        text = ACTION.read_text(encoding="utf-8")
+    steps = (yaml.safe_load(text) or {}).get("runs", {}).get("steps")
+    assert isinstance(steps, list) and steps, "action.yml has no runs.steps list"
     return steps
 
 
-def test_every_run_script_is_a_literal_block():
-    """Guards the parser above: a `run:` written any other way would be
-    silently skipped by every check in this file."""
-    text = ACTION.read_text(encoding="utf-8")
-    run_keys = [ln.strip() for ln in text.splitlines() if ln.strip().startswith("run:")]
-    assert run_keys and all(key == "run: |" for key in run_keys)
-    assert len(_run_steps()) == len(run_keys)
+def _run_steps() -> list[dict]:
+    """Each step that has a `run:` script: its `name` and that script."""
+    return [{"name": s.get("name", "?"), "run": s["run"]} for s in _steps() if "run" in s]
 
 
 def test_no_expression_is_spliced_into_a_run_script():
@@ -186,14 +164,65 @@ def test_validate_issue_input_step_accepts_only_digits(tmp_path, value, ok):
         assert "::error::The 'issue' input must be a numeric issue number" in result.stdout
 
 
+# The interpolation itself, so a step counts only when it actually receives
+# the value - not inputs.issue_number, nor a prose mention of the name.
+_USES_ISSUE = re.compile(r"\$\{\{\s*inputs\.issue\s*\}\}")
+
+
+def _strings(value):
+    """Every string nested anywhere inside a parsed YAML value."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _strings(item)
+
+
+def _issue_input_users(steps: list[dict]) -> list[str]:
+    """Names of the steps that receive `inputs.issue`, in run order."""
+    return [
+        step["name"]
+        for step in steps
+        if any(_USES_ISSUE.search(text) for key, value in step.items() if key != "name" for text in _strings(value))
+    ]
+
+
+def _guard_runs_first(steps: list[dict]) -> bool:
+    """The property #365 depends on: the validation step is the first step,
+    and so the first of those that receive `inputs.issue`."""
+    users = _issue_input_users(steps)
+    return steps[0]["name"] == "Validate issue input" and users[:1] == ["Validate issue input"]
+
+
 def test_issue_input_is_validated_before_any_other_step_uses_it():
     """The guard is only worth anything if it runs first: every step that
     receives `inputs.issue` comes after it (#365)."""
-    text = ACTION.read_text(encoding="utf-8")
-    steps_text = text.split("\n    - name: ")[1:]
-    users = [chunk.split("\n", 1)[0] for chunk in steps_text if "${{ inputs.issue }}" in chunk]
-    assert users[0] == "Validate issue input"
-    assert _step_names()[0] == "Validate issue input"
+    assert _guard_runs_first(_steps())
+
+
+def test_issue_input_check_catches_a_consumer_moved_before_the_guard():
+    """The same predicate as above, shown to fail: move the first step
+    after the guard that receives `inputs.issue` ahead of it."""
+    steps = _steps()
+    guard = steps.pop(0)
+    consumer = next(i for i, step in enumerate(steps) if step["name"] in _issue_input_users(steps))
+    steps.insert(consumer + 1, guard)
+
+    assert not _guard_runs_first(steps)
+
+
+def test_step_checks_do_not_depend_on_action_yml_indentation():
+    """The reason for parsing YAML (#758): with action.yml re-indented, the
+    same steps, scripts and input users are found."""
+    original = ACTION.read_text(encoding="utf-8")
+    reindented = yaml.safe_dump(yaml.safe_load(original), indent=4, sort_keys=False, width=1000)
+    assert reindented != original
+
+    assert _issue_input_users(_steps(reindented)) == _issue_input_users(_steps())
+    assert _steps(reindented) == _steps()
 
 
 # --- Commit, push, verify, and publish (#272, #283, #306, #325) ------------
@@ -222,18 +251,27 @@ case "$*" in
     for arg in "$@"; do
       case "$arg" in body=@*) cp "${arg#body=@}" "$STUB_LOG/patched_body" ;; esac
     done ;;
+  "api -X POST repos/owner/name/issues/7/labels"*) ;;
+  *)
+    # A call the step didn't make when this stub was written: fail loudly
+    # so the test is updated, not quietly fed an empty answer (#756).
+    echo "gh stub: unexpected call: $*" >&2
+    exit 97 ;;
 esac
 exit 0
 """
 
 _CICAID_STUB = r"""#!/bin/sh
 printf '%s\n' "$*" >> "$STUB_LOG/cicaid.calls"
-case "$1" in
-  run-ci-checks) exit 0 ;;
-  publish-pr)
-    for arg in "$@"; do last="$arg"; done
+case "$*" in
+  "run-ci-checks --all") exit 0 ;;
+  "publish-pr --body-file "*|"publish-pr --draft --body-file "*)
     # publish-pr appends `Closes #N` to the body it was given.
+    for arg in "$@"; do last="$arg"; done
     { cat "$last"; printf '\nCloses #%s\n' "$ISSUE"; } > "$STUB_LOG/pr_body" ;;
+  *)
+    echo "cicaid stub: unexpected call: $*" >&2
+    exit 97 ;;
 esac
 exit 0
 """
@@ -365,6 +403,14 @@ def test_commit_step_keeps_a_tracked_issue_worm_file_out_of_commit_and_pr_body(a
     body = (action_checkout["log"] / "pr_body").read_text()
     files_section = body.split("**Files changed:**\n", 1)[1].split("\n\n", 1)[0]
     assert [line.removeprefix("- ") for line in files_section.splitlines()] == committed
+
+
+def test_commit_step_runs_in_strict_mode():
+    """The harness below runs the step's own text, so it only exercises
+    `set -e` failure semantics - a non-zero `git reset` aborting the step,
+    say (#272) - while the step itself turns them on (#757)."""
+    first = next(ln.strip() for ln in _step(COMMIT_STEP).splitlines() if ln.strip())
+    assert first == "set -euo pipefail"
 
 
 def test_pr_body_file_list_diffs_against_head_not_the_working_tree():
