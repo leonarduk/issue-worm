@@ -3429,6 +3429,36 @@ def select_ci_checks(repo_path: str, changed_paths: list[str]) -> tuple[list[str
     )
 
 
+CHECKS_PASSED_LINE = "✓ `cicaid run-ci-checks --all` passed."
+# The header `cicaid run-ci-checks` prints before each check it runs:
+# "== <name>: <description> ==" (cicaid_devtools.run_ci_checks.run_checks).
+_CHECK_HEADER_RE = re.compile(r"^== (.+?): .* ==$")
+_MAX_CHECK_NAMES = 10
+
+
+def checks_pass_summary(output: str) -> str:
+    """One line for a passing ``cicaid run-ci-checks --all`` run (#381).
+
+    Says how many checks ran and names them, read from the per-check
+    headers in ``output``, so a PR's ## Testing section shows what passed
+    rather than only that something did. Falls back to the bare status
+    line when no header is found (empty or unrecognised output), so the
+    section is never empty. Always a single line.
+    """
+    names = []
+    for line in output.splitlines():
+        match = _CHECK_HEADER_RE.match(line.strip())
+        if match:
+            names.append(" ".join(match.group(1).split()))
+    if not names:
+        return CHECKS_PASSED_LINE
+    shown = ", ".join(names[:_MAX_CHECK_NAMES])
+    if len(names) > _MAX_CHECK_NAMES:
+        shown += f", and {len(names) - _MAX_CHECK_NAMES} more"
+    plural = "check" if len(names) == 1 else "checks"
+    return f"{CHECKS_PASSED_LINE[:-1]}: {len(names)} {plural} ({shown})."
+
+
 def run_ci_checks(
     repo_path: str,
     command: list[str] | None = None,

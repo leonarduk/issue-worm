@@ -280,7 +280,7 @@ exit 0
 _CICAID_STUB = r"""#!/bin/sh
 printf '%s\n' "$*" >> "$STUB_LOG/cicaid.calls"
 case "$*" in
-  "run-ci-checks --all") exit 0 ;;
+  "run-ci-checks --all") cat "$STUB_LOG/checks_output" 2>/dev/null; exit 0 ;;
   "publish-pr --body-file "*|"publish-pr --draft --body-file "*)
     # publish-pr appends `Closes #N` to the body it was given.
     for arg in "$@"; do last="$arg"; done
@@ -340,7 +340,7 @@ def action_checkout(tmp_path):
     return {"work": work, "stubs": stubs, "log": log, "pypath": pkg.parent}
 
 
-def _run_commit_step(checkout, close_issue="true"):
+def _run_commit_step(checkout, close_issue="true", cwd=None):
     env = {
         "PATH": f"{checkout['stubs']}{os.pathsep}{os.environ.get('PATH', '')}",
         "PYTHONPATH": os.pathsep.join([str(checkout["pypath"]), str(ACTION.parent)]),
@@ -357,6 +357,7 @@ def _run_commit_step(checkout, close_issue="true"):
         capture_output=True,
         text=True,
         env=env,
+        cwd=cwd,
         check=False,
     )
 
@@ -473,6 +474,42 @@ def test_commit_step_pr_body_is_exact(action_checkout, issue_body, what):
         "\nCloses #5\n"
     )
     assert (action_checkout["log"] / "pr_body").read_text() == expected
+
+
+@needs_bash_and_git
+def test_commit_step_pass_summary_names_the_checks_that_ran(action_checkout):
+    """On a passing run the ## Testing line comes from the captured check
+    output (#381), via workspace.checks_pass_summary in the action's venv."""
+    work = action_checkout["work"]
+    (action_checkout["log"] / "checks_output").write_text(
+        "\n== Python tests: pytest ==\n$ pytest\n5 passed\n\n== Ruff lint: ruff ==\n$ ruff check .\n"
+    )
+    (work / "app.py").write_text("x = 2\n")
+
+    result = _run_commit_step(action_checkout)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    body = (action_checkout["log"] / "pr_body").read_text()
+    assert (
+        "## Testing\n✓ `cicaid run-ci-checks --all` passed: 2 checks (Python tests, Ruff lint).\n\n"
+        in body
+    )
+
+
+@needs_bash_and_git
+def test_commit_step_pass_summary_ignores_a_workspace_py_in_the_target_repo(action_checkout):
+    """The step runs in the caller's checkout; a top-level workspace.py there
+    must not shadow the action's own module (python -P drops cwd)."""
+    work = action_checkout["work"]
+    (action_checkout["log"] / "checks_output").write_text("== Ruff lint: ruff ==\n")
+    (work / "workspace.py").write_text("def checks_pass_summary(_):\n    return 'DECOY'\n")
+
+    result = _run_commit_step(action_checkout, cwd=work)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    body = (action_checkout["log"] / "pr_body").read_text()
+    assert "DECOY" not in body
+    assert "passed: 1 check (Ruff lint)." in body
 
 
 @needs_bash_and_git

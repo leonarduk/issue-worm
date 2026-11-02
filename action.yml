@@ -326,7 +326,15 @@ runs:
           --stage-done verifier --elapsed "$((SECONDS - verifier_started))" || true
 
         if [ "$checks_status" -eq 0 ]; then
+          # One line naming the checks that ran, read from the output just
+          # captured (no re-run): workspace.checks_pass_summary, unit-tested
+          # in tests/test_workspace.py (#381). It returns the bare status
+          # line for unrecognised output, and that same line is the
+          # fallback here if the helper itself can't run.
           testing="✓ \`cicaid run-ci-checks --all\` passed."
+          if summary="$(python -P -c 'import sys; from workspace import checks_pass_summary; sys.stdout.write(checks_pass_summary(open(sys.argv[1], encoding="utf-8", errors="replace").read()))' "$checks_log")" && [ -n "$summary" ]; then
+            testing="$summary"
+          fi
         else
           # GitHub PR bodies cap at 65536 chars; keep the check output well
           # under that so the rest of the body (diff list, DONE line,
