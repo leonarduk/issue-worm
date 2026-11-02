@@ -57,6 +57,12 @@ jobs:
             exit 1
           fi
 
+      # A wheel missing a module, the issue-worm console script or its
+      # metadata still uploads fine, and version_checker.py would then send
+      # every user to it (#197). Checked before anything is published.
+      - name: Check the wheel's contents
+        run: python scripts/check_wheel_contents.py "dist/issue_worm-${GITHUB_REF_NAME#v}-py3-none-any.whl"
+
       # Publish the installable artifacts before the best-effort README
       # update below. A README-update failure must not leave a published
       # release without the wheel advertised by the updater.
@@ -81,23 +87,40 @@ jobs:
       # its full matrix (issue-worm, cicaid-devtools-pro, ollama-tools) on
       # workflow_dispatch, and its cicaid-devtools pin is deliberately only
       # ever moved via the issue-worm leg (see its update_dependency_pins.py),
-      # so no per-dependency input is needed here. Needs a cross-repo PAT
-      # with Actions:write on issue-worm-pro (github.token only reaches this
-      # repo); DISPATCH_TOKEN is a repo secret here, not something a release
-      # can set itself.
+      # so no per-dependency input is needed here. github.token only reaches
+      # this repo, so this needs a cross-repo credential: preferably a GitHub
+      # App installation token minted for this run and scoped to
+      # Actions:write on issue-worm-pro alone (#513), else the older
+      # long-lived DISPATCH_TOKEN PAT. Set up in docs/maintenance.md.
+      # vars, not secrets, gate the step: `if:` can't read secrets.
+      - name: Mint a dispatch token (GitHub App)
+        id: dispatch-app
+        if: vars.DISPATCH_APP_ID != ''
+        continue-on-error: true  # best-effort, like the dispatch itself
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.DISPATCH_APP_ID }}
+          private-key: ${{ secrets.DISPATCH_APP_PRIVATE_KEY }}
+          owner: leonarduk
+          repositories: issue-worm-pro
+          permission-actions: write
+
       - name: Trigger dependency update in issue-worm-pro
         env:
-          GH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
+          GH_TOKEN: ${{ steps.dispatch-app.outputs.token || secrets.DISPATCH_TOKEN }}
         run: |
           if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::warning::DISPATCH_TOKEN is not set; skipping issue-worm-pro dependency-update dispatch. Add a fine-grained PAT with Actions:write on leonarduk/issue-worm-pro as the DISPATCH_TOKEN repo secret."
+            echo "::warning::No dispatch credential; skipping issue-worm-pro dependency-update dispatch. Set the DISPATCH_APP_ID variable and DISPATCH_APP_PRIVATE_KEY secret (preferred), or a DISPATCH_TOKEN PAT - see docs/maintenance.md."
             exit 0
           fi
           # Best-effort: the release is already published by this point, so a
           # dispatch failure (bad token scope, workflow renamed/removed in
           # issue-worm-pro) must not turn a successful release red. The next
-          # scheduled poll there still catches this release either way.
-          gh workflow run update-dependencies.yml --repo leonarduk/issue-worm-pro || \
+          # scheduled poll there still catches this release either way. One
+          # retry first (#515): gh exits non-zero for a network blip or a 5xx
+          # too, and those usually clear within seconds.
+          dispatch() { gh workflow run update-dependencies.yml --repo leonarduk/issue-worm-pro; }
+          dispatch || { echo "Dispatch failed; retrying once in 5s."; sleep 5; dispatch; } || \
             echo "::warning::Could not dispatch update-dependencies.yml in leonarduk/issue-worm-pro — it will pick up this release on its next scheduled run instead."
 
       - name: Update README to this release's version
