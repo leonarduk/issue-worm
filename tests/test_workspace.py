@@ -1229,12 +1229,19 @@ def test_parse_unterminated_unfenced_full_section_drops_a_sign_off(tail):
         # Suffixless code files are skipped outright, like suffixless prose.
         ("Makefile", "all:\n\tbuild\n\nThe build target compiles everything.\n"),
         ("Dockerfile", "FROM python\n\nThe image installs the package.\n"),
+        # Not a language where a bare sentence is a syntax error.
+        ("Dockerfile.prod", "FROM python\n\nRUN echo the build is done.\n"),
+        ("run.sh", "set -e\n\nThe script exits on errors now.\n"),
+        ("config.yml", "a: 1\n\nThe value is set here.\n"),
+        # An all-caps first word is a keyword, not a sentence.
+        ("a.py", "x = 1\n\nRUN echo the build is done.\n"),
         # Nothing but a sentence: nothing to keep it apart from.
         ("a.py", "\nThe file now sets value to 2.\n"),
     ],
     ids=[
         "comment", "string", "call", "docstring", "yaml-key", "short",
         "no-blank-line", "markdown", "txt", "no-suffix", "makefile", "dockerfile",
+        "dockerfile-suffix", "shell", "yaml", "all-caps-keyword",
         "only-prose",
     ],
 )
@@ -3316,9 +3323,62 @@ def test_literal_replace_marker_in_replace_text_is_rejected_not_truncated():
         parse_coder_output(_edit("a.md", body), ["a.md"])
 
     message = str(exc.value)
-    assert "block 1's REPLACE text probably contains a literal '>>>>>>> REPLACE'" in message
-    assert "1 line(s) of text between them" in message
+    assert "block 1's REPLACE text contains a literal '>>>>>>> REPLACE' line" in message
+    assert "1 line(s) of text after block 1" in message
     assert "MODE: FULL" in message
+
+
+def test_prose_then_a_stray_closing_line_is_rejected_too():
+    """The new failure mode, pinned: prose after a block followed by a
+    stray '>>>>>>> REPLACE' (an echoed marker, or a block that lost its
+    SEARCH line) is rejected, and the message names both causes."""
+    body = (
+        "<<<<<<< SEARCH\na = 1\n=======\na = 2\n>>>>>>> REPLACE\n"
+        "That updates a.\n>>>>>>> REPLACE\n"
+    )
+
+    with pytest.raises(MalformedOutputError, match="a block lost its '<<<<<<< SEARCH' line"):
+        parse_coder_output(_edit("a.py", body), ["a.py"])
+
+
+def test_the_dropped_text_count_restarts_with_each_block():
+    """Prose before block 2 isn't counted against block 2's close."""
+    body = (
+        "<<<<<<< SEARCH\na = 1\n=======\na = 2\n>>>>>>> REPLACE\n"
+        "Some prose.\nMore prose.\n"
+        "<<<<<<< SEARCH\nb = 1\n=======\nsee:\n>>>>>>> REPLACE\ntail\n>>>>>>> REPLACE\n"
+    )
+
+    with pytest.raises(MalformedOutputError, match=r"1 line\(s\) of text after block 2"):
+        parse_coder_output(_edit("a.py", body), ["a.py"])
+
+
+def test_a_search_marker_inside_search_text_is_content():
+    """Before the divider, a SEARCH-shaped line is the file's own text
+    (editing this grammar's docs or tests, say), and the block applies
+    (#313)."""
+    body = (
+        "<<<<<<< SEARCH\nexample:\n<<<<<<< SEARCH\nend\n=======\n"
+        "example: none\n>>>>>>> REPLACE\n"
+    )
+    changes = parse_coder_output(_edit("a.md", body), ["a.md"])
+
+    assert _apply_search_replace(
+        "intro\nexample:\n<<<<<<< SEARCH\nend\n", changes[0].body, "a.md"
+    ) == ("intro\nexample: none\n", None)
+
+
+def test_a_block_that_lost_its_divider_still_fails():
+    """Taking a SEARCH marker as content can't hide a missing divider: the
+    run-on block's SEARCH text isn't in the file, so it fails at apply."""
+    body = (
+        "<<<<<<< SEARCH\na = 1\n"
+        "<<<<<<< SEARCH\nb = 1\n=======\nb = 2\n>>>>>>> REPLACE\n"
+    )
+    changes = parse_coder_output(_edit("a.py", body), ["a.py"])
+
+    with pytest.raises(MalformedOutputError):
+        _apply_search_replace("a = 1\nb = 1\n", changes[0].body, "a.py")
 
 
 @pytest.mark.parametrize("between", ["", "\n", "\n\n```\n"], ids=["adjacent", "blank", "fence"])
@@ -3351,7 +3411,7 @@ def test_prose_between_blocks_is_still_ignored():
     ("body", "match"),
     [
         (
-            "<<<<<<< SEARCH\nprint('<<<<<<< SEARCH')\n<<<<<<< SEARCH\n=======\nx\n>>>>>>> REPLACE\n",
+            "<<<<<<< SEARCH\nold\n>>>>>>> REPLACE\n",
             "SEARCH block 1 has no '=======' .* divider",
         ),
         (
@@ -3363,7 +3423,7 @@ def test_prose_between_blocks_is_still_ignored():
             "second '=======' divider",
         ),
     ],
-    ids=["search-marker-in-search", "search-marker-in-replace", "divider-in-code-replace"],
+    ids=["replace-marker-in-search", "search-marker-in-replace", "divider-in-code-replace"],
 )
 def test_other_marker_lines_inside_a_block_are_rejected_loudly(body, match):
     with pytest.raises(MalformedOutputError, match=match):

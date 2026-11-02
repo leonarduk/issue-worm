@@ -648,19 +648,29 @@ def _drop_prose_after_closing_fence(body: str) -> str:
 # not file content (#257).
 _CODE_CHARS = frozenset("{}()[];:=<>#/*`'\"$@|\\")
 _CONTRACTION_RE = re.compile(r"(?<=[A-Za-z])'(?=[A-Za-z])")
-# Text files where a paragraph of prose IS the content (no suffix: README,
-# LICENSE, ...). Spelled out rather than reusing _MARKUP_SUFFIXES, which is
-# defined further down.
-_PROSE_FILE_SUFFIXES = (".md", ".markdown", ".rst", ".adoc", ".txt", "")
+# Languages in which a bare English sentence is a syntax error, so a trailing
+# one can only be the model's sign-off. Anything else - prose files (README,
+# .md, .txt), shell, Dockerfiles, Makefiles, YAML, config - is left alone:
+# there a sentence-shaped line can be real content (`RUN echo done.`).
+_SIGN_OFF_CODE_SUFFIXES = frozenset(
+    {
+        ".py", ".pyi", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".java",
+        ".kt", ".kts", ".scala", ".go", ".rs", ".c", ".h", ".cc", ".cpp",
+        ".hpp", ".cs", ".swift", ".php", ".rb", ".dart",
+    }
+)
 
 
 def _is_prose_line(line: str) -> bool:
-    """Capitalised, unindented, three or more words, ending a sentence, and
-    no code character (apostrophes inside contractions aside)."""
+    """Capitalised (a word, not an all-caps keyword like RUN), unindented,
+    three or more words, ending a sentence, and no code character
+    (apostrophes inside contractions aside)."""
     text = _CONTRACTION_RE.sub("", line.rstrip())
+    first = text.split()[0] if text.split() else ""
     return (
         bool(text)
         and text[0].isupper()
+        and not (len(first) > 1 and first.isupper())
         and text[-1] in ".!?"
         and len(text.split()) >= 3
         and not _CODE_CHARS.intersection(text)
@@ -672,12 +682,12 @@ def _drop_trailing_prose(body: str, path: str) -> str:
 
     Only when the body's last paragraph - after its last blank line - is
     nothing but prose-shaped lines (:func:`_is_prose_line`) and something comes
-    before it. Never for a prose file (markup, .txt, no suffix), and never
-    for a fenced body (``_drop_prose_after_closing_fence`` handles that).
+    before it. Only for a language where a bare sentence can't be code
+    (``_SIGN_OFF_CODE_SUFFIXES``), and never for a fenced body (``_drop_prose_after_closing_fence`` handles that).
     False negatives keep the old verbatim behaviour; a false positive would
     delete real content, so anything short of obvious prose stays (#257).
     """
-    if Path(path).suffix.lower() in _PROSE_FILE_SUFFIXES:
+    if Path(path).suffix.lower() not in _SIGN_OFF_CODE_SUFFIXES:
         return body
     # Leading blank lines don't hide a fence: the first real line decides.
     lines = body.strip("\n").splitlines()
@@ -917,14 +927,15 @@ def _resolve_repeated_sections(
 # with MODE: FULL. test_diff_style_literal_example_block_is_a_known_limit
 # pins the behaviour.
 #
-# Every other marker line inside a block's text is rejected loudly rather
-# than guessed at (#313): a SEARCH marker before the divider ("no
-# divider"), a second divider in a code file (#338), a SEARCH marker in a
+# Marker lines inside a block's text (#313). A SEARCH marker before the
+# divider is SEARCH content: the block still needs its own divider, so
+# nothing is ambiguous. Every other one is rejected loudly rather than
+# guessed at: a second divider in a code file (#338), a SEARCH marker in a
 # canonical block's REPLACE text, and a '>>>>>>> REPLACE' that closed a
 # block early - caught when the real closing line turns up outside any
-# block with the dropped text before it. Treating them as content instead
-# would need lookahead that makes a stray marker silently pull the prose
-# before it into the file.
+# block with text before it. Taking those as content would need lookahead
+# that makes a stray marker silently pull the prose before it into the
+# file.
 _SEARCH_MARKER_RE = re.compile(r"^<{5,9} ?SEARCH[ \t]*$")
 _DIVIDER_MARKER_RE = re.compile(r"^={5,9}[ \t]*$")
 _DIFF_SEARCH_MARKER_RE = re.compile(r"^-{3,9} ?SEARCH[ \t]*$")
@@ -1002,11 +1013,12 @@ def _parse_search_replace_blocks(body: str, path: str) -> list[tuple[str, str]]:
             elif _REPLACE_MARKER_RE.match(stripped) and blocks and dropped_since_close:
                 raise MalformedOutputError(
                     f"MODE: EDIT section for {path!r}: a '>>>>>>> REPLACE' line "
-                    f"follows block {len(blocks)}'s closing line, with "
-                    f"{dropped_since_close} line(s) of text between them - block "
-                    f"{len(blocks)}'s REPLACE text probably contains a literal "
-                    "'>>>>>>> REPLACE' line, which ended it early. No EDIT block "
-                    "can carry that line: write this file with MODE: FULL instead"
+                    f"after block {len(blocks)}'s closing line, with "
+                    f"{dropped_since_close} line(s) of text after block "
+                    f"{len(blocks)} before it. Either block {len(blocks)}'s REPLACE "
+                    "text contains a literal '>>>>>>> REPLACE' line, which ended "
+                    "it early (no EDIT block can carry one: write this file with "
+                    "MODE: FULL), or a block lost its '<<<<<<< SEARCH' line"
                 )
             elif stripped.strip() and not stripped.lstrip().startswith("```"):
                 dropped_since_close += 1
@@ -1015,9 +1027,14 @@ def _parse_search_replace_blocks(body: str, path: str) -> list[tuple[str, str]]:
                 stripped
             ):
                 state = "replace"
-            elif is_search_marker(stripped) or _REPLACE_MARKER_RE.match(stripped):
+            elif _REPLACE_MARKER_RE.match(stripped):
                 raise no_divider(len(blocks) + 1)
             else:
+                # A SEARCH-shaped line before the divider is the file's own
+                # text (editing this grammar's docs or tests, say): the block
+                # still needs its divider, so nothing is ambiguous (#313). A
+                # block that really lost its divider still fails - at the end
+                # of the body below, or when its SEARCH text isn't found.
                 search.append(line)
         else:  # replace
             if _REPLACE_MARKER_RE.match(stripped):
