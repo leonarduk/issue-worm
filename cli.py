@@ -849,9 +849,9 @@ def _build_parser() -> argparse.ArgumentParser:
     build_parser.add_argument(
         "--workspace",
         help="Directory to clone --repo into (overrides WORKSPACE_ROOT; "
-        "default: .issue-worm-workspace/<repo>). Free-tier only — with "
-        "issue-worm-pro installed, `build` runs pro's implementation, "
-        "which resolves its own workspace and rejects this flag",
+        "default: .issue-worm-workspace/<repo>). With issue-worm-pro "
+        "installed, `build` runs pro's implementation, which takes "
+        "--workspace with the same precedence",
     )
 
     poll_parser = subparsers.add_parser(

@@ -1,0 +1,74 @@
+name: Issue templates
+
+# Only when something the check reads changes (#363): the templates, the
+# check itself, the pins it installs the canonical copies from, or this
+# workflow. Unrelated PRs aren't held up by it.
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/cicaid-pins.env"
+      - ".github/scripts/pip_install_cicaid_pro.sh"
+      - ".github/workflows/issue-templates.yml"
+      - "scripts/check_issue_templates.py"
+  pull_request:
+    paths:
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/cicaid-pins.env"
+      - ".github/scripts/pip_install_cicaid_pro.sh"
+      - ".github/workflows/issue-templates.yml"
+      - "scripts/check_issue_templates.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  issue-templates:
+    name: Issue templates
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # No template line may start with FILES:/DONE: (issue-worm would read
+      # an unfilled issue as scoped), and each template must match the
+      # canonical copy in the pinned cicaid-devtools-pro (#363,
+      # docs/maintenance.md "Issue templates"). The comparison needs the
+      # private package, so without CICAID_PRO_TOKEN only the first check
+      # runs.
+      - name: Check issue templates
+        shell: bash
+        env:
+          CICAID_PRO_TOKEN: ${{ secrets.CICAID_PRO_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CICAID_PRO_TOKEN:-}" ]; then
+            echo "::warning::CICAID_PRO_TOKEN is not set; checking templates for FILES:/DONE: lines only, not against the canonical copies."
+            python scripts/check_issue_templates.py
+            exit 0
+          fi
+          # Both pins, the same shapes the review's install step accepts
+          # (#614): cicaid-devtools-pro depends on cicaid-devtools unpinned,
+          # and that isn't on PyPI.
+          free_ref="$(sed -n 's/^CICAID_REF=//p' .github/cicaid-pins.env)"
+          pro_ref="$(sed -n 's/^CICAID_PRO_REF=//p' .github/cicaid-pins.env)"
+          for ref in "$free_ref" "$pro_ref"; do
+            if [[ ! "$ref" =~ ^(main|v[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+              echo "::error::.github/cicaid-pins.env pins must be main or vX.Y.Z, got '$ref'."
+              exit 1
+            fi
+          done
+          bash .github/scripts/pip_install_cicaid_pro.sh python -m pip install --quiet \
+            "cicaid-devtools @ git+https://github.com/leonarduk/cicaid.git@${free_ref}" \
+            "cicaid-devtools-pro @ git+https://github.com/leonarduk/cicaid-pro.git@${pro_ref}"
+          python scripts/check_issue_templates.py --canonical
