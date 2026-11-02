@@ -138,7 +138,7 @@ def test_load_config_hands_every_role_the_one_read(monkeypatch):
     passed = []
     real_load = config_module._load_role_config
 
-    def _recording_load(role_prefix, remote=None):
+    def _recording_load(role_prefix, remote):
         passed.append(remote)
         return real_load(role_prefix, remote)
 
@@ -153,22 +153,19 @@ def test_load_config_hands_every_role_the_one_read(monkeypatch):
     assert config["coder_config"].remote is passed[0]
 
 
-def test_load_role_config_uses_the_settings_it_is_given(monkeypatch):
-    """Given settings, _load_role_config doesn't read the environment at
-    all; only a direct one-argument call (issue-worm-pro's benchmark
-    fixtures) reads for itself."""
+def test_load_role_config_never_reads_the_remote_settings_itself(monkeypatch):
+    """_load_role_config takes the settings it is given and never reads
+    REMOTE_LLM_* / DEEPSEEK_* - load_config is the one read site (#799)."""
     import config as config_module
 
     given = RemoteCoderSettings()
 
     def _no_read():
-        raise AssertionError("must not read the environment when given settings")
+        raise AssertionError("_load_role_config must not read the environment")
 
-    with monkeypatch.context() as m:
-        m.setattr(config_module, "remote_coder_settings_from_env", _no_read)
-        assert config_module._load_role_config("CODER", given).remote is given
+    monkeypatch.setattr(config_module, "remote_coder_settings_from_env", _no_read)
 
-    assert config_module._load_role_config("CODER").remote is not None
+    assert config_module._load_role_config("CODER", given).remote is given
 
 
 def test_load_config_remote_coder_settings_defaults_when_blank(monkeypatch):
@@ -272,7 +269,7 @@ def test_load_config_synthesized_target_names_are_sanitized(monkeypatch):
 
     original_load_role_config = config_module._load_role_config
 
-    def _patched(role_prefix, remote=None):
+    def _patched(role_prefix, remote):
         role = original_load_role_config(role_prefix, remote)
         if role_prefix == "CODER":
             role.model_source = "model;rm -rf"
@@ -311,7 +308,7 @@ def test_load_config_synthesized_target_names_are_ascii_only(
 
     original_load_role_config = config_module._load_role_config
 
-    def _patched(role_prefix, remote=None):
+    def _patched(role_prefix, remote):
         role = original_load_role_config(role_prefix, remote)
         if role_prefix == "CODER":
             role.model_source = model_source
@@ -337,7 +334,7 @@ def test_load_config_synthesized_target_name_strips_hyphen_left_by_truncation(mo
     original_load_role_config = config_module._load_role_config
     source = "a" * 63 + " tail"  # sanitizes to 63 a's, "-", "tail"
 
-    def _patched(role_prefix, remote=None):
+    def _patched(role_prefix, remote):
         role = original_load_role_config(role_prefix, remote)
         if role_prefix == "CODER":
             role.model_source = source
@@ -360,7 +357,7 @@ def test_load_config_synthesized_target_names_handle_spaces(monkeypatch):
 
     original_load_role_config = config_module._load_role_config
 
-    def _patched(role_prefix, remote=None):
+    def _patched(role_prefix, remote):
         role = original_load_role_config(role_prefix, remote)
         if role_prefix == "CODER":
             role.model_source = "my cloud model"
@@ -384,7 +381,7 @@ def test_load_config_synthesized_target_names_fall_back_when_empty(monkeypatch):
 
     original_load_role_config = config_module._load_role_config
 
-    def _patched(role_prefix, remote=None):
+    def _patched(role_prefix, remote):
         role = original_load_role_config(role_prefix, remote)
         if role_prefix == "CODER":
             role.model_source = "   "

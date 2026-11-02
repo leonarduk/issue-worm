@@ -320,9 +320,7 @@ def _parse_log_level(raw: str) -> str:
 _VALID_MODEL_SOURCES = {"local", "lmstudio", "cloud", "remote", "claude"}
 
 
-def _load_role_config(
-    role_prefix: str, remote: Optional[RemoteCoderSettings] = None
-) -> RoleConfig:
+def _load_role_config(role_prefix: str, remote: RemoteCoderSettings) -> RoleConfig:
     """Load configuration for a specific role from environment variables.
 
     Args:
@@ -369,10 +367,9 @@ def _load_role_config(
         mcp_tool_name=os.getenv("MCP_TOOL_NAME") or DEFAULT_MCP_TOOL_NAME,
         mcp_timeout_seconds=_env_int("MCP_TIMEOUT_SECONDS", DEFAULT_MCP_TIMEOUT_SECONDS),
         mcp_max_doc_chars=_env_int("MCP_MAX_DOC_CHARS", DEFAULT_MCP_MAX_DOC_CHARS),
-        # load_config always passes its one read (#799). The default is for
-        # a direct one-argument call (issue-worm-pro's benchmark fixtures
-        # call _load_role_config("CODER")), which reads for itself.
-        remote=remote if remote is not None else remote_coder_settings_from_env(),
+        # load_config's one read, shared by every role (#799); this function
+        # never reads REMOTE_LLM_* / DEEPSEEK_* itself.
+        remote=remote,
     )
 
 
