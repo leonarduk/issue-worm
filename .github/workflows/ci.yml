@@ -188,3 +188,116 @@ jobs:
 
           print("OK: no file:// or path:// dependencies found in pyproject.toml")
           PY
+
+  cicaid-pins:
+    name: cicaid pins resolve to real tags
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # No persisted GITHUB_TOKEN extraheader: git would send it instead of
+      # CICAID_PRO_TOKEN, and it can't see cicaid-pro.
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # Fails at PR time, with a message saying which, on a typo'd/deleted
+      # tag or a token that can no longer read cicaid-pro - instead of an
+      # opaque clone error in the AI review's install step (#391, #444).
+      # Without the secret (fork/Dependabot PRs) the private pin is skipped
+      # with a warning.
+      - name: Check every pin in .github/cicaid-pins.env
+        env:
+          CICAID_PRO_TOKEN: ${{ secrets.CICAID_PRO_TOKEN }}
+        run: python scripts/check_cicaid_pins.py
+
+  pro-dependency-graph:
+    name: issue-worm-pro still resolves against this checkout
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Non-blocking to start with, as #103 asks: it reaches two private repos
+    # and PyPI, so let it prove itself before it can turn a PR red.
+    continue-on-error: true
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # issue-worm-pro pins a released issue-worm and cicaid-devtools, and
+      # pip resolves one version of each git-pinned package for the whole
+      # graph, so moving a pin here can break pro's install with
+      # ResolutionImpossible (#100/#101). Resolve pro's runtime requirements
+      # with issue-worm swapped for this checkout (#103). Both repos are
+      # private: ISSUE_WORM_PRO_TOKEN reads issue-worm-pro, CICAID_PRO_TOKEN
+      # reads cicaid-pro (docs/maintenance.md). Without them the job warns
+      # and passes - a fork PR gets no secrets.
+      - name: Install issue-worm-pro's dependency graph and pip check it
+        shell: bash
+        env:
+          ISSUE_WORM_PRO_TOKEN: ${{ secrets.ISSUE_WORM_PRO_TOKEN }}
+          CICAID_PRO_TOKEN: ${{ secrets.CICAID_PRO_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ISSUE_WORM_PRO_TOKEN:-}" ] || [ -z "${CICAID_PRO_TOKEN:-}" ]; then
+            echo "::warning::ISSUE_WORM_PRO_TOKEN and CICAID_PRO_TOKEN are both needed to resolve issue-worm-pro's private dependency graph; skipping (docs/maintenance.md)."
+            exit 0
+          fi
+          if ! GH_TOKEN="$ISSUE_WORM_PRO_TOKEN" gh api \
+            -H "Accept: application/vnd.github.raw" \
+            repos/leonarduk/issue-worm-pro/contents/pyproject.toml > "$RUNNER_TEMP/pro-pyproject.toml"; then
+            echo "::error::Could not read issue-worm-pro's pyproject.toml - check that ISSUE_WORM_PRO_TOKEN is still valid and has Contents: read on leonarduk/issue-worm-pro."
+            exit 1
+          fi
+          python scripts/pro_dependency_requirements.py "$RUNNER_TEMP/pro-pyproject.toml" . \
+            > "$RUNNER_TEMP/pro-requirements.txt"
+          cat "$RUNNER_TEMP/pro-requirements.txt"
+          # A clean venv with all of it installed together - issue-worm (this
+          # checkout), cicaid-devtools, cicaid-devtools-pro and pro's other
+          # requirements - then pip check, as #103 asks. A pin moved here that
+          # pro hasn't moved yet fails the install with ResolutionImpossible.
+          python -m venv "$RUNNER_TEMP/graph"
+          "$RUNNER_TEMP/graph/bin/python" -m pip install --upgrade pip
+          # The insteadOf rewrite is scoped to this process, as in
+          # .github/scripts/pip_install_cicaid_pro.sh; tokens never reach a
+          # config file.
+          GIT_CONFIG_COUNT=2 \
+          GIT_CONFIG_KEY_0="url.https://x-access-token:${CICAID_PRO_TOKEN}@github.com/leonarduk/cicaid-pro.insteadOf" \
+          GIT_CONFIG_VALUE_0="https://github.com/leonarduk/cicaid-pro" \
+          GIT_CONFIG_KEY_1="url.https://x-access-token:${ISSUE_WORM_PRO_TOKEN}@github.com/leonarduk/issue-worm-pro.insteadOf" \
+          GIT_CONFIG_VALUE_1="https://github.com/leonarduk/issue-worm-pro" \
+            "$RUNNER_TEMP/graph/bin/python" -m pip install -r "$RUNNER_TEMP/pro-requirements.txt"
+          "$RUNNER_TEMP/graph/bin/python" -m pip check
+
+  wheel-contents:
+    name: Built wheel contents
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # setuptools-scm derives the version from tags
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # The same check release.yml runs before uploading, so a wheel that
+      # would be rejected at release time fails in the PR instead (#197).
+      - name: Build the wheel and check its contents
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+          python scripts/check_wheel_contents.py dist/*.whl

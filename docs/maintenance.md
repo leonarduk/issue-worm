@@ -189,3 +189,38 @@ release. The pins themselves are left untouched.
   summary shows `main` in the Ref column. A run that keeps testing `main` long
   after the sibling's nightly-tag workflow should have run means that workflow
   is broken in the sibling, not here.
+
+## CI secrets and release guards
+
+Each of these is optional in the sense that a workflow without it still runs:
+the step it feeds warns and skips instead of failing. A fork or Dependabot PR
+never gets secrets, which is why none of them is a hard requirement.
+
+| Name | Kind | Used by | What it needs |
+|---|---|---|---|
+| `CICAID_PRO_TOKEN` | secret | the AI review install, `ci.yml`'s `cicaid-pins` and `pro-dependency-graph` jobs | fine-grained PAT, Contents: read on `leonarduk/cicaid-pro` |
+| `ISSUE_WORM_PRO_TOKEN` | secret | `ci.yml`'s `pro-dependency-graph` job | fine-grained PAT, Contents: read on `leonarduk/issue-worm-pro` |
+| `DISPATCH_APP_ID` | variable | `release.yml`'s dispatch to issue-worm-pro | the ID of a GitHub App installed on `leonarduk/issue-worm-pro` with Actions: write |
+| `DISPATCH_APP_PRIVATE_KEY` | secret | the same | that App's private key |
+| `DISPATCH_TOKEN` | secret | the same, only when the App isn't set up | fine-grained PAT, Actions: write on `leonarduk/issue-worm-pro` |
+
+- **`cicaid-pins`** ([`scripts/check_cicaid_pins.py`](../scripts/check_cicaid_pins.py))
+  resolves every `.github/cicaid-pins.env` pin with `git ls-remote`. It tells
+  a missing tag apart from a token that can't read the private repo, at PR
+  time instead of in the review's install step (#391, #444).
+- **`pro-dependency-graph`** ([`scripts/pro_dependency_requirements.py`](../scripts/pro_dependency_requirements.py))
+  installs issue-worm-pro's runtime requirements into a clean venv, with
+  issue-worm swapped for the PR's checkout, then runs `pip check`. A pin
+  moved here that pro hasn't moved yet fails with `ResolutionImpossible` in
+  the PR that moves it (#103, the #100/#101 conflict). The fix is to move
+  both pins together, as in the table above. The job is non-blocking
+  (`continue-on-error`) until it has proved reliable.
+- **`wheel-contents`** and release.yml's matching step
+  ([`scripts/check_wheel_contents.py`](../scripts/check_wheel_contents.py))
+  check that the built wheel has every `py-modules` module, the `issue-worm`
+  console script and its metadata, and no repo tooling (#197).
+- **Dispatch to issue-worm-pro.** Prefer the GitHub App (#513): its token is
+  minted per release run and scoped to issue-worm-pro's Actions alone, where
+  `DISPATCH_TOKEN` is a long-lived PAT. Once `DISPATCH_APP_ID` and
+  `DISPATCH_APP_PRIVATE_KEY` are set, `DISPATCH_TOKEN` can be deleted. The
+  dispatch retries once before warning (#515).
