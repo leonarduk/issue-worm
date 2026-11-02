@@ -1187,16 +1187,95 @@ def test_parse_unterminated_fenced_full_section_drops_prose_after_closing_fence(
     assert changes[0].body == "value = 2"
 
 
-def test_parse_unterminated_unfenced_full_section_is_taken_verbatim():
-    """No fence means no reliable boundary between code and commentary: the
-    body is kept whole and the Verifier is the backstop."""
+def _unterminated_full(path, body):
+    return f"=== FILE: {path} ===\n=== MODE: FULL ===\n{body}"
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "The file now sets value to 2.\n",
+        "Let me know if you'd like any changes!\n",
+        "I updated the constant.\nThe tests should pass now.\n",
+    ],
+    ids=["one-sentence", "contraction", "two-sentences"],
+)
+def test_parse_unterminated_unfenced_full_section_drops_a_sign_off(tail):
+    """An unfenced code file's last paragraph made only of English sentences
+    can't be code - bare text like that is a syntax error - so it is the
+    model's sign-off and isn't written into the file (#257)."""
+    changes = parse_coder_output(_unterminated_full("a.py", f"value = 2\n\n{tail}"), ["a.py"])
+
+    assert changes[0].body == "value = 2"
+
+
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        # Sentence-shaped, but code: a comment, a string, a call, a docstring
+        # line, an indented line, a key: value line.
+        ("a.py", "value = 2\n\n# The file now sets value to 2.\n"),
+        ("a.py", "value = 2\n\nMESSAGE = 'The file now sets value.'\n"),
+        ("a.py", "x = 1\n\nprint(The value is set.)\n"),
+        ("a.py", 'def f():\n    """Doc.\n\n    Returns the value it was given.\n'),
+        ("a.yml", "a: 1\n\nNote: the value is set.\n"),
+        # Too short to be sure, or no paragraph break to split at.
+        ("a.py", "value = 2\n\nDone now.\n"),
+        ("a.py", "value = 2\nThe file now sets value to 2.\n"),
+        # Files whose content is prose.
+        ("README.md", "# Title\n\nThis paragraph is the content.\n"),
+        ("notes.txt", "list\n\nThis paragraph is the content.\n"),
+        ("LICENSE", "MIT\n\nPermission is hereby granted to anyone.\n"),
+        # Suffixless code files are skipped outright, like suffixless prose.
+        ("Makefile", "all:\n\tbuild\n\nThe build target compiles everything.\n"),
+        ("Dockerfile", "FROM python\n\nThe image installs the package.\n"),
+        # Not a language where a bare sentence is a syntax error.
+        ("Dockerfile.prod", "FROM python\n\nRUN echo the build is done.\n"),
+        ("run.sh", "set -e\n\nThe script exits on errors now.\n"),
+        ("config.yml", "a: 1\n\nThe value is set here.\n"),
+        # An all-caps first word is a keyword, not a sentence.
+        ("a.py", "x = 1\n\nRUN echo the build is done.\n"),
+        # Nothing but a sentence: nothing to keep it apart from.
+        ("a.py", "\nThe file now sets value to 2.\n"),
+    ],
+    ids=[
+        "comment", "string", "call", "docstring", "yaml-key", "short",
+        "no-blank-line", "markdown", "txt", "no-suffix", "makefile", "dockerfile",
+        "dockerfile-suffix", "shell", "yaml", "all-caps-keyword",
+        "only-prose",
+    ],
+)
+def test_parse_unterminated_unfenced_full_section_keeps_anything_but_obvious_prose(path, body):
+    """False negatives keep the old verbatim behaviour; a false positive
+    would delete real content (#257)."""
+    changes = parse_coder_output(_unterminated_full(path, body), [path])
+
+    # Edge newlines are normalised as before; nothing else changes.
+    assert changes[0].body == body.strip("\n")
+
+
+def test_sign_off_strip_leaves_a_fenced_body_behind_blank_lines_alone():
+    """Leading blank lines don't hide the opening fence: a fenced body is
+    _drop_prose_after_closing_fence's business, and its (unclosed) content
+    is kept whole here (#257)."""
+    body = "\n\n```python\nvalue = 2\n\nThe file now sets value to 2.\n"
+
+    # parse_coder_output trims the edge newlines before this runs, so pin
+    # the helper's own contract directly as well.
+    assert workspace._drop_trailing_prose(body, "a.py") == body
+    changes = parse_coder_output(_unterminated_full("a.py", body), ["a.py"])
+    assert changes[0].body.endswith("value = 2\n\nThe file now sets value to 2.")
+
+
+def test_terminated_full_section_keeps_a_trailing_sentence():
+    """The sign-off strip is only for unterminated sections: END FILE marks
+    the end exactly, so what comes before it is the file (#257)."""
     output = (
         "=== FILE: a.py ===\n=== MODE: FULL ===\n"
-        "value = 2\n\nThe file now sets value to 2.\n"
+        "value = 2\n\nThe file now sets value to 2.\n=== END FILE ===\n"
     )
-    changes = parse_coder_output(output, ["a.py"])
 
-    assert changes[0].body == "value = 2\n\nThe file now sets value to 2."
+    assert parse_coder_output(output, ["a.py"])[0].body == "value = 2\n\nThe file now sets value to 2."
 
 
 def test_parse_strict_end_marker_still_bounds_the_section():
@@ -3220,6 +3299,153 @@ def test_edit_keeps_a_heading_underline_in_a_markup_file():
     )
 
 
+# --- marker-shaped lines inside a block's text (#313) -----------------------
+#
+# The grammar is in-band, so a marker line inside SEARCH/REPLACE text can't be
+# told apart from a real one without lookahead. Each case is rejected loudly
+# (or, for a heading underline in markup, kept) - never applied wrong.
+
+
+def _edit(path, body):
+    return f"=== FILE: {path} ===\n=== MODE: EDIT ===\n{body}=== END FILE ===\n"
+
+
+def test_literal_replace_marker_in_replace_text_is_rejected_not_truncated():
+    """It used to close the block early: the REPLACE text was cut at the
+    literal line, the rest dropped as prose, and the real closing line
+    ignored - a silently truncated edit."""
+    body = (
+        "<<<<<<< SEARCH\nold\n=======\nThe block ends with:\n"
+        ">>>>>>> REPLACE\nand that is all.\n>>>>>>> REPLACE\n"
+    )
+
+    with pytest.raises(MalformedOutputError) as exc:
+        parse_coder_output(_edit("a.md", body), ["a.md"])
+
+    message = str(exc.value)
+    assert "block 1's REPLACE text contains a literal '>>>>>>> REPLACE' line" in message
+    assert "1 line(s) of text after block 1" in message
+    assert "MODE: FULL" in message
+
+
+def test_prose_then_a_stray_closing_line_is_rejected_too():
+    """The new failure mode, pinned: prose after a block followed by a
+    stray '>>>>>>> REPLACE' (an echoed marker, or a block that lost its
+    SEARCH line) is rejected, and the message names both causes."""
+    body = (
+        "<<<<<<< SEARCH\na = 1\n=======\na = 2\n>>>>>>> REPLACE\n"
+        "That updates a.\n>>>>>>> REPLACE\n"
+    )
+
+    with pytest.raises(MalformedOutputError, match="a block lost its '<<<<<<< SEARCH' line"):
+        parse_coder_output(_edit("a.py", body), ["a.py"])
+
+
+def test_the_dropped_text_count_restarts_with_each_block():
+    """Prose before block 2 isn't counted against block 2's close."""
+    body = (
+        "<<<<<<< SEARCH\na = 1\n=======\na = 2\n>>>>>>> REPLACE\n"
+        "Some prose.\nMore prose.\n"
+        "<<<<<<< SEARCH\nb = 1\n=======\nsee:\n>>>>>>> REPLACE\ntail\n>>>>>>> REPLACE\n"
+    )
+
+    with pytest.raises(MalformedOutputError, match=r"1 line\(s\) of text after block 2"):
+        parse_coder_output(_edit("a.py", body), ["a.py"])
+
+
+def test_a_search_marker_inside_search_text_is_content():
+    """Before the divider, a SEARCH-shaped line is the file's own text
+    (editing this grammar's docs or tests, say), and the block applies
+    (#313)."""
+    body = (
+        "<<<<<<< SEARCH\nexample:\n<<<<<<< SEARCH\nend\n=======\n"
+        "example: none\n>>>>>>> REPLACE\n"
+    )
+    changes = parse_coder_output(_edit("a.md", body), ["a.md"])
+
+    assert _apply_search_replace(
+        "intro\nexample:\n<<<<<<< SEARCH\nend\n", changes[0].body, "a.md"
+    ) == ("intro\nexample: none\n", None)
+
+
+def test_a_block_that_lost_its_divider_still_fails():
+    """Taking a SEARCH marker as content can't hide a missing divider: the
+    run-on block's SEARCH text isn't in the file, so it fails at apply."""
+    body = (
+        "<<<<<<< SEARCH\na = 1\n"
+        "<<<<<<< SEARCH\nb = 1\n=======\nb = 2\n>>>>>>> REPLACE\n"
+    )
+    changes = parse_coder_output(_edit("a.py", body), ["a.py"])
+
+    with pytest.raises(MalformedOutputError):
+        _apply_search_replace("a = 1\nb = 1\n", changes[0].body, "a.py")
+
+
+@pytest.mark.parametrize("between", ["", "\n", "\n\n```\n"], ids=["adjacent", "blank", "fence"])
+def test_a_doubled_closing_line_is_still_accepted(between):
+    """A stuttered '>>>>>>> REPLACE' with nothing dropped between the two
+    (blank lines or a fence at most) loses nothing, so it stays accepted."""
+    body = f"<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE\n{between}>>>>>>> REPLACE\n"
+
+    changes = parse_coder_output(_edit("a.py", body), ["a.py"])
+
+    assert _apply_search_replace("old\n", changes[0].body, "a.py") == ("new\n", None)
+
+
+def test_prose_between_blocks_is_still_ignored():
+    body = (
+        "<<<<<<< SEARCH\na = 1\n=======\na = 2\n>>>>>>> REPLACE\n"
+        "Now the second change:\n"
+        "<<<<<<< SEARCH\nb = 1\n=======\nb = 2\n>>>>>>> REPLACE\n"
+    )
+
+    changes = parse_coder_output(_edit("a.py", body), ["a.py"])
+
+    assert _apply_search_replace("a = 1\nb = 1\n", changes[0].body, "a.py") == (
+        "a = 2\nb = 2\n",
+        None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("body", "match"),
+    [
+        (
+            "<<<<<<< SEARCH\nold\n>>>>>>> REPLACE\n",
+            "SEARCH block 1 has no '=======' .* divider",
+        ),
+        (
+            "<<<<<<< SEARCH\nold\n=======\n<<<<<<< SEARCH\n>>>>>>> REPLACE\n",
+            "no '>>>>>>> REPLACE' line before the next SEARCH",
+        ),
+        (
+            "<<<<<<< SEARCH\nold\n=======\nnew\n=======\n>>>>>>> REPLACE\n",
+            "second '=======' divider",
+        ),
+    ],
+    ids=["replace-marker-in-search", "search-marker-in-replace", "divider-in-code-replace"],
+)
+def test_other_marker_lines_inside_a_block_are_rejected_loudly(body, match):
+    with pytest.raises(MalformedOutputError, match=match):
+        parse_coder_output(_edit("a.py", body), ["a.py"])
+
+
+def test_a_block_after_a_kept_markup_divider_parses_cleanly():
+    """The one marker-shaped line kept as content - a heading underline in a
+    markup file (#338) - doesn't throw off the block after it."""
+    body = (
+        "<<<<<<< SEARCH\nold\n=======\nTitle\n=======\n>>>>>>> REPLACE\n"
+        "<<<<<<< SEARCH\nend\n=======\nfin\n>>>>>>> REPLACE\n"
+    )
+
+    changes = parse_coder_output(_edit("a.md", body), ["a.md"])
+
+    assert _apply_search_replace("old\nend\n", changes[0].body, "a.md") == (
+        "Title\n=======\nfin\n",
+        None,
+    )
+
+
 # --- diff-header-style EDIT blocks ('--- SEARCH' / '+++ REPLACE') ----------
 #
 # The shape qwen3.8-216k (thinking off) wrote for every EDIT section on
@@ -3248,6 +3474,24 @@ def test_diff_style_blocks_end_at_the_next_search_marker():
     assert _apply_search_replace(
         "value = 1\nother = 3\n", changes[0].body, "a.py"
     ) == ("value = 2\nother = 4\n", None)
+
+
+def test_diff_style_literal_example_block_is_a_known_limit():
+    """#684, documented by the grammar comment: a literal example block in a
+    diff-style REPLACE splits it, and when the file also has the example's
+    SEARCH text, both halves apply - the outer REPLACE truncated. Pinned so
+    a grammar change that fixes (or worsens) this is a visible decision."""
+    output = _diff_style_edit(
+        "doc.md",
+        ("x = 1\n", "Example:\n"),
+        ("old line\n", "new line\n"),
+    )
+    changes = parse_coder_output(output, ["doc.md"])
+
+    assert _apply_search_replace("x = 1\nold line\n", changes[0].body, "doc.md") == (
+        "Example:\nnew line\n",
+        None,
+    )
 
 
 def test_diff_style_block_may_still_be_closed_with_a_replace_line():
