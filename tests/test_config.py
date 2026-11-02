@@ -117,9 +117,26 @@ def test_load_config_reads_remote_settings_once_and_shares_them(monkeypatch):
     config = load_config()
 
     assert len(calls) == 1
-    roles = [config[key] for key in ("coder_config", "analyser_config", "triage_config")]
+    roles = [value for value in config.values() if isinstance(value, RoleConfig)]
+    assert len(roles) >= 3
     assert all(role.remote is roles[0].remote for role in roles)
     assert roles[0].remote is not None
+
+
+def test_load_config_gives_a_newly_added_role_the_shared_settings(monkeypatch):
+    """A role load_config gains later is covered without editing a list of
+    keys: every RoleConfig in the config gets the one shared object."""
+    import config as config_module
+
+    # Stand-in for a future "reviewer_config": a fourth RoleConfig placed in
+    # the dict through a value load_config already stores.
+    extra = config_module._load_role_config("REVIEWER")
+    monkeypatch.setattr(config_module, "_parse_coder_backend", lambda raw: extra)
+
+    config = load_config()
+
+    assert config["coder_backend"] is extra
+    assert extra.remote is config["coder_config"].remote is not None
 
 
 def test_load_config_remote_coder_settings_defaults_when_blank(monkeypatch):

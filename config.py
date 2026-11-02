@@ -174,10 +174,13 @@ def load_config() -> dict:
     }
 
     # One read of REMOTE_LLM_* / DEEPSEEK_* for the whole config, shared by
-    # every role, so the roles can't diverge (#799).
+    # every role, so the roles can't diverge (#799). Every RoleConfig in the
+    # dict, not a list of keys: a role added later gets it without anyone
+    # remembering to extend a list here.
     remote = remote_coder_settings_from_env()
-    for role_key in ("coder_config", "analyser_config", "triage_config"):
-        config[role_key].remote = remote
+    for value in config.values():
+        if isinstance(value, RoleConfig):
+            value.remote = remote
 
     if not config["coder_targets"] and config["coder_config"].model_source != "local":
         # CODER_TARGETS exists to pool multiple local Ollama machines by
