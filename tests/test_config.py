@@ -100,6 +100,28 @@ def test_load_config_reads_remote_coder_settings_from_env(monkeypatch):
     assert config["analyser_config"].remote == config["coder_config"].remote
 
 
+def test_load_config_reads_remote_settings_once_and_shares_them(monkeypatch):
+    """One environment read per load_config, one shared object across the
+    roles, not one per role (#799)."""
+    import config as config_module
+
+    calls = []
+    real = config_module.remote_coder_settings_from_env
+
+    def _counting():
+        calls.append(1)
+        return real()
+
+    monkeypatch.setattr(config_module, "remote_coder_settings_from_env", _counting)
+
+    config = load_config()
+
+    assert len(calls) == 1
+    roles = [config[key] for key in ("coder_config", "analyser_config", "triage_config")]
+    assert all(role.remote is roles[0].remote for role in roles)
+    assert roles[0].remote is not None
+
+
 def test_load_config_remote_coder_settings_defaults_when_blank(monkeypatch):
     """Blank counts as unset, as it did when build_coder read these itself:
     no remote_* value, and DeepSeek's provider endpoint and model. Set blank

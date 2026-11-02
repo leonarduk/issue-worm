@@ -394,6 +394,8 @@ def test_http_json_reports_no_status_for_a_transport_failure(failure):
             _http_json("https://api.example.invalid")
 
     assert exc.value.status is None
+    # The original failure stays chained for the traceback (#790).
+    assert exc.value.__cause__ is failure
 
 
 def test_http_json_reports_no_status_for_an_unparseable_body():
@@ -405,6 +407,7 @@ def test_http_json_reports_no_status_for_an_unparseable_body():
             _http_json("https://api.example.invalid")
 
     assert exc.value.status is None
+    assert isinstance(exc.value.__cause__, ValueError)  # JSONDecodeError (#790)
 
 
 def test_http_json_reports_other_http_errors_with_their_status():

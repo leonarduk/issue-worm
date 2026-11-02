@@ -1434,3 +1434,67 @@ def test_setup_env_always_turns_user_installs_off(monkeypatch, ambient):
         monkeypatch.setenv("PIP_USER", ambient)
 
     assert workspace._venv_setup_env()["PIP_USER"] == "0"
+
+
+def _pip_config_list(stdout, returncode=0):
+    return subprocess.CompletedProcess([], returncode, stdout=stdout, stderr="")
+
+
+@pytest.mark.parametrize(
+    ("stdout", "keys"),
+    [
+        ("global.target='/opt/site'\n", "global.target"),
+        ("global.index-url='https://mirror'\ninstall.prefix='/usr/local'\n", "install.prefix"),
+        (":env:.root='/x'\nglobal.prefix='/y'\n", ":env:.root, global.prefix"),
+    ],
+)
+def test_pip_config_that_moves_installs_out_of_the_venv_is_warned_about(
+    tmp_path, caplog, stdout, keys
+):
+    """The env-level fix can't override a pip config key it doesn't name, so
+    a config-file target/prefix/root is surfaced instead (#796)."""
+    with patch("workspace.subprocess.run", return_value=_pip_config_list(stdout)) as run:
+        workspace._warn_on_pip_config_install_location("py", tmp_path, {"PIP_USER": "0"})
+
+    assert run.call_args.args[0][-2:] == ["config", "list"]
+    assert run.call_args.kwargs["env"] == {"PIP_USER": "0"}
+    assert f"pip config sets {keys}," in caplog.text
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        _pip_config_list("global.index-url='https://mirror'\nglobal.timeout='60'\n"),
+        _pip_config_list("global.target='/opt'\n", returncode=1),
+        OSError("no python"),
+        subprocess.TimeoutExpired(["pip"], 1),
+    ],
+    ids=["no-location-keys", "pip-failed", "oserror", "timeout"],
+)
+def test_pip_config_check_is_quiet_and_never_fails_the_build(tmp_path, caplog, outcome):
+    """No warning without a location key, and a pip that can't report its
+    config doesn't stop the venv build - the check is advisory (#796)."""
+    kwargs = {"side_effect": outcome} if isinstance(outcome, BaseException) else {"return_value": outcome}
+    with patch("workspace.subprocess.run", **kwargs):
+        workspace._warn_on_pip_config_install_location("py", tmp_path, {})
+
+    assert "pip config sets" not in caplog.text
+
+
+def test_venv_build_runs_the_pip_config_check_with_the_setup_env(tmp_path, venv_root):
+    _python_project(tmp_path)
+    venv_dir = verifier_venv_dir(str(tmp_path))
+
+    def fake_step(command, cwd, env):
+        if command[1:3] == ["-m", "venv"]:
+            _fake_built_venv(venv_dir)
+
+    with (
+        patch("workspace._run_venv_setup_step", side_effect=fake_step),
+        patch("workspace._warn_on_pip_config_install_location") as check,
+    ):
+        ensure_verifier_venv(str(tmp_path))
+
+    (python, _cwd, env), _ = check.call_args
+    assert python == str(workspace._venv_python(venv_dir))
+    assert env["PIP_USER"] == "0"

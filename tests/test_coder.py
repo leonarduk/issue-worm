@@ -748,17 +748,30 @@ def test_build_coder_cloud_falls_back_to_defaults_for_explicit_none():
     assert (coder.endpoint, coder.model) == (DEFAULT_DEEPSEEK_ENDPOINT, DEFAULT_DEEPSEEK_MODEL)
 
 
-def test_build_coder_reads_settings_via_config_for_a_role_without_them(monkeypatch):
+@pytest.mark.parametrize(
+    ("model_source", "expected"),
+    [("cloud", ("deepseek-v4", "sk-test")), ("remote", ("gpt-5", "sk-remote"))],
+)
+def test_build_coder_reads_settings_via_config_for_a_role_without_them(
+    monkeypatch, model_source, expected
+):
     """A role built by hand (or anything RoleConfig-shaped) carries no
     settings; build_coder gets them from config.py's reader at call time,
-    as it read the environment before #223."""
+    as it read the environment before #223. Both sources that use them
+    (#798)."""
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-v4")
+    monkeypatch.setenv("REMOTE_LLM_ENDPOINT", "https://api.openai.com")
+    monkeypatch.setenv("REMOTE_LLM_MODEL", "gpt-5")
+    monkeypatch.setenv("REMOTE_LLM_API_KEY", "sk-remote")
 
-    assert RoleConfig(model_source="cloud").remote is None
-    for role in (RoleConfig(model_source="cloud"), SimpleNamespace(model_source="cloud")):
+    assert RoleConfig(model_source=model_source).remote is None
+    for role in (
+        RoleConfig(model_source=model_source),
+        SimpleNamespace(model_source=model_source),
+    ):
         coder = build_coder(role)
-        assert (coder.model, coder.api_key) == ("deepseek-v4", "sk-test")
+        assert (coder.model, coder.api_key) == expected
 
 
 def test_build_coder_cloud_model_override(monkeypatch):

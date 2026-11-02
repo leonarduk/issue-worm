@@ -2230,6 +2230,62 @@ def test_exclusive_file_lock_closes_fd_exactly_once_on_normal_exit(tmp_path):
     _assert_fds_closed(opened)
 
 
+def test_checks_pass_summary_reads_real_cicaid_run_ci_checks_output(tmp_path, capsys):
+    """The header regex is checked against what cicaid's own run_checks
+    prints, not only a hand-written fixture, so a header format change in
+    cicaid fails here instead of silently dropping to the fallback (#802)."""
+    from cicaid_devtools.run_ci_checks import Check, run_checks
+
+    checks = [
+        Check("Python tests", "pytest", "ci.yml", ("pytest -q",)),
+        Check("Ruff lint", "ruff check", "ci.yml", ("ruff check .",)),
+    ]
+    assert run_checks(checks, tmp_path, dry_run=True, keep_going=False) == 0
+
+    assert workspace.checks_pass_summary(capsys.readouterr().out) == (
+        "✓ `cicaid run-ci-checks --all` passed: 2 checks (Python tests, Ruff lint)."
+    )
+
+
+def test_exclusive_file_lock_windows_branch_success_path(tmp_path, monkeypatch):
+    """The Windows branch end to end with a fake msvcrt that succeeds: lock,
+    body runs once, unlock with LK_UNLCK on the same fd, fd closed exactly
+    once (#808)."""
+    import types
+
+    from workspace import _exclusive_file_lock
+
+    calls: list[tuple[int, int, int]] = []
+    fake_msvcrt = types.ModuleType("msvcrt")
+    fake_msvcrt.LK_LOCK, fake_msvcrt.LK_UNLCK = 1, 0
+    fake_msvcrt.locking = lambda fd, mode, nbytes: calls.append((fd, mode, nbytes))
+    monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
+
+    opened: list[int] = []
+    closed: list[int] = []
+    real_close = os.close
+
+    def _close(fd):
+        closed.append(fd)
+        real_close(fd)
+
+    body_runs = 0
+    with (
+        patch("workspace.os.open", side_effect=_recording_os_open(opened)),
+        patch("workspace.os.close", side_effect=_close),
+        patch("workspace.os.name", "nt"),
+    ):
+        with _exclusive_file_lock(tmp_path / "x.lock"):
+            body_runs += 1
+            assert calls == [(opened[0], fake_msvcrt.LK_LOCK, 1)]
+            assert closed == []
+
+    assert body_runs == 1
+    assert calls == [(opened[0], fake_msvcrt.LK_LOCK, 1), (opened[0], fake_msvcrt.LK_UNLCK, 1)]
+    assert closed == opened
+    _assert_fds_closed(opened)
+
+
 def test_run_ci_checks_passes_default_timeout(repo):
     """CI checks are bounded by DEFAULT_CI_TIMEOUT unless overridden."""
     with patch("workspace.subprocess.run") as m_run:

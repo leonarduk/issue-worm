@@ -3011,6 +3011,13 @@ def _dependency_digest(repo: Path, install_args: list[list[str]]) -> str:
 
 
 def _venv_setup_env() -> dict[str, str]:
+    """Environment for the verifier's own setup subprocesses, and nothing
+    else: building the target's venv (``ensure_verifier_venv``) and running
+    ``npm ci`` for its node deps (``ensure_node_deps``). Neither
+    wants a user-site install - inside a venv pip refuses one outright, and
+    npm ignores ``PIP_*`` - so forcing ``PIP_USER=0`` below is safe for both.
+    A new caller that relies on ``PIP_USER`` must not reuse this (#795).
+    """
     passthrough = (
         _CI_ENV_PASSTHROUGH_WINDOWS if os.name == "nt" else _CI_ENV_PASSTHROUGH_POSIX
     )
@@ -3033,6 +3040,51 @@ def _venv_setup_env() -> dict[str, str]:
     env["PIP_USER"] = "0"
     env["PYTHONIOENCODING"] = "utf-8"
     return env
+
+
+# A pip config key that moves installs out of the venv, as `pip config list`
+# prints it: "<section>.<key>='<value>'" (sections: global, install, ...).
+_PIP_CONFIG_INSTALL_LOCATION_RE = re.compile(r"^[\w:-]+\.(target|prefix|root)=", re.MULTILINE)
+
+
+def _warn_on_pip_config_install_location(
+    python: str, cwd: Path, env: dict[str, str]
+) -> None:
+    """Warn when a pip config file sets ``target``/``prefix``/``root`` (#796).
+
+    ``_venv_setup_env`` drops those ``PIP_*`` variables, but a pip.conf /
+    pip.ini (or ``PIP_CONFIG_FILE``) can still set them and send the
+    install outside the venv; env can't override a config key it doesn't
+    name. Ignoring the config files wholesale would also drop a configured
+    index or mirror, so this only says so. The check is advisory: if pip
+    can't report its config, the build goes on as before.
+    """
+    try:
+        result = subprocess.run(
+            [python, "-m", "pip", "--disable-pip-version-check", "config", "list"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            timeout=VERIFIER_VENV_SETUP_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.debug("verifier venv: could not list pip config: %s", exc)
+        return
+    if result.returncode != 0:
+        logger.debug("verifier venv: pip config list exited %s", result.returncode)
+        return
+    keys = [m.group(0).rstrip("=") for m in _PIP_CONFIG_INSTALL_LOCATION_RE.finditer(result.stdout)]
+    if keys:
+        logger.warning(
+            "verifier venv: pip config sets %s, which can install outside the "
+            "venv %s; remove it from the pip config file (see `pip config "
+            "debug`) if the target's checks can't import their dependencies",
+            ", ".join(keys),
+            Path(python).parent.parent,
+        )
 
 
 def _run_venv_setup_step(command: list[str], cwd: Path, env: dict[str, str]) -> None:
@@ -3096,6 +3148,7 @@ def ensure_verifier_venv(repo_path: str) -> Path | None:
     env = _venv_setup_env()
     _run_venv_setup_step([sys.executable, "-m", "venv", str(venv_dir)], repo, env)
     python = str(_venv_python(venv_dir))
+    _warn_on_pip_config_install_location(python, repo, env)
     for args in install_args:
         _run_venv_setup_step(
             [python, "-m", "pip", "--disable-pip-version-check", "--no-input", *args],

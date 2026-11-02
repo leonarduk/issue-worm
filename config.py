@@ -114,7 +114,9 @@ class RoleConfig:
     mcp_tool_name: str = DEFAULT_MCP_TOOL_NAME
     mcp_timeout_seconds: int = DEFAULT_MCP_TIMEOUT_SECONDS
     mcp_max_doc_chars: int = DEFAULT_MCP_MAX_DOC_CHARS
-    # Set by load_config. None for a RoleConfig built by hand: building one
+    # Set by load_config, which reads the environment once and shares the
+    # one (frozen) object across every role (#799). None for a RoleConfig
+    # built by hand: building one
     # never reads the environment; coder.build_coder falls back to
     # remote_coder_settings_from_env() itself for such a role. repr=False:
     # it carries API keys.
@@ -170,6 +172,12 @@ def load_config() -> dict:
         "log_level": _parse_log_level(os.getenv("LOG_LEVEL", "INFO")),
         "log_file": os.getenv("LOG_FILE", ""),
     }
+
+    # One read of REMOTE_LLM_* / DEEPSEEK_* for the whole config, shared by
+    # every role, so the roles can't diverge (#799).
+    remote = remote_coder_settings_from_env()
+    for role_key in ("coder_config", "analyser_config", "triage_config"):
+        config[role_key].remote = remote
 
     if not config["coder_targets"] and config["coder_config"].model_source != "local":
         # CODER_TARGETS exists to pool multiple local Ollama machines by
@@ -361,7 +369,6 @@ def _load_role_config(role_prefix: str) -> RoleConfig:
         mcp_tool_name=os.getenv("MCP_TOOL_NAME") or DEFAULT_MCP_TOOL_NAME,
         mcp_timeout_seconds=_env_int("MCP_TIMEOUT_SECONDS", DEFAULT_MCP_TIMEOUT_SECONDS),
         mcp_max_doc_chars=_env_int("MCP_MAX_DOC_CHARS", DEFAULT_MCP_MAX_DOC_CHARS),
-        remote=remote_coder_settings_from_env(),
     )
 
 
