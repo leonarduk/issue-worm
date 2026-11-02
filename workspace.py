@@ -642,6 +642,58 @@ def _drop_prose_after_closing_fence(body: str) -> str:
     return body
 
 
+# Characters code, config and comments are made of. A trailing line with none
+# of them that reads as an English sentence is a syntax error in every
+# language the coder edits, so a run of such lines is the model's sign-off,
+# not file content (#257).
+_CODE_CHARS = frozenset("{}()[];:=<>#/*`'\"$@|\\")
+_CONTRACTION_RE = re.compile(r"(?<=[A-Za-z])'(?=[A-Za-z])")
+# Text files where a paragraph of prose IS the content (no suffix: README,
+# LICENSE, ...). Spelled out rather than reusing _MARKUP_SUFFIXES, which is
+# defined further down.
+_PROSE_FILE_SUFFIXES = (".md", ".markdown", ".rst", ".adoc", ".txt", "")
+
+
+def _is_prose_line(line: str) -> bool:
+    """Capitalised, unindented, three or more words, ending a sentence, and
+    no code character (apostrophes inside contractions aside)."""
+    text = _CONTRACTION_RE.sub("", line.rstrip())
+    return (
+        bool(text)
+        and text[0].isupper()
+        and text[-1] in ".!?"
+        and len(text.split()) >= 3
+        and not _CODE_CHARS.intersection(text)
+    )
+
+
+def _drop_trailing_prose(body: str, path: str) -> str:
+    """Drop a sign-off paragraph from an unfenced, unterminated FULL body.
+
+    Only when the body's last paragraph - after its last blank line - is
+    nothing but prose-shaped lines (:func:`_is_prose_line`) and something comes
+    before it. Never for a prose file (markup, .txt, no suffix), and never
+    for a fenced body (``_drop_prose_after_closing_fence`` handles that).
+    False negatives keep the old verbatim behaviour; a false positive would
+    delete real content, so anything short of obvious prose stays (#257).
+    """
+    if Path(path).suffix.lower() in _PROSE_FILE_SUFFIXES:
+        return body
+    lines = body.rstrip("\n").splitlines()
+    if not lines or _FENCE_RE.match(lines[0]):
+        return body
+    blanks = [i for i, line in enumerate(lines) if not line.strip()]
+    if not blanks:
+        return body
+    tail = lines[blanks[-1] + 1 :]
+    head = lines[: blanks[-1]]
+    if not tail or not any(line.strip() for line in head):
+        return body
+    if not all(_is_prose_line(line) for line in tail):
+        return body
+    return "\n".join(head).rstrip("\n")
+
+
 # Repetition guards (see issue-worm-pro runs #582/#623, 2026-09-13). A Coder
 # response can degenerate in two ways that the section grammar alone does
 # not catch:
@@ -850,6 +902,28 @@ def _resolve_repeated_sections(
 # '>>>>>>> REPLACE' line if the model adds one, or at the end of the body.
 # Only a block OPENED with '--- SEARCH' gets that leniency; for the
 # canonical grammar an unclosed block still reads as a truncated reply.
+#
+# Known limitation of that leniency (#684, kept deliberately): a diff-style
+# block's REPLACE text can't contain a literal example block. Its inner
+# '--- SEARCH' ends the outer block, and with a divider after it the input
+# is identical to a genuine two-block body, so no parser can tell them
+# apart. If the file also contains the example's SEARCH text, the outer
+# REPLACE is applied truncated and the example applied as an edit -
+# silently. Dropping the leniency (every block needs '>>>>>>> REPLACE')
+# would re-reject the replies it was added for, and limiting it to
+# bodies with no '>>>>>>> REPLACE' doesn't cover this case. The prompt's
+# rule stands: a file whose new text contains marker lines is written
+# with MODE: FULL. test_diff_style_literal_example_block_is_a_known_limit
+# pins the behaviour.
+#
+# Every other marker line inside a block's text is rejected loudly rather
+# than guessed at (#313): a SEARCH marker before the divider ("no
+# divider"), a second divider in a code file (#338), a SEARCH marker in a
+# canonical block's REPLACE text, and a '>>>>>>> REPLACE' that closed a
+# block early - caught when the real closing line turns up outside any
+# block with the dropped text before it. Treating them as content instead
+# would need lookahead that makes a stray marker silently pull the prose
+# before it into the file.
 _SEARCH_MARKER_RE = re.compile(r"^<{5,9} ?SEARCH[ \t]*$")
 _DIVIDER_MARKER_RE = re.compile(r"^={5,9}[ \t]*$")
 _DIFF_SEARCH_MARKER_RE = re.compile(r"^-{3,9} ?SEARCH[ \t]*$")
@@ -911,6 +985,11 @@ def _parse_search_replace_blocks(body: str, path: str) -> list[tuple[str, str]]:
             )
         return MalformedOutputError(message)
 
+    # Non-blank lines seen outside a block since the last one closed. A
+    # '>>>>>>> REPLACE' after them means the last block closed early on a
+    # literal marker line in its REPLACE text and they were its tail (#313).
+    dropped_since_close = 0
+
     for line in body.splitlines():
         stripped = line.rstrip("\r")
         if state == "outside":
@@ -918,6 +997,17 @@ def _parse_search_replace_blocks(body: str, path: str) -> list[tuple[str, str]]:
                 state, search, replace = "search", [], []
                 diff_style = bool(_DIFF_SEARCH_MARKER_RE.match(stripped))
                 split_off = False
+            elif _REPLACE_MARKER_RE.match(stripped) and blocks and dropped_since_close:
+                raise MalformedOutputError(
+                    f"MODE: EDIT section for {path!r}: a '>>>>>>> REPLACE' line "
+                    f"follows block {len(blocks)}'s closing line, with "
+                    f"{dropped_since_close} line(s) of text between them - block "
+                    f"{len(blocks)}'s REPLACE text probably contains a literal "
+                    "'>>>>>>> REPLACE' line, which ended it early. No EDIT block "
+                    "can carry that line: write this file with MODE: FULL instead"
+                )
+            elif stripped.strip() and not stripped.lstrip().startswith("```"):
+                dropped_since_close += 1
         elif state == "search":
             if _DIVIDER_MARKER_RE.match(stripped) or _DIFF_DIVIDER_MARKER_RE.match(
                 stripped
@@ -931,6 +1021,7 @@ def _parse_search_replace_blocks(body: str, path: str) -> list[tuple[str, str]]:
             if _REPLACE_MARKER_RE.match(stripped):
                 blocks.append(("\n".join(search), "\n".join(replace)))
                 state = "outside"
+                dropped_since_close = 0
             elif is_search_marker(stripped):
                 if not diff_style:
                     raise MalformedOutputError(
@@ -1231,6 +1322,7 @@ def parse_coder_output(output: str, declared_files: list[str]) -> list[FileChang
                 # was fenced, the closing fence marks where the file ends
                 # and everything after it is commentary, not code.
                 body = _drop_prose_after_closing_fence(body)
+                body = _drop_trailing_prose(body, path)
             # A full-file rewrite wrapped in a Markdown fence (```python /
             # bare ``` / ...) is not part of the file's real content, and
             # there's no verifier here (free-tier build, #401) to catch the
