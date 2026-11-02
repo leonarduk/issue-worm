@@ -90,3 +90,10 @@ def test_main_canonical_mode_reports_a_malformed_template_map(monkeypatch, capsy
 
     assert check_issue_templates.main(["--canonical"]) == 1
     assert "cannot load the canonical templates" in capsys.readouterr().out
+
+
+def test_main_reports_a_missing_template_directory(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+
+    assert check_issue_templates.main([]) == 1
+    assert "::error::cannot read .github/ISSUE_TEMPLATE" in capsys.readouterr().out

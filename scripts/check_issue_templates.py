@@ -68,7 +68,11 @@ def load_canonical() -> dict[str, str]:
 
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
-    local = load_local()
+    try:
+        local = load_local()
+    except OSError as exc:
+        print(f"::error::cannot read {TEMPLATE_DIR}: {exc}")
+        return 1
     problems = scope_line_problems(local)
     if "--canonical" in args:
         try:

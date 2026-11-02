@@ -246,7 +246,7 @@ across all of them (#364).
 
   Never edit a consumer's copy directly. The next sync would either refuse
   or overwrite it.
-- **Enforced here** by `ci.yml`'s `issue-templates` job
+- **Enforced here** by `issue-templates.yml` (run when a template, the pins or the check changes)
   ([`scripts/check_issue_templates.py`](../scripts/check_issue_templates.py),
   #363). It does two things:
   - It fails on any template line that *starts* with `FILES:` or `DONE:`.
