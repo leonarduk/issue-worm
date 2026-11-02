@@ -209,11 +209,12 @@ never gets secrets, which is why none of them is a hard requirement.
   a missing tag apart from a token that can't read the private repo, at PR
   time instead of in the review's install step (#391, #444).
 - **`pro-dependency-graph`** ([`scripts/pro_dependency_requirements.py`](../scripts/pro_dependency_requirements.py))
-  resolves issue-worm-pro's runtime requirements, with issue-worm swapped for
-  the PR's checkout, as a `pip install --dry-run`. A pin moved here that pro
-  hasn't moved yet fails with `ResolutionImpossible` in the PR that moves it
-  (#103, the #100/#101 conflict). The fix is to move both pins together, as
-  in the table above.
+  installs issue-worm-pro's runtime requirements into a clean venv, with
+  issue-worm swapped for the PR's checkout, then runs `pip check`. A pin
+  moved here that pro hasn't moved yet fails with `ResolutionImpossible` in
+  the PR that moves it (#103, the #100/#101 conflict). The fix is to move
+  both pins together, as in the table above. The job is non-blocking
+  (`continue-on-error`) until it has proved reliable.
 - **`wheel-contents`** and release.yml's matching step
   ([`scripts/check_wheel_contents.py`](../scripts/check_wheel_contents.py))
   check that the built wheel has every `py-modules` module, the `issue-worm`

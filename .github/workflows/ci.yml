@@ -194,8 +194,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      # No persisted GITHUB_TOKEN extraheader: git would send it instead of
+      # CICAID_PRO_TOKEN, and it can't see cicaid-pro.
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -216,9 +220,14 @@ jobs:
     name: issue-worm-pro still resolves against this checkout
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Non-blocking to start with, as #103 asks: it reaches two private repos
+    # and PyPI, so let it prove itself before it can turn a PR red.
+    continue-on-error: true
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -233,7 +242,7 @@ jobs:
       # private: ISSUE_WORM_PRO_TOKEN reads issue-worm-pro, CICAID_PRO_TOKEN
       # reads cicaid-pro (docs/maintenance.md). Without them the job warns
       # and passes - a fork PR gets no secrets.
-      - name: Resolve issue-worm-pro's dependency graph (dry run)
+      - name: Install issue-worm-pro's dependency graph and pip check it
         shell: bash
         env:
           ISSUE_WORM_PRO_TOKEN: ${{ secrets.ISSUE_WORM_PRO_TOKEN }}
@@ -250,7 +259,12 @@ jobs:
           python scripts/pro_dependency_requirements.py "$RUNNER_TEMP/pro-pyproject.toml" . \
             > "$RUNNER_TEMP/pro-requirements.txt"
           cat "$RUNNER_TEMP/pro-requirements.txt"
-          python -m pip install --upgrade pip
+          # A clean venv with all of it installed together - issue-worm (this
+          # checkout), cicaid-devtools, cicaid-devtools-pro and pro's other
+          # requirements - then pip check, as #103 asks. A pin moved here that
+          # pro hasn't moved yet fails the install with ResolutionImpossible.
+          python -m venv "$RUNNER_TEMP/graph"
+          "$RUNNER_TEMP/graph/bin/python" -m pip install --upgrade pip
           # The insteadOf rewrite is scoped to this process, as in
           # .github/scripts/pip_install_cicaid_pro.sh; tokens never reach a
           # config file.
@@ -259,7 +273,8 @@ jobs:
           GIT_CONFIG_VALUE_0="https://github.com/leonarduk/cicaid-pro" \
           GIT_CONFIG_KEY_1="url.https://x-access-token:${ISSUE_WORM_PRO_TOKEN}@github.com/leonarduk/issue-worm-pro.insteadOf" \
           GIT_CONFIG_VALUE_1="https://github.com/leonarduk/issue-worm-pro" \
-            python -m pip install --dry-run --ignore-installed -r "$RUNNER_TEMP/pro-requirements.txt"
+            "$RUNNER_TEMP/graph/bin/python" -m pip install -r "$RUNNER_TEMP/pro-requirements.txt"
+          "$RUNNER_TEMP/graph/bin/python" -m pip check
 
   wheel-contents:
     name: Built wheel contents

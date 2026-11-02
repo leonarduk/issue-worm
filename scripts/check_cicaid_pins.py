@@ -74,14 +74,26 @@ def parse_pins(text: str) -> tuple[list[Pin], list[str]]:
 
 
 def _git_env(repo: str, token: str | None) -> dict[str, str]:
-    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    # actions/checkout leaves GITHUB_TOKEN in the checkout's local git config
+    # as an Authorization extraheader for github.com. Run from inside the
+    # checkout, git sends that header instead of the token below, and
+    # GITHUB_TOKEN can't see another private repo ("Repository not found").
+    # An empty value resets the header list, and env config is read after
+    # the local config.
+    env = dict(
+        os.environ,
+        GIT_TERMINAL_PROMPT="0",
+        GIT_CONFIG_COUNT="1",
+        GIT_CONFIG_KEY_0="http.https://github.com/.extraheader",
+        GIT_CONFIG_VALUE_0="",
+    )
     if token:
         # Same URL rewrite as .github/scripts/pip_install_cicaid_pro.sh,
         # scoped to this one process; the token never reaches a config file.
         env.update(
-            GIT_CONFIG_COUNT="1",
-            GIT_CONFIG_KEY_0=f"url.https://x-access-token:{token}@github.com/{repo}.insteadOf",
-            GIT_CONFIG_VALUE_0=f"https://github.com/{repo}",
+            GIT_CONFIG_COUNT="2",
+            GIT_CONFIG_KEY_1=f"url.https://x-access-token:{token}@github.com/{repo}.insteadOf",
+            GIT_CONFIG_VALUE_1=f"https://github.com/{repo}",
         )
     return env
 

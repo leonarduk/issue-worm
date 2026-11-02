@@ -18,8 +18,8 @@ import sys
 import tomllib
 from pathlib import Path
 
-# A PEP 508 requirement's distribution name, normalised (PEP 503).
-_NAME_RE = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
+# A PEP 508 requirement's distribution name and any extras.
+_NAME_RE = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*(\[[^\]]*\])?")
 
 
 def _normalise(name: str) -> str:
@@ -32,13 +32,15 @@ def swap_issue_worm(requirements: list[str], checkout: Path) -> list[str]:
     Raises ValueError when pro doesn't depend on issue-worm exactly once:
     either way the check would no longer test what it claims to.
     """
-    local = f"issue-worm @ {checkout.resolve().as_uri()}"
+    uri = checkout.resolve().as_uri()
     out: list[str] = []
     swapped = 0
     for requirement in requirements:
         match = _NAME_RE.match(requirement)
         if match and _normalise(match.group(1)) == "issue-worm":
-            out.append(local)
+            # Keep any extras pro asks for: they add dependencies to resolve.
+            extras = (match.group(2) or "").replace(" ", "")
+            out.append(f"issue-worm{extras} @ {uri}")
             swapped += 1
         else:
             out.append(requirement.strip())

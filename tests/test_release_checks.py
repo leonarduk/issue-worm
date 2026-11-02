@@ -28,6 +28,8 @@ import check_wheel_contents  # noqa: E402
 import pro_dependency_requirements  # noqa: E402
 from check_cicaid_pins import Pin, check_pin, parse_pins  # noqa: E402
 
+needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+
 # --- check_cicaid_pins --------------------------------------------------------
 
 
@@ -79,12 +81,37 @@ def test_check_pin_private_repo_uses_the_token_and_never_prints_it():
         status, message = check_pin(pin, "s3cret")
 
     env = run.call_args.kwargs["env"]
-    assert env["GIT_CONFIG_KEY_0"] == (
+    assert env["GIT_CONFIG_COUNT"] == "2"
+    assert env["GIT_CONFIG_KEY_1"] == (
         "url.https://x-access-token:s3cret@github.com/leonarduk/cicaid-pro.insteadOf"
     )
     assert status == "error"
     assert "CICAID_PRO_TOKEN is still valid" in message
     assert "s3cret" not in message
+
+
+@needs_git
+def test_check_pin_overrides_a_checkout_extraheader(tmp_path):
+    """actions/checkout leaves GITHUB_TOKEN as a github.com extraheader in
+    the checkout's local config; git must not send it in place of the
+    pin token (it can't see cicaid-pro: "Repository not found" in CI)."""
+    repo = tmp_path / "checkout"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "http.https://github.com/.extraheader",
+         "AUTHORIZATION: basic eC1hY2Nlc3MtdG9rZW46Z2hzX3dyb25n"],
+        check=True,
+    )
+    env = check_cicaid_pins._git_env("leonarduk/cicaid-pro", "s3cret")
+
+    result = subprocess.run(
+        ["git", "-C", str(repo), "config", "--get-all", "http.https://github.com/.extraheader"],
+        env=env, capture_output=True, text=True, check=False,
+    )
+
+    # The local value is followed by the env's empty one, and git treats an
+    # empty extraheader as "reset the list": only "" survives.
+    assert result.stdout.splitlines()[-1] == ""
 
 
 def test_check_pin_skips_the_private_pin_without_a_token():
@@ -173,6 +200,14 @@ def test_swap_issue_worm_points_pro_at_this_checkout(tmp_path):
     out = pro_dependency_requirements.swap_issue_worm(requirements, tmp_path)
 
     assert out == [f"issue-worm @ {tmp_path.resolve().as_uri()}", *requirements[1:]]
+
+
+def test_swap_issue_worm_keeps_the_extras_pro_asks_for(tmp_path):
+    out = pro_dependency_requirements.swap_issue_worm(
+        ["issue-worm[vram, dev] @ git+https://x@v1"], tmp_path
+    )
+
+    assert out == [f"issue-worm[vram,dev] @ {tmp_path.resolve().as_uri()}"]
 
 
 @pytest.mark.parametrize("names", [[], ["issue_worm @ x", "Issue.Worm>=1"]], ids=["none", "two"])
