@@ -253,9 +253,12 @@ jobs:
             echo "::warning::ISSUE_WORM_PRO_TOKEN and CICAID_PRO_TOKEN are both needed to resolve issue-worm-pro's private dependency graph; skipping (docs/maintenance.md)."
             exit 0
           fi
-          GH_TOKEN="$ISSUE_WORM_PRO_TOKEN" gh api \
+          if ! GH_TOKEN="$ISSUE_WORM_PRO_TOKEN" gh api \
             -H "Accept: application/vnd.github.raw" \
-            repos/leonarduk/issue-worm-pro/contents/pyproject.toml > "$RUNNER_TEMP/pro-pyproject.toml"
+            repos/leonarduk/issue-worm-pro/contents/pyproject.toml > "$RUNNER_TEMP/pro-pyproject.toml"; then
+            echo "::error::Could not read issue-worm-pro's pyproject.toml - check that ISSUE_WORM_PRO_TOKEN is still valid and has Contents: read on leonarduk/issue-worm-pro."
+            exit 1
+          fi
           python scripts/pro_dependency_requirements.py "$RUNNER_TEMP/pro-pyproject.toml" . \
             > "$RUNNER_TEMP/pro-requirements.txt"
           cat "$RUNNER_TEMP/pro-requirements.txt"

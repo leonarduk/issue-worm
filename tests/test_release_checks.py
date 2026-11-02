@@ -173,6 +173,16 @@ def test_wheel_check_reports_each_kind_of_broken_wheel(mutate, problem):
     assert any(p.startswith(problem) for p in problems), problems
 
 
+def test_wheel_check_without_console_scripts_needs_no_entry_points():
+    """A project with no [project.scripts] has no entry_points.txt to ask
+    for; only its modules and metadata are checked."""
+    pyproject = {"tool": {"setuptools": {"py-modules": ["mod"]}}, "project": {}}
+    names = ["mod.py", *(f"{_DIST_INFO}/{n}" for n in ("METADATA", "WHEEL", "RECORD"))]
+
+    assert check_wheel_contents.check_wheel(names, None, pyproject) == []
+    assert check_wheel_contents.check_wheel(names[1:], None, pyproject) == ["missing module mod.py"]
+
+
 def test_wheel_check_main_reads_a_real_zip(tmp_path, capsys):
     wheel = tmp_path / "issue_worm-1.0.0-py3-none-any.whl"
     with zipfile.ZipFile(wheel, "w") as archive:
