@@ -1103,6 +1103,51 @@ def test_remote_complete_warns_when_output_hit_token_cap(caplog):
     assert "CODER_MAX_TOKENS" in caplog.text
 
 
+def test_remote_multi_file_full_rewrite_near_the_default_cap_is_not_truncated(
+    monkeypatch, caplog
+):
+    """The failure behind #355 end to end (#358): a multi-file FULL rewrite
+    sized near DEFAULT_DEEPSEEK_MAX_TOKENS comes back whole through the
+    factory's default cap - every file, byte for byte, no truncation
+    warning - and the request carries that cap."""
+    from workspace import parse_coder_output
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.delenv("CODER_MAX_TOKENS", raising=False)
+    coder = build_coder(RoleConfig(model_source="cloud"))
+    assert coder.max_tokens == DEFAULT_DEEPSEEK_MAX_TOKENS
+
+    # ~4 characters per token is the usual rule of thumb for code, so this
+    # is ~90% of the cap: large, but a response the cap admits whole.
+    files = {
+        f"pkg/module_{n}.py": "".join(
+            f"def handler_{n}_{i}(value):\n    return value + {i}\n\n"
+            for i in range(790)
+        )
+        for n in range(3)
+    }
+    response = "".join(
+        f"=== FILE: {path} ===\n=== MODE: FULL ===\n{body}=== END FILE ===\n"
+        for path, body in files.items()
+    )
+    assert 0.8 < len(response) / (4 * DEFAULT_DEEPSEEK_MAX_TOKENS) < 1.0
+    body = {"choices": [{"message": {"content": response}, "finish_reason": "stop"}]}
+
+    with patch("coder.requests.post", return_value=_mock_response(body)) as post:
+        with caplog.at_level("WARNING", logger="coder"):
+            result = coder.complete("rewrite the package")
+
+    assert post.call_args.kwargs["json"]["max_tokens"] == DEFAULT_DEEPSEEK_MAX_TOKENS
+    assert "finish_reason=length" not in caplog.text
+    assert result == response
+    changes = {c.path: c for c in parse_coder_output(result, list(files))}
+    assert set(changes) == set(files)
+    for path, content in files.items():
+        # The section parser drops a body's trailing newlines (the write
+        # adds the file's own back); everything before them is untouched.
+        assert changes[path].body.rstrip("\n") == content.rstrip("\n"), path
+
+
 @pytest.mark.parametrize(
     "choice",
     [
