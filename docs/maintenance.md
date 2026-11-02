@@ -224,3 +224,33 @@ never gets secrets, which is why none of them is a hard requirement.
   `DISPATCH_TOKEN` is a long-lived PAT. Once `DISPATCH_APP_ID` and
   `DISPATCH_APP_PRIVATE_KEY` are set, `DISPATCH_TOKEN` can be deleted. The
   dispatch retries once before warning (#515).
+
+## Issue templates
+
+The issue templates in [`.github/ISSUE_TEMPLATE/`](../.github/ISSUE_TEMPLATE/)
+(`bug_report.md`, `feature_request.md`, `task_chore.md`, `config.yml`) are
+shared with cicaid, allotmint and sing-attune, and must stay byte-identical
+across all of them (#364).
+
+- **Canonical source:** leonarduk/cicaid-pro. Its own
+  `.github/ISSUE_TEMPLATE/*` and the `ISSUE_TEMPLATE_FILES` constants embedded
+  in `src/cicaid_devtools/setup_review_actions.py` are the same text. That
+  repo's drift tests keep those two identical.
+- **Every other repo gets them from `cicaid setup-review-actions`,** which
+  writes the embedded copies. It refuses to overwrite a template edited
+  locally since it was scaffolded, unless given `--force`.
+- **To change a template:**
+  1. Change it in cicaid-pro, in both places, and release.
+  2. Once a repo's `CICAID_PRO_REF` reaches that release, run
+     `cicaid setup-review-actions` there.
+
+  Never edit a consumer's copy directly. The next sync would either refuse
+  or overwrite it.
+- **Enforced here** by `ci.yml`'s `issue-templates` job
+  ([`scripts/check_issue_templates.py`](../scripts/check_issue_templates.py),
+  #363). It does two things:
+  - It fails on any template line that *starts* with `FILES:` or `DONE:`.
+    issue-worm reads the first such line in an issue body as its scope, so
+    an unfilled issue would look scoped.
+  - It compares each template with the pinned cicaid-devtools-pro's copy, so
+    a pin bump that changes the templates fails until this repo is synced.

@@ -290,11 +290,13 @@ comment is worth checking that scope for.
 
 ## Working with private repositories
 
-`issue-worm build` — the free-tier one; issue-worm-pro's resolves its own
-workspace and does not accept `--workspace` — works in a checkout it calls
-the workspace, chosen by `--workspace`, else `WORKSPACE_ROOT`, else a
-default under `.issue-worm-workspace/`. When that path is missing or empty it is
-fresh-cloned over **HTTPS with no credentials** — `ensure_base_clone`
+`issue-worm build` works in a checkout it calls the workspace, chosen by
+`--workspace`, else `WORKSPACE_ROOT`, else a default under
+`.issue-worm-workspace/`. With issue-worm-pro installed, `build` runs pro's
+implementation instead; it accepts `--workspace` too and resolves the
+workspace in the same order, so the flag is neither an error nor ignored.
+When that path is missing or empty it is fresh-cloned over **HTTPS with no
+credentials** — `ensure_base_clone`
 builds `https://github.com/<owner>/<name>.git` and nothing attaches a
 token.
 
