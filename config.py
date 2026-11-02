@@ -114,7 +114,9 @@ class RoleConfig:
     mcp_tool_name: str = DEFAULT_MCP_TOOL_NAME
     mcp_timeout_seconds: int = DEFAULT_MCP_TIMEOUT_SECONDS
     mcp_max_doc_chars: int = DEFAULT_MCP_MAX_DOC_CHARS
-    # Set by load_config. None for a RoleConfig built by hand: building one
+    # Set by _load_role_config: from load_config, the one frozen
+    # RemoteCoderSettings it read, shared by every role (#799). None for a
+    # RoleConfig built by hand: building one
     # never reads the environment; coder.build_coder falls back to
     # remote_coder_settings_from_env() itself for such a role. repr=False:
     # it carries API keys.
@@ -153,6 +155,10 @@ def load_config() -> dict:
     # ISSUE_WORM_ENV_FILE=.env-deepseek issue-worm build
     load_dotenv(dotenv_path=os.getenv("ISSUE_WORM_ENV_FILE", ".env"), override=False)
 
+    # One read of REMOTE_LLM_* / DEEPSEEK_* for the whole config (#799),
+    # handed to every role as it is built, so the roles share one frozen
+    # object and can't diverge.
+    remote = remote_coder_settings_from_env()
     config = {
         "coder_backend": _parse_coder_backend(os.getenv("CODER_BACKEND", "native")),
         "workspace_root": os.getenv("WORKSPACE_ROOT", "."),
@@ -163,9 +169,9 @@ def load_config() -> dict:
         # AI-review rejections allowed before the review-feedback loop
         # hands the issue to a human (#306).
         "max_rejections": _env_int("MAX_REJECTIONS", 3),
-        "coder_config": _load_role_config("CODER"),
-        "analyser_config": _load_role_config("ANALYSER"),
-        "triage_config": _load_role_config("TRIAGE"),
+        "coder_config": _load_role_config("CODER", remote),
+        "analyser_config": _load_role_config("ANALYSER", remote),
+        "triage_config": _load_role_config("TRIAGE", remote),
         "coder_targets": _parse_coder_targets(os.getenv("CODER_TARGETS", "")),
         "log_level": _parse_log_level(os.getenv("LOG_LEVEL", "INFO")),
         "log_file": os.getenv("LOG_FILE", ""),
@@ -314,7 +320,7 @@ def _parse_log_level(raw: str) -> str:
 _VALID_MODEL_SOURCES = {"local", "lmstudio", "cloud", "remote", "claude"}
 
 
-def _load_role_config(role_prefix: str) -> RoleConfig:
+def _load_role_config(role_prefix: str, remote: RemoteCoderSettings) -> RoleConfig:
     """Load configuration for a specific role from environment variables.
 
     Args:
@@ -361,7 +367,9 @@ def _load_role_config(role_prefix: str) -> RoleConfig:
         mcp_tool_name=os.getenv("MCP_TOOL_NAME") or DEFAULT_MCP_TOOL_NAME,
         mcp_timeout_seconds=_env_int("MCP_TIMEOUT_SECONDS", DEFAULT_MCP_TIMEOUT_SECONDS),
         mcp_max_doc_chars=_env_int("MCP_MAX_DOC_CHARS", DEFAULT_MCP_MAX_DOC_CHARS),
-        remote=remote_coder_settings_from_env(),
+        # load_config's one read, shared by every role (#799); this function
+        # never reads REMOTE_LLM_* / DEEPSEEK_* itself.
+        remote=remote,
     )
 
 
