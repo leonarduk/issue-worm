@@ -254,6 +254,31 @@ def test_load_config_synthesized_target_names_are_ascii_only(
     assert target.name.isascii()
 
 
+def test_load_config_synthesized_target_name_strips_hyphen_left_by_truncation(monkeypatch):
+    """A name whose 64th sanitized character is a hyphen: truncation leaves
+    it trailing, so it is stripped again before the "-N" suffix (#673)."""
+    monkeypatch.setenv("CODER_MODEL_SOURCE", "cloud")
+    monkeypatch.setenv("MAX_CONCURRENT_ISSUES", "1")
+    monkeypatch.delenv("CODER_TARGETS", raising=False)
+
+    import config as config_module
+
+    original_load_role_config = config_module._load_role_config
+    source = "a" * 63 + " tail"  # sanitizes to 63 a's, "-", "tail"
+
+    def _patched(role_prefix):
+        role = original_load_role_config(role_prefix)
+        if role_prefix == "CODER":
+            role.model_source = source
+        return role
+
+    monkeypatch.setattr(config_module, "_load_role_config", _patched)
+
+    (target,) = load_config()["coder_targets"]
+
+    assert target.name == "a" * 63 + "-1"
+
+
 def test_load_config_synthesized_target_names_handle_spaces(monkeypatch):
     """A model_source with spaces becomes a hyphenated, parseable name."""
     monkeypatch.setenv("CODER_MODEL_SOURCE", "cloud")

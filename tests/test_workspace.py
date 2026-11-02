@@ -2166,6 +2166,70 @@ def test_exclusive_file_lock_fd_is_not_inheritable(tmp_path):
     _assert_fds_closed(opened)
 
 
+def test_exclusive_file_lock_windows_branch_propagates_non_oserror(tmp_path, monkeypatch):
+    """The Windows branch, driven on any OS with a fake msvcrt: a non-OSError
+    from msvcrt.locking after os.open succeeded propagates and the fd is
+    closed exactly once (#628, #649)."""
+    import types
+
+    from workspace import _exclusive_file_lock
+
+    fake_msvcrt = types.ModuleType("msvcrt")
+    fake_msvcrt.LK_LOCK, fake_msvcrt.LK_UNLCK = 1, 0
+
+    def _locking(fd, mode, nbytes):
+        raise ValueError("boom")
+
+    fake_msvcrt.locking = _locking
+    monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
+
+    opened: list[int] = []
+    closed: list[int] = []
+    real_close = os.close
+
+    def _close(fd):
+        closed.append(fd)
+        real_close(fd)
+
+    with (
+        patch("workspace.os.open", side_effect=_recording_os_open(opened)),
+        patch("workspace.os.close", side_effect=_close),
+        patch("workspace.os.name", "nt"),
+        pytest.raises(ValueError, match="boom"),
+    ):
+        with _exclusive_file_lock(tmp_path / "x.lock"):
+            pytest.fail("body must not run when acquisition raises")
+
+    assert closed == opened
+    _assert_fds_closed(opened)
+
+
+def test_exclusive_file_lock_closes_fd_exactly_once_on_normal_exit(tmp_path):
+    """Acquire -> body -> release closes the lock fd once and only once
+    (#650). The body-error path is pinned by
+    test_exclusive_file_lock_close_failure_does_not_mask_body_error."""
+    from workspace import _exclusive_file_lock
+
+    opened: list[int] = []
+    closed: list[int] = []
+    real_close = os.close
+
+    def _close(fd):
+        closed.append(fd)
+        real_close(fd)
+
+    with (
+        patch("workspace.os.open", side_effect=_recording_os_open(opened)),
+        patch("workspace.os.close", side_effect=_close),
+    ):
+        with _exclusive_file_lock(tmp_path / "x.lock"):
+            assert closed == []
+
+    assert len(opened) == 1
+    assert closed == opened
+    _assert_fds_closed(opened)
+
+
 def test_run_ci_checks_passes_default_timeout(repo):
     """CI checks are bounded by DEFAULT_CI_TIMEOUT unless overridden."""
     with patch("workspace.subprocess.run") as m_run:
