@@ -6,6 +6,7 @@ Loads settings for model providers, coder targets, and workspace paths.
 import logging
 import os
 import threading
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Optional
 from urllib.parse import urlparse
@@ -114,13 +115,20 @@ class RoleConfig:
     mcp_tool_name: str = DEFAULT_MCP_TOOL_NAME
     mcp_timeout_seconds: int = DEFAULT_MCP_TIMEOUT_SECONDS
     mcp_max_doc_chars: int = DEFAULT_MCP_MAX_DOC_CHARS
-    # Set by load_config, which reads the environment once and shares the
-    # one (frozen) object across every role (#799). None for a RoleConfig
-    # built by hand: building one
+    # Set by _load_role_config: within a load_config call, the one frozen
+    # RemoteCoderSettings that call read, shared by every role (#799). None
+    # for a RoleConfig built by hand: building one
     # never reads the environment; coder.build_coder falls back to
     # remote_coder_settings_from_env() itself for such a role. repr=False:
     # it carries API keys.
     remote: Optional[RemoteCoderSettings] = field(default=None, repr=False)
+
+
+# The REMOTE_LLM_* / DEEPSEEK_* settings load_config read for the config it
+# is building (#799); None outside a load_config call.
+_SHARED_REMOTE: ContextVar[Optional[RemoteCoderSettings]] = ContextVar(
+    "_SHARED_REMOTE", default=None
+)
 
 
 def load_config() -> dict:
@@ -155,32 +163,32 @@ def load_config() -> dict:
     # ISSUE_WORM_ENV_FILE=.env-deepseek issue-worm build
     load_dotenv(dotenv_path=os.getenv("ISSUE_WORM_ENV_FILE", ".env"), override=False)
 
-    config = {
-        "coder_backend": _parse_coder_backend(os.getenv("CODER_BACKEND", "native")),
-        "workspace_root": os.getenv("WORKSPACE_ROOT", "."),
-        "test_command": os.getenv("TEST_COMMAND", "pytest"),
-        "max_concurrent_issues": _parse_max_concurrent_issues(
-            os.getenv("MAX_CONCURRENT_ISSUES", "1")
-        ),
-        # AI-review rejections allowed before the review-feedback loop
-        # hands the issue to a human (#306).
-        "max_rejections": _env_int("MAX_REJECTIONS", 3),
-        "coder_config": _load_role_config("CODER"),
-        "analyser_config": _load_role_config("ANALYSER"),
-        "triage_config": _load_role_config("TRIAGE"),
-        "coder_targets": _parse_coder_targets(os.getenv("CODER_TARGETS", "")),
-        "log_level": _parse_log_level(os.getenv("LOG_LEVEL", "INFO")),
-        "log_file": os.getenv("LOG_FILE", ""),
-    }
-
-    # One read of REMOTE_LLM_* / DEEPSEEK_* for the whole config, shared by
-    # every role, so the roles can't diverge (#799). Every RoleConfig in the
-    # dict, not a list of keys: a role added later gets it without anyone
-    # remembering to extend a list here.
-    remote = remote_coder_settings_from_env()
-    for value in config.values():
-        if isinstance(value, RoleConfig):
-            value.remote = remote
+    # One read of REMOTE_LLM_* / DEEPSEEK_* for the whole config (#799):
+    # every RoleConfig _load_role_config builds while this runs - wherever
+    # in the config it ends up - takes this one frozen object, so the roles
+    # can't diverge. Set at construction, not patched in afterwards, so no
+    # role can be missed.
+    shared_remote = _SHARED_REMOTE.set(remote_coder_settings_from_env())
+    try:
+        config = {
+            "coder_backend": _parse_coder_backend(os.getenv("CODER_BACKEND", "native")),
+            "workspace_root": os.getenv("WORKSPACE_ROOT", "."),
+            "test_command": os.getenv("TEST_COMMAND", "pytest"),
+            "max_concurrent_issues": _parse_max_concurrent_issues(
+                os.getenv("MAX_CONCURRENT_ISSUES", "1")
+            ),
+            # AI-review rejections allowed before the review-feedback loop
+            # hands the issue to a human (#306).
+            "max_rejections": _env_int("MAX_REJECTIONS", 3),
+            "coder_config": _load_role_config("CODER"),
+            "analyser_config": _load_role_config("ANALYSER"),
+            "triage_config": _load_role_config("TRIAGE"),
+            "coder_targets": _parse_coder_targets(os.getenv("CODER_TARGETS", "")),
+            "log_level": _parse_log_level(os.getenv("LOG_LEVEL", "INFO")),
+            "log_file": os.getenv("LOG_FILE", ""),
+        }
+    finally:
+        _SHARED_REMOTE.reset(shared_remote)
 
     if not config["coder_targets"] and config["coder_config"].model_source != "local":
         # CODER_TARGETS exists to pool multiple local Ollama machines by
@@ -372,6 +380,9 @@ def _load_role_config(role_prefix: str) -> RoleConfig:
         mcp_tool_name=os.getenv("MCP_TOOL_NAME") or DEFAULT_MCP_TOOL_NAME,
         mcp_timeout_seconds=_env_int("MCP_TIMEOUT_SECONDS", DEFAULT_MCP_TIMEOUT_SECONDS),
         mcp_max_doc_chars=_env_int("MCP_MAX_DOC_CHARS", DEFAULT_MCP_MAX_DOC_CHARS),
+        # load_config's one read when called from it (#799); otherwise this
+        # call reads the environment itself.
+        remote=_SHARED_REMOTE.get() or remote_coder_settings_from_env(),
     )
 
 

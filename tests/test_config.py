@@ -123,20 +123,45 @@ def test_load_config_reads_remote_settings_once_and_shares_them(monkeypatch):
     assert roles[0].remote is not None
 
 
-def test_load_config_gives_a_newly_added_role_the_shared_settings(monkeypatch):
-    """A role load_config gains later is covered without editing a list of
-    keys: every RoleConfig in the config gets the one shared object."""
+def test_load_config_shares_the_settings_with_a_role_built_anywhere_in_it(monkeypatch):
+    """Every RoleConfig _load_role_config builds during load_config takes
+    the one shared object - set at construction, so a role nested anywhere
+    in the config (here inside a list) can't be missed (#799)."""
     import config as config_module
 
-    # Stand-in for a future "reviewer_config": a fourth RoleConfig placed in
-    # the dict through a value load_config already stores.
-    extra = config_module._load_role_config("REVIEWER")
-    monkeypatch.setattr(config_module, "_parse_coder_backend", lambda raw: extra)
+    calls = []
+    real = config_module.remote_coder_settings_from_env
+
+    def _counting():
+        calls.append(1)
+        return real()
+
+    monkeypatch.setattr(config_module, "remote_coder_settings_from_env", _counting)
+    # Stand-in for a future role, built mid-load and stored nested.
+    monkeypatch.setattr(
+        config_module,
+        "_parse_coder_backend",
+        lambda raw: [config_module._load_role_config("REVIEWER")],
+    )
 
     config = load_config()
 
-    assert config["coder_backend"] is extra
-    assert extra.remote is config["coder_config"].remote is not None
+    (nested,) = config["coder_backend"]
+    assert nested.remote is config["coder_config"].remote is not None
+    assert len(calls) == 1
+
+
+def test_load_role_config_outside_load_config_reads_the_environment(monkeypatch):
+    """Called on its own, _load_role_config still gets the settings - its
+    own read - and load_config's shared object doesn't leak past it."""
+    import config as config_module
+
+    shared = load_config()["coder_config"].remote
+    role = config_module._load_role_config("CODER")
+
+    assert role.remote is not None
+    assert role.remote is not shared
+    assert role.remote == shared
 
 
 def test_load_config_remote_coder_settings_defaults_when_blank(monkeypatch):
