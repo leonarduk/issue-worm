@@ -1226,12 +1226,16 @@ def test_parse_unterminated_unfenced_full_section_drops_a_sign_off(tail):
         ("README.md", "# Title\n\nThis paragraph is the content.\n"),
         ("notes.txt", "list\n\nThis paragraph is the content.\n"),
         ("LICENSE", "MIT\n\nPermission is hereby granted to anyone.\n"),
+        # Suffixless code files are skipped outright, like suffixless prose.
+        ("Makefile", "all:\n\tbuild\n\nThe build target compiles everything.\n"),
+        ("Dockerfile", "FROM python\n\nThe image installs the package.\n"),
         # Nothing but a sentence: nothing to keep it apart from.
         ("a.py", "\nThe file now sets value to 2.\n"),
     ],
     ids=[
         "comment", "string", "call", "docstring", "yaml-key", "short",
-        "no-blank-line", "markdown", "txt", "no-suffix", "only-prose",
+        "no-blank-line", "markdown", "txt", "no-suffix", "makefile", "dockerfile",
+        "only-prose",
     ],
 )
 def test_parse_unterminated_unfenced_full_section_keeps_anything_but_obvious_prose(path, body):
@@ -1241,6 +1245,19 @@ def test_parse_unterminated_unfenced_full_section_keeps_anything_but_obvious_pro
 
     # Edge newlines are normalised as before; nothing else changes.
     assert changes[0].body == body.strip("\n")
+
+
+def test_sign_off_strip_leaves_a_fenced_body_behind_blank_lines_alone():
+    """Leading blank lines don't hide the opening fence: a fenced body is
+    _drop_prose_after_closing_fence's business, and its (unclosed) content
+    is kept whole here (#257)."""
+    body = "\n\n```python\nvalue = 2\n\nThe file now sets value to 2.\n"
+
+    # parse_coder_output trims the edge newlines before this runs, so pin
+    # the helper's own contract directly as well.
+    assert workspace._drop_trailing_prose(body, "a.py") == body
+    changes = parse_coder_output(_unterminated_full("a.py", body), ["a.py"])
+    assert changes[0].body.endswith("value = 2\n\nThe file now sets value to 2.")
 
 
 def test_terminated_full_section_keeps_a_trailing_sentence():

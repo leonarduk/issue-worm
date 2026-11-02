@@ -679,8 +679,9 @@ def _drop_trailing_prose(body: str, path: str) -> str:
     """
     if Path(path).suffix.lower() in _PROSE_FILE_SUFFIXES:
         return body
-    lines = body.rstrip("\n").splitlines()
-    if not lines or _FENCE_RE.match(lines[0]):
+    # Leading blank lines don't hide a fence: the first real line decides.
+    lines = body.strip("\n").splitlines()
+    if not lines or _FENCE_RE.match(lines[0].strip()):
         return body
     blanks = [i for i, line in enumerate(lines) if not line.strip()]
     if not blanks:
@@ -997,6 +998,7 @@ def _parse_search_replace_blocks(body: str, path: str) -> list[tuple[str, str]]:
                 state, search, replace = "search", [], []
                 diff_style = bool(_DIFF_SEARCH_MARKER_RE.match(stripped))
                 split_off = False
+                dropped_since_close = 0
             elif _REPLACE_MARKER_RE.match(stripped) and blocks and dropped_since_close:
                 raise MalformedOutputError(
                     f"MODE: EDIT section for {path!r}: a '>>>>>>> REPLACE' line "
