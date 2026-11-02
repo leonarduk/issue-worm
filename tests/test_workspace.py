@@ -5018,3 +5018,48 @@ def test_run_advisory_attempt_rolls_back_on_workflow_step_failure(repo):
     assert result.category == "test_failure"
     assert result.test_output == "ci ok\n\nstep failed"
     assert (Path(repo) / "a.py").read_text() == "value = 1\n"
+
+
+_CHECKS_OUTPUT = (
+    "\n== Python tests: pytest over the whole suite ==\n"
+    "$ python -m pytest\n"
+    "........................................ [100%]\n"
+    "========================= 1273 passed in 34.76s =========================\n"
+    "\n== Ruff lint: ruff check . ==\n"
+    "$ ruff check .\n"
+    "All checks passed!\n"
+    "\n== actionlint: workflow lint ==\n"
+    "$ actionlint\n"
+)
+
+
+def test_checks_pass_summary_names_the_checks_that_ran():
+    """The pass-path ## Testing line says what passed (#381), read from the
+    per-check headers cicaid prints - not pytest's own ===== banners."""
+    assert workspace.checks_pass_summary(_CHECKS_OUTPUT) == (
+        "✓ `cicaid run-ci-checks --all` passed: 3 checks (Python tests, Ruff lint, actionlint)."
+    )
+
+
+def test_checks_pass_summary_singular_and_crlf():
+    output = "\r\n== Python tests: pytest ==\r\n$ pytest\r\n"
+    assert workspace.checks_pass_summary(output) == (
+        "✓ `cicaid run-ci-checks --all` passed: 1 check (Python tests)."
+    )
+
+
+@pytest.mark.parametrize("output", ["", "something unexpected\nno headers here\n"])
+def test_checks_pass_summary_falls_back_to_the_status_line(output):
+    """Never an empty or malformed section: unrecognised output gives the
+    status line the PR body used before #381."""
+    assert workspace.checks_pass_summary(output) == "✓ `cicaid run-ci-checks --all` passed."
+
+
+def test_checks_pass_summary_caps_the_names_listed():
+    output = "".join(f"== check{i}: does {i} ==\n" for i in range(13))
+
+    summary = workspace.checks_pass_summary(output)
+
+    assert summary.startswith("✓ `cicaid run-ci-checks --all` passed: 13 checks (check0, ")
+    assert summary.endswith("check9, and 3 more).")
+    assert "\n" not in summary
